@@ -46,6 +46,36 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // llvm_backend — a version-independent C++ wrapper around LLVM, exposed to
+    // Zig through a stable `llvm_backend` module. Only the C++ in this package
+    // changes when we bump LLVM; the Zig-facing API stays put. The C++ is
+    // currently a stub (no real LLVM linked), but it already compiles, links,
+    // and exercises the plumbing that `--release` builds will route through.
+    const llvm_backend_cpp_mod = b.createModule(.{
+        .root_source_file = b.path("libs/llvm_backend/src/cpp/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    llvm_backend_cpp_mod.addCSourceFiles(.{
+        .root = b.path("libs/llvm_backend/src/cpp"),
+        .files = &.{"llvm_backend.cpp"},
+        .language = .cpp,
+    });
+    llvm_backend_cpp_mod.addIncludePath(b.path("libs/llvm_backend/include"));
+    llvm_backend_cpp_mod.linkSystemLibrary("c++", .{});
+    const llvm_backend_cpp = b.addLibrary(.{
+        .name = "llvm_backend_cpp",
+        .root_module = llvm_backend_cpp_mod,
+    });
+
+    const llvm_backend_mod = b.addModule("llvm_backend", .{
+        .root_source_file = b.path("libs/llvm_backend/src/llvm_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    llvm_backend_mod.linkLibrary(llvm_backend_cpp);
+    llvm_backend_mod.linkSystemLibrary("c", .{});
+
     // Commit SHA baked into ore, used by `ore update --check` to decide
     // whether a newer dev build is available. Pass `-Dgit-sha=$(git rev-parse HEAD)`.
     const ore_build_options = b.addOptions();
@@ -102,19 +132,23 @@ pub fn build(b: *std.Build) void {
 
     // ore — the Wolframite package manager CLI. It drives the same compiler
     // pipeline as the library, so it imports both the `compiler` module and
-    // the Tungsten backend.
+    // the Tungsten backend. It also links the llvm_backend C++ wrapper:
+    // `ore build --release` will eventually route codegen through LLVM.
+    const ore_root_mod = b.createModule(.{
+        .root_source_file = b.path("src/ore/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compiler", .module = compiler_mod },
+            .{ .name = "Tungsten", .module = tungsten_mod },
+            .{ .name = "llvm_backend", .module = llvm_backend_mod },
+            .{ .name = "build_options", .module = ore_build_options_mod },
+        },
+    });
+    ore_root_mod.linkLibrary(llvm_backend_cpp);
     const ore_exe = b.addExecutable(.{
         .name = "ore",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/ore/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "compiler", .module = compiler_mod },
-                .{ .name = "Tungsten", .module = tungsten_mod },
-                .{ .name = "build_options", .module = ore_build_options_mod },
-            },
-        }),
+        .root_module = ore_root_mod,
     });
     b.installArtifact(ore_exe);
 
@@ -190,6 +224,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_ore_tests = b.addRunArtifact(ore_tests);
 
+    // llvm_backend module tests
+    const llvm_backend_tests = b.addTest(.{
+        .root_module = llvm_backend_mod,
+    });
+    const run_llvm_backend_tests = b.addRunArtifact(llvm_backend_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -199,6 +239,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_compiler_tests.step);
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_ore_tests.step);
+    test_step.dependOn(&run_llvm_backend_tests.step);
 
     const test_compiler_step = b.step("test-compiler", "Run compiler tests");
     test_compiler_step.dependOn(&run_compiler_tests.step);
