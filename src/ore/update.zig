@@ -178,6 +178,11 @@ fn downloadTo(io: Io, client: *http.Client, url: []const u8, path: []const u8) U
         std.Io.Dir.deleteFileAbsolute(io, path) catch {};
         return error.IOException;
     };
+    fw.interface.flush() catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        return error.IOException;
+    };
     file.close(io);
 
     if (result.status != .ok) {
