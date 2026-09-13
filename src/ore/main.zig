@@ -129,7 +129,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var mode: compile_mod.EmitMode = .@"asm";
     var emit_bin = false;
-    var release = false;
     var file: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -146,8 +145,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             mode = .ir;
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
-        } else if (std.mem.eql(u8, arg, "--release")) {
-            release = true;
         } else if (arg.len > 0 and arg[0] == '-') {
             reportErr(io, "error: unknown option '{s}'\n", .{arg});
             return 2;
@@ -158,8 +155,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return 2;
         }
     }
-
-    if (release) return compileRelease(io);
 
     if (mode == .ir and emit_bin) {
         reportErr(io, "error: --emit-bin cannot be combined with --ir\n", .{});
@@ -232,7 +227,6 @@ fn linkBinary(gpa: Allocator, io: Io, asm_path: []const u8) !u8 {
 fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var file: ?[]const u8 = null;
-    var release = false;
     var prog_args: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 0;
@@ -245,8 +239,6 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             if (i + 1 >= args.len) return flagNeedsValue(io, arg);
             i += 1;
             out_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--release")) {
-            release = true;
         } else if (arg.len > 0 and arg[0] == '-' and file == null) {
             reportErr(io, "error: unknown option '{s}'\n", .{arg});
             return 2;
@@ -256,8 +248,6 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             try prog_args.append(gpa, arg);
         }
     }
-
-    if (release) return compileRelease(io);
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
     const source = readSource(gpa, io, source_path) orelse return 1;
@@ -389,31 +379,6 @@ fn cmdUpdate(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     } else {
         printOut(io, "the next time you run ore, it will be the new version\n", .{});
     }
-    return 0;
-}
-
-// ============================================================================
-// release
-// ============================================================================
-
-/// `--release` routes codegen through the LLVM backend instead of Tungsten.
-/// The LLVM wrapper (libs/llvm_backend) is stubbed for now, so all this does
-/// is walk a module through the wrapper and acknowledge the request — real
-/// LLVM codegen lands when the wrapper is wired up. Dev builds keep going
-/// through Tungsten.
-fn compileRelease(io: Io) u8 {
-    const llvm = @import("llvm_backend");
-
-    // Stub exercise: spin up the backend and build a trivial module through
-    // the stable API so the C++ wrapper is actually linked and invoked on the
-    // --release path. Real lowering happens here once the wrapper is wired.
-    const ctx = llvm.contextCreate().?;
-    defer llvm.contextDestroy(ctx);
-    const module = llvm.moduleCreate(ctx, "release_build").?;
-    const out_path = "out.obj";
-    _ = llvm.moduleEmitObject(module, out_path, .aggressive, .module);
-
-    printOut(io, "this would compile through LLVM\n", .{});
     return 0;
 }
 
@@ -593,7 +558,6 @@ fn printBuildHelp(io: Io) void {
         \\  -o, --output <path>  Write output to <path> (default: <input>.asm)
         \\      --ir             Emit textual Tungsten IR instead of assembly
         \\      --emit-bin       Also assemble and link into an executable (needs nasm)
-        \\      --release        Route codegen through LLVM (stub; prints a notice)
         \\  -h, --help           Show this help
         \\
         \\Exit codes:
@@ -615,7 +579,6 @@ fn printRunHelp(io: Io) void {
         \\
         \\Options:
         \\  -o, --output <path>  Assembly output path (default: <input>.asm)
-        \\      --release        Route codegen through LLVM (stub; prints a notice)
         \\  -h, --help           Show this help
         \\
     , .{});
