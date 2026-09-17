@@ -1262,25 +1262,10 @@ test "typecheck: comparison returns bool" {
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 
-test "typecheck: print statement" {
+test "typecheck: print is an ordinary identifier until the prelude builtin lands" {
     var res = try runCheck(std.testing.allocator,
         \\fn main() -> i32 {
         \\    print("hello")
-        \\    return 42
-        \\}
-    );
-    defer {
-        res.arena.deinit();
-        res.type_pool.deinit();
-        res.diagnostics.deinit();
-    }
-    try std.testing.expect(!res.diagnostics.hasErrors());
-}
-
-test "typecheck: print rejects non-String argument" {
-    var res = try runCheck(std.testing.allocator,
-        \\fn main() -> i32 {
-        \\    print(42)
         \\    return 42
         \\}
     );

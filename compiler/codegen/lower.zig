@@ -1714,40 +1714,6 @@ test "lower: struct init and field access" {
     try std.testing.expect(std.mem.indexOf(u8, text, "fconst 1") != null);
 }
 
-test "lower: class new with vtable and malloc" {
-    var res = try checkLower(std.testing.allocator,
-        \\class Animal {
-        \\    name: i32
-        \\}
-        \\fn main() -> i32 {
-        \\    let a: Animal = Animal{ .name = 7 }
-        \\    return a.name
-        \\}
-    );
-    defer res.deinit();
-
-    var buf: [8192]u8 = undefined;
-    const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "global @vtable_Animal = fn_array [") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "global_addr @vtable_Animal") != null);
-}
-
-test "lower: print statement emits extern puts call" {
-    var res = try checkLower(std.testing.allocator,
-        \\fn main() -> i32 {
-        \\    print("hello")
-        \\    return 42
-        \\}
-    );
-    defer res.deinit();
-
-    var buf: [8192]u8 = undefined;
-    const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "extern puts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "extern_call puts(%") != null);
-}
-
 test "lower: string literal pool" {
     var res = try checkLower(std.testing.allocator,
         \\fn main() -> i32 {
@@ -1761,30 +1727,6 @@ test "lower: string literal pool" {
     const text = res.text(&buf);
     try std.testing.expect(std.mem.indexOf(u8, text, "global @str_0 = string \"hi\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
-}
-
-test "lower: method call passes receiver first" {
-    var res = try checkLower(std.testing.allocator,
-        \\class Dog {
-        \\    name: i32
-        \\    fn speak(self: *Dog) -> i32 {
-        \\        return self.name
-        \\    }
-        \\}
-        \\fn main() -> i32 {
-        \\    let d: Dog = Dog{ .name = 3 }
-        \\    return d.speak()
-        \\}
-    );
-    defer res.deinit();
-
-    var buf: [8192]u8 = undefined;
-    const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "global @vtable_Dog = fn_array [@fn0]") != null);
-
-    const asm_text = try res.ctx.emitAssembly();
-    defer res.ctx.gpa.free(asm_text);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "_Dog_speak") != null);
 }
 
 test "lower: defers run before return" {

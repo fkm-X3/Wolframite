@@ -91,6 +91,10 @@ pub const Lexer = struct {
         return ch;
     }
 
+    fn isIdentChar(ch: u8) bool {
+        return std.ascii.isAlphanumeric(ch) or ch == '_';
+    }
+
     fn skipLineComment(self: *Lexer) void {
         while (self.pos < self.source.len and self.source[self.pos] != '\n') {
             self.pos += 1;
@@ -250,13 +254,20 @@ pub const Lexer = struct {
             '&' => if (self.peek(1) == '&') blk: {
                 self.pos += 1;
                 break :blk .amp_amp;
+            } else if (self.peek(1) == 'm' and self.peek(2) == 'u' and self.peek(3) == 't' and !isIdentChar(self.peek(4))) blk: {
+                self.pos += 3;
+                break :blk .amp_mut;
             } else .amp,
-            '|' => if (self.peek(1) == '|') blk: {
+            '|' => if (self.peek(1) == '>') blk: {
+                self.pos += 1;
+                break :blk .pipeline;
+            } else if (self.peek(1) == '|') blk: {
                 self.pos += 1;
                 break :blk .pipe_pipe;
             } else .pipe,
             '^' => .caret,
             '~' => .tilde,
+            '?' => .question,
             '=' => if (self.peek(1) == '=') blk: {
                 self.pos += 1;
                 break :blk .eq_eq;
@@ -364,16 +375,48 @@ test "lexer: string literals" {
 }
 
 test "lexer: identifiers and keywords" {
-    var lexer = Lexer.init(std.testing.allocator, "fn return struct class");
+    var lexer = Lexer.init(std.testing.allocator, "fn return struct");
     defer lexer.deinit();
 
     const tokens = try lexer.tokenize();
-    try std.testing.expectEqual(@as(usize, 5), tokens.len);
+    try std.testing.expectEqual(@as(usize, 4), tokens.len);
     try std.testing.expectEqual(TokenTag.fn_kw, tokens[0].tag);
     try std.testing.expectEqual(TokenTag.return_kw, tokens[1].tag);
     try std.testing.expectEqual(TokenTag.struct_kw, tokens[2].tag);
-    try std.testing.expectEqual(TokenTag.class_kw, tokens[3].tag);
-    try std.testing.expectEqual(TokenTag.eof, tokens[4].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[3].tag);
+}
+
+test "lexer: new keywords comptime move region" {
+    var lexer = Lexer.init(std.testing.allocator, "comptime move region");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(@as(usize, 4), tokens.len);
+    try std.testing.expectEqual(TokenTag.comptime_kw, tokens[0].tag);
+    try std.testing.expectEqual(TokenTag.move_kw, tokens[1].tag);
+    try std.testing.expectEqual(TokenTag.region_kw, tokens[2].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[3].tag);
+}
+
+test "lexer: class family keywords are ordinary identifiers" {
+    var lexer = Lexer.init(std.testing.allocator, "class override prop this final print");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(@as(usize, 7), tokens.len);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[0].tag);
+    try std.testing.expectEqualStrings("class", tokens[0].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[1].tag);
+    try std.testing.expectEqualStrings("override", tokens[1].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[2].tag);
+    try std.testing.expectEqualStrings("prop", tokens[2].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[3].tag);
+    try std.testing.expectEqualStrings("this", tokens[3].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqualStrings("final", tokens[4].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[5].tag);
+    try std.testing.expectEqualStrings("print", tokens[5].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.eof, tokens[6].tag);
 }
 
 test "lexer: mixed identifiers and keywords" {
@@ -529,34 +572,67 @@ test "lexer: struct definition" {
     try std.testing.expectEqualStrings("f64", tokens[6].lexeme(lexer.source));
 }
 
-test "lexer: class definition" {
-    const source =
-        \\class Dog(Animal) {
-        \\    breed: String
-        \\
-        \\    fn init(name: String, breed: String) -> Dog {
-        \\        let base := Animal.init(name)
-        \\        return Dog{ .name = base.name, .breed = breed }
-        \\    }
-        \\
-        \\    override fn speak(self: *Dog) -> String {
-        \\        return "Woof!"
-        \\    }
-        \\}
-    ;
-
-    var lexer = Lexer.init(std.testing.allocator, source);
+test "lexer: question and pipeline operators" {
+    var lexer = Lexer.init(std.testing.allocator, "? |> a |> b");
     defer lexer.deinit();
 
     const tokens = try lexer.tokenize();
-    try std.testing.expect(tokens.len > 10);
-    try std.testing.expectEqual(TokenTag.class_kw, tokens[0].tag);
+    try std.testing.expectEqual(TokenTag.question, tokens[0].tag);
+    try std.testing.expectEqual(TokenTag.pipeline, tokens[1].tag);
+    try std.testing.expectEqualStrings("|>", tokens[1].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[2].tag);
+    try std.testing.expectEqual(TokenTag.pipeline, tokens[3].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[5].tag);
+}
+
+test "lexer: reference and mut-reference operators" {
+    var lexer = Lexer.init(std.testing.allocator, "&x &mut y &fields");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(TokenTag.amp, tokens[0].tag);
     try std.testing.expectEqual(TokenTag.identifier, tokens[1].tag);
-    try std.testing.expectEqualStrings("Dog", tokens[1].lexeme(lexer.source));
-    try std.testing.expectEqual(TokenTag.lparen, tokens[2].tag);
+    try std.testing.expectEqual(TokenTag.amp_mut, tokens[2].tag);
+    try std.testing.expectEqualStrings("&mut", tokens[2].lexeme(lexer.source));
     try std.testing.expectEqual(TokenTag.identifier, tokens[3].tag);
-    try std.testing.expectEqualStrings("Animal", tokens[3].lexeme(lexer.source));
-    try std.testing.expectEqual(TokenTag.rparen, tokens[4].tag);
+    try std.testing.expectEqualStrings("y", tokens[3].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.amp, tokens[4].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[5].tag);
+    try std.testing.expectEqualStrings("fields", tokens[5].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.eof, tokens[6].tag);
+}
+
+test "lexer: amp mut maximal munch edge cases" {
+    var lexer = Lexer.init(std.testing.allocator, "&mut &mutx &&x & mut");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(TokenTag.amp_mut, tokens[0].tag);
+    try std.testing.expectEqual(TokenTag.amp, tokens[1].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[2].tag);
+    try std.testing.expectEqualStrings("mutx", tokens[2].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.amp_amp, tokens[3].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqualStrings("x", tokens[4].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.amp, tokens[5].tag);
+    try std.testing.expectEqual(TokenTag.mut_kw, tokens[6].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[7].tag);
+}
+
+test "lexer: pipe then greater is pipeline not bitwise or" {
+    var lexer = Lexer.init(std.testing.allocator, "a |> b | c || d");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(TokenTag.identifier, tokens[0].tag);
+    try std.testing.expectEqual(TokenTag.pipeline, tokens[1].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[2].tag);
+    try std.testing.expectEqual(TokenTag.pipe, tokens[3].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqual(TokenTag.pipe_pipe, tokens[5].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[6].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[7].tag);
 }
 
 test "lexer: enum definition" {

@@ -562,26 +562,6 @@ test "resolve: struct declaration" {
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 
-test "resolve: class declaration" {
-    var res = try runResolve(std.testing.allocator,
-        \\class Animal {
-        \\    name: String
-        \\}
-        \\class Dog(Animal) {
-        \\    breed: String
-        \\    fn speak(self: *Dog) -> String {
-        \\        return "Woof!"
-        \\    }
-        \\}
-    );
-    defer {
-        res.arena.deinit();
-        res.type_pool.deinit();
-        res.diagnostics.deinit();
-    }
-    try std.testing.expect(!res.diagnostics.hasErrors());
-}
-
 test "resolve: enum declaration" {
     var res = try runResolve(std.testing.allocator,
         \\enum Option[T] {

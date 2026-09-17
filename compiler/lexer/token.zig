@@ -14,10 +14,8 @@ pub const TokenTag = enum(u8) {
     mut_kw,
     struct_kw,
     enum_kw,
-    class_kw,
     impl_kw,
     interface_kw,
-    override_kw,
     return_kw,
     if_kw,
     else_kw,
@@ -31,10 +29,9 @@ pub const TokenTag = enum(u8) {
     true_kw,
     false_kw,
     null_kw,
-    this_kw,
-    final_kw,
-    prop_kw,
-    print_kw,
+    comptime_kw,
+    move_kw,
+    region_kw,
 
     // Operators
     plus,
@@ -64,6 +61,9 @@ pub const TokenTag = enum(u8) {
     slash_eq,
     arrow,
     fat_arrow,
+    question,
+    amp_mut,
+    pipeline,
 
     // Delimiters
     lparen,
@@ -95,10 +95,8 @@ pub const TokenTag = enum(u8) {
             .mut_kw => "mut",
             .struct_kw => "struct",
             .enum_kw => "enum",
-            .class_kw => "class",
             .impl_kw => "impl",
             .interface_kw => "interface",
-            .override_kw => "override",
             .return_kw => "return",
             .if_kw => "if",
             .else_kw => "else",
@@ -112,10 +110,9 @@ pub const TokenTag = enum(u8) {
             .true_kw => "true",
             .false_kw => "false",
             .null_kw => "null",
-            .this_kw => "this",
-            .final_kw => "final",
-            .prop_kw => "prop",
-            .print_kw => "print",
+            .comptime_kw => "comptime",
+            .move_kw => "move",
+            .region_kw => "region",
             .plus => "+",
             .minus => "-",
             .star => "*",
@@ -143,6 +140,9 @@ pub const TokenTag = enum(u8) {
             .slash_eq => "/=",
             .arrow => "->",
             .fat_arrow => "=>",
+            .question => "?",
+            .amp_mut => "&mut",
+            .pipeline => "|>",
             .lparen => "(",
             .rparen => ")",
             .lbrace => "{",
@@ -183,10 +183,8 @@ pub const KEYWORDS = init: {
         .{ "mut", .mut_kw },
         .{ "struct", .struct_kw },
         .{ "enum", .enum_kw },
-        .{ "class", .class_kw },
         .{ "impl", .impl_kw },
         .{ "interface", .interface_kw },
-        .{ "override", .override_kw },
         .{ "return", .return_kw },
         .{ "if", .if_kw },
         .{ "else", .else_kw },
@@ -200,10 +198,9 @@ pub const KEYWORDS = init: {
         .{ "true", .true_kw },
         .{ "false", .false_kw },
         .{ "null", .null_kw },
-        .{ "this", .this_kw },
-        .{ "final", .final_kw },
-        .{ "prop", .prop_kw },
-        .{ "print", .print_kw },
+        .{ "comptime", .comptime_kw },
+        .{ "move", .move_kw },
+        .{ "region", .region_kw },
     };
 
     const Map = std.StaticStringMap(TokenTag);
@@ -231,7 +228,18 @@ test "Token lexeme from source" {
 test "lookupKeyword finds keywords" {
     try std.testing.expectEqual(@as(?TokenTag, .fn_kw), lookupKeyword("fn"));
     try std.testing.expectEqual(@as(?TokenTag, .return_kw), lookupKeyword("return"));
-    try std.testing.expectEqual(@as(?TokenTag, .print_kw), lookupKeyword("print"));
+    try std.testing.expectEqual(@as(?TokenTag, .comptime_kw), lookupKeyword("comptime"));
+    try std.testing.expectEqual(@as(?TokenTag, .move_kw), lookupKeyword("move"));
+    try std.testing.expectEqual(@as(?TokenTag, .region_kw), lookupKeyword("region"));
     try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("foo"));
     try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("Fn"));
+}
+
+test "drops class family keywords" {
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("class"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("override"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("prop"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("this"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("final"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("print"));
 }

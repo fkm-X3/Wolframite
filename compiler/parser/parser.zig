@@ -207,22 +207,9 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.parseFnDecl(false);
             },
-            .override_kw => {
-                _ = self.advance();
-                if (!self.check(.fn_kw)) {
-                    self.errorHere("expected 'fn' after 'override'", .{});
-                    return null;
-                }
-                _ = self.advance();
-                return self.parseFnDecl(true);
-            },
             .struct_kw => {
                 _ = self.advance();
                 return self.parseStructDecl();
-            },
-            .class_kw => {
-                _ = self.advance();
-                return self.parseClassDecl();
             },
             .enum_kw => {
                 _ = self.advance();
@@ -240,15 +227,11 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.parseImportDecl();
             },
-            .prop_kw => {
-                _ = self.advance();
-                return self.parsePropDecl();
-            },
             .let_kw, .mut_kw => {
                 return self.parseLetStmt();
             },
             else => {
-                self.errorHere("expected declaration (fn, struct, class, enum, interface, impl, import, let, mut)", .{});
+                self.errorHere("expected declaration (fn, struct, enum, interface, impl, import, let, mut)", .{});
                 return null;
             },
         }
@@ -310,29 +293,13 @@ pub const Parser = struct {
             self.skipNewlinesAndSemicolons();
             if (self.check(.rbrace)) break;
 
-            if (self.check(.fn_kw) or self.check(.override_kw)) {
-                const is_override = if (self.check(.override_kw)) blk: {
-                    _ = self.advance();
-                    break :blk true;
-                } else false;
-                if (!self.check(.fn_kw)) {
-                    self.errorHere("expected 'fn'", .{});
-                    self.recoverTo(.rbrace);
-                    break;
-                }
+            if (self.check(.fn_kw)) {
                 _ = self.advance();
-                const method = self.parseFnDecl(is_override) orelse {
+                const method = self.parseFnDecl(false) orelse {
                     self.recoverTo(.rbrace);
                     break;
                 };
                 methods.append(self.allocator, method) catch unreachable;
-            } else if (self.check(.prop_kw)) {
-                _ = self.advance();
-                const prop = self.parsePropDecl() orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                methods.append(self.allocator, prop) catch unreachable;
             } else {
                 const field = self.parseField() orelse {
                     self.recoverTo(.rbrace);
@@ -346,73 +313,6 @@ pub const Parser = struct {
         return self.appendNode(.{ .struct_decl = .{
             .name = self.makeStringRef(name_tok),
             .generic_params = generic_params,
-            .fields = self.arena.allocNodeList(fields.items) catch NodeList{ .indices = &.{} },
-            .methods = self.arena.allocNodeList(methods.items) catch NodeList{ .indices = &.{} },
-        } });
-    }
-
-    fn parseClassDecl(self: *Parser) ?NodeIdx {
-        const name_tok = self.expect(.identifier) orelse return null;
-        const generic_params = self.parseGenericParams() orelse NodeList{ .indices = &.{} };
-
-        var parent: ?NodeIdx = null;
-        self.skipNewlinesAndSemicolons();
-        if (self.check(.lparen)) {
-            _ = self.advance();
-            parent = self.parseExpr(Precedence.none.toInt());
-            _ = self.expect(.rparen);
-        }
-
-        if (self.expect(.lbrace) == null) return null;
-
-        var fields = std.ArrayList(NodeIdx).empty;
-        var methods = std.ArrayList(NodeIdx).empty;
-        defer {
-            fields.deinit(self.allocator);
-            methods.deinit(self.allocator);
-        }
-
-        while (true) {
-            self.skipNewlinesAndSemicolons();
-            if (self.check(.rbrace)) break;
-
-            if (self.check(.fn_kw) or self.check(.override_kw)) {
-                const is_override = if (self.check(.override_kw)) blk: {
-                    _ = self.advance();
-                    break :blk true;
-                } else false;
-                if (!self.check(.fn_kw)) {
-                    self.errorHere("expected 'fn'", .{});
-                    self.recoverTo(.rbrace);
-                    break;
-                }
-                _ = self.advance();
-                const method = self.parseFnDecl(is_override) orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                methods.append(self.allocator, method) catch unreachable;
-            } else if (self.check(.prop_kw)) {
-                _ = self.advance();
-                const prop = self.parsePropDecl() orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                methods.append(self.allocator, prop) catch unreachable;
-            } else {
-                const field = self.parseField() orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                fields.append(self.allocator, field) catch unreachable;
-            }
-        }
-
-        _ = self.expect(.rbrace);
-        return self.appendNode(.{ .class_decl = .{
-            .name = self.makeStringRef(name_tok),
-            .generic_params = generic_params,
-            .parent = parent,
             .fields = self.arena.allocNodeList(fields.items) catch NodeList{ .indices = &.{} },
             .methods = self.arena.allocNodeList(methods.items) catch NodeList{ .indices = &.{} },
         } });
@@ -584,54 +484,6 @@ pub const Parser = struct {
         } });
     }
 
-    fn parsePropDecl(self: *Parser) ?NodeIdx {
-        const name_tok = self.expect(.identifier) orelse return null;
-        _ = self.expect(.colon);
-        const ty = self.parseExpr(Precedence.none.toInt()) orelse NodeIdx.none;
-
-        if (self.expect(.lbrace) == null) return null;
-
-        var getter: ?NodeIdx = null;
-        var setter: ?NodeIdx = null;
-
-        while (true) {
-            self.skipNewlinesAndSemicolons();
-            if (self.check(.rbrace)) break;
-
-            if (self.check(.identifier)) {
-                const accessor = self.advance();
-                const name = self.makeStringRef(accessor);
-                const name_str = name.slice(self.source);
-
-                if (self.expectPeek(.fat_arrow)) |_| {
-                    const expr = self.parseExpr(Precedence.none.toInt()) orelse break;
-                    if (std.mem.eql(u8, name_str, "get")) {
-                        getter = expr;
-                    } else if (std.mem.eql(u8, name_str, "set")) {
-                        setter = expr;
-                    } else {
-                        self.errorTok(accessor, "expected 'get' or 'set' in property", .{});
-                    }
-                } else {
-                    self.errorHere("expected '=>' in property accessor", .{});
-                }
-            } else {
-                self.errorHere("expected property accessor (get/set)", .{});
-                self.recoverTo(.rbrace);
-                break;
-            }
-        }
-
-        _ = self.expect(.rbrace);
-        const getter_node = getter orelse NodeIdx.none;
-        return self.appendNode(.{ .prop_decl = .{
-            .name = self.makeStringRef(name_tok),
-            .ty = ty,
-            .getter = getter_node,
-            .setter = setter,
-        } });
-    }
-
     fn parseTypeRepr(self: *Parser) ?TypeRepr {
         const expr = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
         const node = self.arena.get(expr);
@@ -676,11 +528,6 @@ pub const Parser = struct {
                 _ = self.advance();
                 const expr = self.parseExpr(Precedence.none.toInt()) orelse return null;
                 return self.appendNode(.{ .defer_stmt = .{ .expr = expr } });
-            },
-            .print_kw => {
-                _ = self.advance();
-                const value = self.parseExpr(Precedence.none.toInt()) orelse return null;
-                return self.appendNode(.{ .print_stmt = .{ .value = value } });
             },
             .lbrace => return self.parseBlock(),
             .match_kw => {
@@ -986,10 +833,6 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.appendNode(.{ .identifier = self.makeStringRef(tok) });
             },
-            .this_kw => {
-                _ = self.advance();
-                return self.appendNode(.{ .identifier = self.makeStringRef(tok) });
-            },
             .lparen => {
                 _ = self.advance();
                 const expr = self.parseExpr(Precedence.none.toInt()) orelse return null;
@@ -1091,8 +934,7 @@ pub const Parser = struct {
                 return self.appendNode(.{ .index_access = .{ .object = left, .index = index } });
             },
             .dot => {
-                // Keywords like `print` are valid after a dot (e.g. `io.print`).
-                const field_tok = if (self.check(.print_kw)) self.advance() else (self.expect(.identifier) orelse return left);
+                const field_tok = self.expect(.identifier) orelse return left;
                 return self.appendNode(.{ .field_access = .{ .object = left, .field = self.makeStringRef(field_tok) } });
             },
             else => {
@@ -1268,19 +1110,6 @@ test "parser: struct declaration" {
     try std.testing.expectEqual(@as(usize, 0), decl.struct_decl.methods.indices.len);
 }
 
-test "parser: class with inheritance" {
-    var res = try runTest(std.testing.allocator,
-        \\class Dog(Animal) {
-        \\    breed: String
-        \\}
-    );
-    defer res.arena.deinit();
-    const mod = getMod(&res);
-    const decl = res.arena.get(mod.module.decls.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .class_decl), tagOf(decl));
-    try std.testing.expect(decl.class_decl.parent != null);
-}
-
 test "parser: enum declaration" {
     var res = try runTest(std.testing.allocator,
         \\enum Option[T] {
@@ -1445,36 +1274,6 @@ test "parser: call expression" {
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(call));
 }
 
-test "parser: print statement" {
-    var res = try runTest(std.testing.allocator,
-        \\fn main() {
-        \\    print("hello")
-        \\}
-    );
-    defer res.arena.deinit();
-    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
-    const body = res.arena.get(decl.fn_decl.body);
-    const stmt = res.arena.get(body.block.stmts.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .print_stmt), tagOf(stmt));
-    const arg = res.arena.get(stmt.print_stmt.value);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .paren_expr), tagOf(arg));
-}
-
-test "parser: print statement without parens" {
-    var res = try runTest(std.testing.allocator,
-        \\fn main() {
-        \\    print "hello"
-        \\}
-    );
-    defer res.arena.deinit();
-    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
-    const body = res.arena.get(decl.fn_decl.body);
-    const stmt = res.arena.get(body.block.stmts.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .print_stmt), tagOf(stmt));
-    const arg = res.arena.get(stmt.print_stmt.value);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .string_literal), tagOf(arg));
-}
-
 test "parser: print as field name after dot" {
     var res = try runTest(std.testing.allocator,
         \\fn main() {
@@ -1545,22 +1344,6 @@ test "parser: single-expression function" {
     const ret = body.return_stmt;
     try std.testing.expect(ret.value != null);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(res.arena.get(ret.value.?)));
-}
-
-test "parser: override method" {
-    var res = try runTest(std.testing.allocator,
-        \\class Dog(Animal) {
-        \\    override fn speak(self: *Dog) -> String {
-        \\        return "Woof!"
-        \\    }
-        \\}
-    );
-    defer res.arena.deinit();
-    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .class_decl), tagOf(decl));
-    try std.testing.expectEqual(@as(usize, 1), decl.class_decl.methods.indices.len);
-    const method = res.arena.get(decl.class_decl.methods.indices[0]);
-    try std.testing.expectEqual(true, method.fn_decl.is_override);
 }
 
 test "parser: impl block" {
