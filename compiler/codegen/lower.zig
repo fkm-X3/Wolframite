@@ -11,7 +11,7 @@
 //! pointer to its stack-allocated block (see `class.zig`); a class value is
 //! a pointer to its heap allocation.
 //!
-//! Known simplifications (see plan.md):
+//! Known simplifications:
 //! - All integer math runs in 64-bit slots; narrow types are not truncated.
 //! - Struct copies share the underlying block (no deep copy).
 //! - Classes leak: no `free` is emitted for the ref-counted header.
