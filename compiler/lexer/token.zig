@@ -64,6 +64,7 @@ pub const TokenTag = enum(u8) {
     question,
     amp_mut,
     pipeline,
+    at,
 
     // Delimiters
     lparen,
@@ -143,6 +144,7 @@ pub const TokenTag = enum(u8) {
             .question => "?",
             .amp_mut => "&mut",
             .pipeline => "|>",
+            .at => "@",
             .lparen => "(",
             .rparen => ")",
             .lbrace => "{",

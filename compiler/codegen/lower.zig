@@ -193,26 +193,12 @@ pub const Lowerer = struct {
                     _ = try self.createFunction(decl_idx, self.nameSlice(f.name));
                 },
                 .struct_decl => |s| try self.collectMethods(decl_idx, self.nameSlice(s.name), s.methods),
-                .class_decl => |c| try self.collectMethods(decl_idx, self.nameSlice(c.name), c.methods),
                 .impl_block => |ib| try self.collectImplMethods(decl_idx, ib),
                 else => {},
             }
         }
 
-        // Pass 2: vtable globals (one per class, even if method-less).
-        for (module.module.decls.indices) |decl_idx| {
-            const decl = self.arena.get(decl_idx);
-            if (decl.* != .class_decl) continue;
-            var funcs = std.ArrayList(api.FunctionIdx).empty;
-            defer funcs.deinit(self.gpa);
-            if (self.methods.get(decl_idx)) |table| {
-                try funcs.appendSlice(self.gpa, table.order.items);
-            }
-            const g = try class_mod.generateVtable(self.gpa, self.ctx, self.nameSlice(decl.class_decl.name), funcs.items);
-            try self.vtable_by_class.put(self.gpa, decl_idx, g);
-        }
-
-        // Pass 3: function bodies.
+        // Pass 2: function bodies.
         for (self.all_functions.items) |f| {
             try self.lowerFunctionBody(f.node, f.idx);
         }
@@ -323,7 +309,6 @@ pub const Lowerer = struct {
             .return_stmt => |r| try self.lowerReturn(r),
             .expr_stmt => |e| _ = try self.lowerExpr(e.expr),
             .defer_stmt => |d| try self.pending_defers.append(self.gpa, d.expr),
-            .print_stmt => |p| try self.lowerPrint(node_idx, p),
             .if_expr => try self.lowerIf(node_idx),
             .while_expr => try self.lowerWhile(node_idx),
             .for_range => try self.lowerForRange(node_idx),
@@ -393,21 +378,6 @@ pub const Lowerer = struct {
             else => 8,
         };
         return self.ctx.buildAllocaBytes(self.ptr_ty, size);
-    }
-
-    /// Lower a `print <expr>` statement to a call to the C runtime's `puts`.
-    /// The String value is a pointer to a `[len][data]` block; `puts` takes a
-    /// NUL-terminated C string, so the data pointer is passed.
-    fn lowerPrint(self: *Lowerer, node_idx: NodeIdx, p: anytype) !void {
-        const val = try self.lowerExpr(p.value);
-        const sem = self.type_pool.get(self.exprType(p.value));
-        if (sem != .string_type) {
-            self.codegenError(node_idx, "print supports only String values for now", .{});
-            return;
-        }
-        const data_addr = try self.ctx.buildPtrAdd(self.ptr_ty, val, try self.ctx.buildIntConst(self.i64_ty, @intCast(string_mod.data_offset)));
-        const data_ptr = try self.ctx.buildLoad(self.ptr_ty, data_addr);
-        _ = try self.ctx.buildExternCall("puts", self.void_ty, &.{data_ptr});
     }
 
     fn lowerReturn(self: *Lowerer, r: anytype) !void {
@@ -1079,8 +1049,8 @@ pub const Lowerer = struct {
                 self.ctx.buildSub(ir_ty, try self.ctx.buildIntConst(ir_ty, 0), operand),
             .not => self.ctx.buildXor(self.bool_ty, operand, try self.ctx.buildIntConst(self.bool_ty, 1)),
             .bit_not => self.ctx.buildXor(ir_ty, operand, try self.ctx.buildIntConst(ir_ty, -1)),
-            .deref, .ref => blk: {
-                self.codegenError(node_idx, "explicit dereference/reference is not lowered yet", .{});
+            .ref, .mut_ref => blk: {
+                self.codegenError(node_idx, "explicit reference is not lowered yet", .{});
                 break :blk try self.ctx.buildIntConst(self.i64_ty, 0);
             },
         };
@@ -1256,7 +1226,6 @@ pub const Lowerer = struct {
         const decl = self.arena.get(ty_decl);
         const type_name: []const u8 = switch (decl.*) {
             .struct_decl => |s| self.nameSlice(s.name),
-            .class_decl => |c| self.nameSlice(c.name),
             else => return null,
         };
         const name = std.fmt.allocPrint(self.gpa, "vtable_{s}_{s}", .{ type_name, self.nameSlice(iface.name) }) catch return null;
@@ -1308,7 +1277,6 @@ pub const Lowerer = struct {
         const decl = self.arena.get(decl_node);
         const fields: []const NodeIdx = switch (decl.*) {
             .struct_decl => |s| s.fields.indices,
-            .class_decl => |c| c.fields.indices,
             else => &.{},
         };
 
@@ -1442,13 +1410,18 @@ pub const Lowerer = struct {
     }
 
     /// Semantic type of a function parameter's type node. The checker caches
-    /// the pointee's type on `*T` unary nodes but not the pointer itself, so
-    /// pointer types are rebuilt here.
+    /// the pointee's type on `&T`/`&mut T` unary nodes but not the reference
+    /// itself, so reference types are rebuilt here.
     fn paramType(self: *Lowerer, ty_node: NodeIdx) !TypeIdx {
         const node = self.arena.get(ty_node);
-        if (node.* == .unary_op and node.unary_op.op == .deref) {
-            const pointee = self.checker.nodeType(node.unary_op.operand);
-            return try self.type_pool.add(.{ .pointer = pointee });
+        if (node.* == .unary_op) {
+            switch (node.unary_op.op) {
+                .ref, .mut_ref => {
+                    const pointee = self.checker.nodeType(node.unary_op.operand);
+                    return try self.type_pool.add(.{ .pointer = pointee });
+                },
+                else => {},
+            }
         }
         return self.checker.nodeType(ty_node);
     }
@@ -1682,7 +1655,7 @@ test "lower: for range loop" {
 test "lower: short-circuit and with phi" {
     var res = try checkLower(std.testing.allocator,
         \\fn main() -> bool {
-        \\    let b := 1 < 2 && 3 < 4
+        \\    let b = 1 < 2 && 3 < 4
         \\    return b
         \\}
     );
@@ -1872,19 +1845,19 @@ test "lower: string index access loads a byte" {
 test "lower: interface method call dispatches through a vtable" {
     var res = try checkLower(std.testing.allocator,
         \\interface Shape {
-        \\    fn area(self: *Shape) -> i32
-        \\    fn name(self: *Shape) -> i32
+        \\    fn area(self: &Shape) -> i32
+        \\    fn name(self: &Shape) -> i32
         \\}
         \\struct Square {
         \\    side: i32
-        \\    fn area(self: *Square) -> i32 {
+        \\    fn area(self: &Square) -> i32 {
         \\        return self.side * self.side
         \\    }
-        \\    fn name(self: *Square) -> i32 {
+        \\    fn name(self: &Square) -> i32 {
         \\        return 1
         \\    }
         \\}
-        \\fn describe(s: *impl Shape) -> i32 {
+        \\fn describe(s: &impl Shape) -> i32 {
         \\    return s.area()
         \\}
         \\fn main() -> i32 {

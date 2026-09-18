@@ -268,6 +268,7 @@ pub const Lexer = struct {
             '^' => .caret,
             '~' => .tilde,
             '?' => .question,
+            '@' => .at,
             '=' => if (self.peek(1) == '=') blk: {
                 self.pos += 1;
                 break :blk .eq_eq;
@@ -583,6 +584,18 @@ test "lexer: question and pipeline operators" {
     try std.testing.expectEqual(TokenTag.identifier, tokens[2].tag);
     try std.testing.expectEqual(TokenTag.pipeline, tokens[3].tag);
     try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqual(TokenTag.eof, tokens[5].tag);
+}
+
+test "lexer: at builtin marker" {
+    var lexer = Lexer.init(std.testing.allocator, "@sizeof(i32)");
+    defer lexer.deinit();
+
+    const tokens = try lexer.tokenize();
+    try std.testing.expectEqual(TokenTag.at, tokens[0].tag);
+    try std.testing.expectEqualStrings("@", tokens[0].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[1].tag);
+    try std.testing.expectEqualStrings("sizeof", tokens[1].lexeme(lexer.source));
     try std.testing.expectEqual(TokenTag.eof, tokens[5].tag);
 }
 

@@ -176,7 +176,6 @@ pub const TypeChecker = struct {
         switch (decl.*) {
             .fn_decl => try self.checkFnDecl(decl_idx),
             .struct_decl => try self.checkStructDecl(decl_idx),
-            .class_decl => try self.checkClassDecl(decl_idx),
             .enum_decl => try self.checkEnumDecl(decl_idx),
             .interface_decl => try self.checkInterfaceDecl(decl_idx),
             .impl_block => |ib| {
@@ -193,14 +192,6 @@ pub const TypeChecker = struct {
         const decl = self.arena.get(decl_idx);
         const s = decl.struct_decl;
         for (s.methods.indices) |method_idx| {
-            try self.checkDecl(method_idx);
-        }
-    }
-
-    fn checkClassDecl(self: *TypeChecker, decl_idx: NodeIdx) anyerror!void {
-        const decl = self.arena.get(decl_idx);
-        const c = decl.class_decl;
-        for (c.methods.indices) |method_idx| {
             try self.checkDecl(method_idx);
         }
     }
@@ -325,13 +316,6 @@ pub const TypeChecker = struct {
             },
             .defer_stmt => |d| {
                 _ = self.inferExprType(d.expr);
-                self.setNodeType(stmt_idx, self.void_ty);
-            },
-            .print_stmt => |p| {
-                const arg_ty = self.inferExprType(p.value);
-                if (!self.typesEqual(arg_ty, self.string_ty)) {
-                    self.errorAt(stmt_idx, "print expects a String argument, got '{s}'", .{self.typeName(arg_ty)});
-                }
                 self.setNodeType(stmt_idx, self.void_ty);
             },
             .if_expr => |i| {
@@ -487,16 +471,6 @@ pub const TypeChecker = struct {
                         });
                         return self.void_ty;
                     },
-                    .class_type => |decl_node| {
-                        if (self.classFieldType(decl_node, self.nameSlice(fa.field))) |ft| {
-                            return ft;
-                        }
-                        const c = self.arena.get(decl_node).class_decl;
-                        self.errorAt(expr_idx, "class '{s}' has no field '{s}'", .{
-                            self.nameSlice(c.name), self.nameSlice(fa.field),
-                        });
-                        return self.void_ty;
-                    },
                     .pointer => |elem| {
                         const elem_type = self.type_pool.get(elem);
                         switch (elem_type) {
@@ -507,16 +481,9 @@ pub const TypeChecker = struct {
                                 self.errorAt(expr_idx, "struct has no field '{s}'", .{self.nameSlice(fa.field)});
                                 return self.void_ty;
                             },
-                            .class_type => |decl_node| {
-                                if (self.classFieldType(decl_node, self.nameSlice(fa.field))) |ft| {
-                                    return ft;
-                                }
-                                self.errorAt(expr_idx, "class has no field '{s}'", .{self.nameSlice(fa.field)});
-                                return self.void_ty;
-                            },
                             else => {},
                         }
-                        self.errorAt(expr_idx, "cannot access field on non-struct/class type", .{});
+                        self.errorAt(expr_idx, "cannot access field on non-struct type", .{});
                         return self.void_ty;
                     },
                     else => {
@@ -549,6 +516,40 @@ pub const TypeChecker = struct {
                 _ = self.inferExprType(r.start);
                 _ = self.inferExprType(r.end);
                 return self.i32_ty;
+            },
+            .closure => |cl| {
+                for (cl.params.indices) |param_idx| {
+                    const param = self.arena.get(param_idx);
+                    if (param.param.ty != NodeIdx.none) {
+                        _ = self.inferExprType(param.param.ty);
+                    }
+                }
+                _ = self.inferExprType(cl.body);
+                return self.void_ty;
+            },
+            .comptime_block => |inner| {
+                tryStd(self.checkStmt(inner));
+                return self.void_ty;
+            },
+            .comptime_expr => |inner| return self.inferExprType(inner),
+            .comptime_call => |cc| {
+                for (cc.args.indices) |arg| {
+                    _ = self.inferExprType(arg);
+                }
+                return self.i32_ty;
+            },
+            .pipeline => |p| {
+                _ = self.inferExprType(p.lhs);
+                return self.inferExprType(p.rhs);
+            },
+            .try_propagate => |inner| return self.inferExprType(inner),
+            .move_expr => |inner| return self.inferExprType(inner),
+            .region_expr => |r| {
+                if (r.allocator) |alloc_ty| {
+                    _ = self.inferExprType(alloc_ty);
+                }
+                tryStd(self.checkStmt(r.body));
+                return self.void_ty;
             },
             .block => |b| {
                 tryStd(self.checkStmt(expr_idx));
@@ -590,6 +591,9 @@ pub const TypeChecker = struct {
                     for (m.arms.indices) |arm_idx| {
                         const arm = self.arena.get(arm_idx);
                         _ = self.inferExprType(arm.match_arm.pattern);
+                        if (arm.match_arm.guard) |guard| {
+                            _ = self.inferExprType(guard);
+                        }
                         result_ty = self.inferExprType(arm.match_arm.body);
                     }
                 }
@@ -679,14 +683,12 @@ pub const TypeChecker = struct {
         const sem = self.type_pool.get(ty);
         const decl_node: NodeIdx = switch (sem) {
             .struct_type => |n| n,
-            .class_type => |n| n,
             else => return false,
         };
         const iface = self.arena.get(iface_node).interface_decl;
         const decl = self.arena.get(decl_node);
         const methods: []const NodeIdx = switch (decl.*) {
             .struct_decl => |s| s.methods.indices,
-            .class_decl => |c| c.methods.indices,
             else => return false,
         };
         outer: for (iface.methods.indices) |iface_method_idx| {
@@ -711,7 +713,6 @@ pub const TypeChecker = struct {
         var decl_node: ?NodeIdx = null;
         switch (sem) {
             .struct_type => |n| decl_node = n,
-            .class_type => |n| decl_node = n,
             .interface_type => |n| iface_node = n,
             else => return null,
         }
@@ -734,7 +735,6 @@ pub const TypeChecker = struct {
             const decl = self.arena.get(dnode);
             const methods: []const NodeIdx = switch (decl.*) {
                 .struct_decl => |s| s.methods.indices,
-                .class_decl => |c| c.methods.indices,
                 else => &.{},
             };
             for (methods) |method_idx| {
@@ -780,6 +780,9 @@ pub const TypeChecker = struct {
             for (m.arms.indices) |arm_idx| {
                 const arm = self.arena.get(arm_idx);
                 _ = self.inferExprType(arm.match_arm.pattern);
+                if (arm.match_arm.guard) |guard| {
+                    _ = self.inferExprType(guard);
+                }
                 _ = self.inferExprType(arm.match_arm.body);
             }
         }
@@ -816,6 +819,12 @@ pub const TypeChecker = struct {
             }
         }
         _ = self.inferExprType(arm.match_arm.pattern);
+        if (arm.match_arm.guard) |guard| {
+            const guard_ty = self.inferExprType(guard);
+            if (!self.typesEqual(guard_ty, self.bool_ty)) {
+                self.errorAt(arm_idx, "match guard must be bool, got '{s}'", .{self.typeName(guard_ty)});
+            }
+        }
         const body_ty = self.inferExprType(arm.match_arm.body);
         self.scopes.popScope();
         return body_ty;
@@ -888,21 +897,10 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    fn classFieldType(self: *TypeChecker, decl_node: NodeIdx, field_name: []const u8) ?TypeIdx {
-        const c = self.arena.get(decl_node).class_decl;
-        for (c.fields.indices) |field_idx| {
-            const field = self.arena.get(field_idx);
-            if (std.mem.eql(u8, self.nameSlice(field.field.name), field_name)) {
-                return self.inferTypeRefNode(field.field.ty);
-            }
-        }
-        return null;
-    }
-
     fn inferTypeRefNode(self: *TypeChecker, ty: ast.TypeRepr) TypeIdx {
         return switch (ty) {
             .plain => |n| self.inferExprType(n),
-            .pointer => |n| blk: {
+            .reference, .mut_reference => |n| blk: {
                 const pointee = self.inferExprType(n);
                 break :blk self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
             },
@@ -921,9 +919,6 @@ pub const TypeChecker = struct {
             },
             .struct_decl => {
                 return self.type_pool.add(.{ .struct_type = decl_node }) catch @panic("OOM");
-            },
-            .class_decl => {
-                return self.type_pool.add(.{ .class_type = decl_node }) catch @panic("OOM");
             },
             .enum_decl => {
                 return self.type_pool.add(.{ .enum_type = decl_node }) catch @panic("OOM");
@@ -1217,7 +1212,7 @@ test "typecheck: let with type annotation" {
 test "typecheck: let with inferred type" {
     var res = try runCheck(std.testing.allocator,
         \\fn main() -> i32 {
-        \\    let z := 42
+        \\    let z = 42
         \\    return z
         \\}
     );

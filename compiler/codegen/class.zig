@@ -27,7 +27,6 @@ pub fn fieldCount(arena: *const ast.AstArena, decl_idx: NodeIdx) u64 {
     const decl = arena.get(decl_idx);
     return switch (decl.*) {
         .struct_decl => |s| @intCast(s.fields.indices.len),
-        .class_decl => |c| @intCast(c.fields.indices.len),
         else => 0,
     };
 }
@@ -56,7 +55,6 @@ fn fieldOffsetOf(arena: *const ast.AstArena, source: []const u8, decl_idx: NodeI
     const decl = arena.get(decl_idx);
     const fields: []const NodeIdx = switch (decl.*) {
         .struct_decl => |s| s.fields.indices,
-        .class_decl => |c| c.fields.indices,
         else => return null,
     };
     for (fields, 0..) |field_idx, i| {

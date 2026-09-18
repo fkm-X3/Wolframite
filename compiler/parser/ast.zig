@@ -53,8 +53,8 @@ pub const UnaryOp = enum(u8) {
     neg,
     not,
     bit_not,
-    deref,
     ref,
+    mut_ref,
 };
 
 pub const NodeList = struct {
@@ -80,15 +80,31 @@ pub const Node = union(enum) {
     paren_expr: NodeIdx,
     struct_init: struct { ty: NodeIdx, fields: NodeList },
     range_expr: struct { start: NodeIdx, end: NodeIdx },
-    /// `impl Interface` type expression (`*impl Interface` = pointer to it).
+    /// `impl Interface` type expression (`&impl Interface` = pointer to it).
     impl_type: NodeIdx,
+    /// Closure literal `|x, y| expr` or `|x| { ... }`. `env` is populated by
+    /// the semantic passes (captured bindings); the parser leaves it empty.
+    closure: struct { params: NodeList, body: NodeIdx, env: NodeList },
+    /// `comptime { ... }` — `body` is a block node.
+    comptime_block: NodeIdx,
+    /// `comptime expr`.
+    comptime_expr: NodeIdx,
+    /// `lhs |> rhs` pipeline.
+    pipeline: struct { lhs: NodeIdx, rhs: NodeIdx },
+    /// Postfix `?` error propagation on `operand`.
+    try_propagate: NodeIdx,
+    /// `region name (: allocator_type)? { stmt* }` arena scope.
+    region_expr: struct { name: StringRef, allocator: ?NodeIdx, body: NodeIdx },
+    /// `move expr` explicit move into a binding.
+    move_expr: NodeIdx,
+    /// `@name(args)` comptime builtin call.
+    comptime_call: struct { name: StringRef, args: NodeList },
 
     // Statements
     let_stmt: struct { mutable: bool, name: StringRef, ty: ?NodeIdx, init_expr: ?NodeIdx },
     return_stmt: struct { value: ?NodeIdx },
     expr_stmt: struct { expr: NodeIdx },
     defer_stmt: struct { expr: NodeIdx },
-    print_stmt: struct { value: NodeIdx },
 
     // Declarations
     fn_decl: struct {
@@ -97,18 +113,10 @@ pub const Node = union(enum) {
         params: NodeList,
         return_type: ?NodeIdx,
         body: NodeIdx,
-        is_override: bool,
     },
     struct_decl: struct {
         name: StringRef,
         generic_params: NodeList,
-        fields: NodeList,
-        methods: NodeList,
-    },
-    class_decl: struct {
-        name: StringRef,
-        generic_params: NodeList,
-        parent: ?NodeIdx,
         fields: NodeList,
         methods: NodeList,
     },
@@ -123,7 +131,6 @@ pub const Node = union(enum) {
         methods: NodeList,
     },
     impl_block: struct { self_type: NodeIdx, methods: NodeList },
-    prop_decl: struct { name: StringRef, ty: NodeIdx, getter: NodeIdx, setter: ?NodeIdx },
     import_decl: struct { path: NodeList, alias: ?StringRef },
 
     // Control flow
@@ -141,13 +148,17 @@ pub const Node = union(enum) {
     param: struct { name: StringRef, ty: NodeIdx },
     field: struct { name: StringRef, ty: TypeRepr },
     enum_variant: struct { name: StringRef, fields: NodeList },
-    match_arm: struct { pattern: NodeIdx, body: NodeIdx },
+    /// `pattern (if guard)? => body`. `guard` is an optional boolean expr.
+    match_arm: struct { pattern: NodeIdx, guard: ?NodeIdx, body: NodeIdx },
     struct_init_field: struct { name: StringRef, value: NodeIdx },
 };
 
 pub const TypeRepr = union(enum) {
     plain: NodeIdx,
-    pointer: NodeIdx,
+    /// `&T` shared reference.
+    reference: NodeIdx,
+    /// `&mut T` exclusive reference.
+    mut_reference: NodeIdx,
     generic_app: struct { base: NodeIdx, args: NodeList },
 };
 

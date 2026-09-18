@@ -124,32 +124,6 @@ pub const Resolver = struct {
                 }
                 self.scopes.popScope();
             },
-            .class_decl => |c| {
-                try self.scopes.insert(self.nameSlice(c.name), .{
-                    .name = c.name,
-                    .kind = .class_type,
-                    .decl_node = decl_idx,
-                    .type_idx = TypeIdx.none,
-                });
-                const class_scope = try self.scopes.pushScope(scope_idx);
-                for (c.fields.indices) |field_idx| {
-                    const field = self.arena.get(field_idx);
-                    const field_name = self.nameSlice(field.field.name);
-                    if (self.scopes.lookupCurrent(field_name) != null) {
-                        self.errorAt(field_idx, "duplicate field '{s}' in class", .{field_name});
-                    }
-                    try self.scopes.insert(field_name, .{
-                        .name = field.field.name,
-                        .kind = .local,
-                        .decl_node = field_idx,
-                        .type_idx = TypeIdx.none,
-                    });
-                }
-                for (c.methods.indices) |method_idx| {
-                    try self.collectFnInScope(method_idx, class_scope);
-                }
-                self.scopes.popScope();
-            },
             .enum_decl => |e| {
                 try self.scopes.insert(self.nameSlice(e.name), .{
                     .name = e.name,
@@ -227,14 +201,6 @@ pub const Resolver = struct {
             },
             .struct_decl => |s| {
                 for (s.methods.indices) |method_idx| {
-                    try self.resolveDecl(method_idx);
-                }
-            },
-            .class_decl => |c| {
-                if (c.parent) |parent| {
-                    try self.resolveExpr(parent);
-                }
-                for (c.methods.indices) |method_idx| {
                     try self.resolveDecl(method_idx);
                 }
             },
@@ -332,9 +298,6 @@ pub const Resolver = struct {
             .defer_stmt => |d| {
                 try self.resolveExpr(d.expr);
             },
-            .print_stmt => |p| {
-                try self.resolveExpr(p.value);
-            },
             .if_expr => |i| {
                 try self.resolveExpr(i.cond);
                 try self.resolveStmt(i.then_body);
@@ -415,10 +378,16 @@ pub const Resolver = struct {
                 for (pattern.call.args.indices) |arg_idx| {
                     try self.resolveExpr(arg_idx);
                 }
+                if (arm.match_arm.guard) |guard| {
+                    try self.resolveExpr(guard);
+                }
                 try self.resolveExpr(arm.match_arm.body);
                 self.scopes.popScope();
             } else {
                 try self.resolveExpr(arm.match_arm.pattern);
+                if (arm.match_arm.guard) |guard| {
+                    try self.resolveExpr(guard);
+                }
                 try self.resolveExpr(arm.match_arm.body);
             }
         }
@@ -429,6 +398,7 @@ pub const Resolver = struct {
         switch (expr.*) {
             .identifier => |id| {
                 const name = self.nameSlice(id);
+                if (std.mem.eql(u8, name, "_")) return;
                 if (isBuiltinTypeName(name)) return;
                 if (ast.findEnumVariant(self.arena, self.source, self.module_node, name) != null) return;
                 if (self.scopes.lookup(name, self.scopes.currentScope())) |_| {
@@ -458,6 +428,44 @@ pub const Resolver = struct {
                 }
             },
             .impl_type => |inner| try self.resolveExpr(inner),
+            .closure => |cl| {
+                _ = try self.scopes.pushScope(self.scopes.currentScope());
+                for (cl.params.indices) |param_idx| {
+                    const param = self.arena.get(param_idx);
+                    if (param.param.ty != NodeIdx.none) {
+                        try self.resolveExpr(param.param.ty);
+                    }
+                    try self.scopes.insert(self.nameSlice(param.param.name), .{
+                        .name = param.param.name,
+                        .kind = .param,
+                        .decl_node = param_idx,
+                        .type_idx = TypeIdx.none,
+                    });
+                }
+                try self.resolveExpr(cl.body);
+                self.scopes.popScope();
+            },
+            .comptime_block => |inner| try self.resolveStmt(inner),
+            .comptime_expr => |inner| try self.resolveExpr(inner),
+            .comptime_call => |cc| {
+                for (cc.args.indices) |arg| {
+                    try self.resolveExpr(arg);
+                }
+            },
+            .pipeline => |p| {
+                try self.resolveExpr(p.lhs);
+                try self.resolveExpr(p.rhs);
+            },
+            .try_propagate => |inner| try self.resolveExpr(inner),
+            .move_expr => |inner| try self.resolveExpr(inner),
+            .region_expr => |r| {
+                if (r.allocator) |alloc_ty| {
+                    try self.resolveExpr(alloc_ty);
+                }
+                _ = try self.scopes.pushScope(self.scopes.currentScope());
+                try self.resolveStmt(r.body);
+                self.scopes.popScope();
+            },
             .field_access => |fa| {
                 try self.resolveExpr(fa.object);
             },
@@ -499,8 +507,8 @@ pub const Resolver = struct {
                 try self.resolveMatchArms(m);
             },
             .param, .field, .enum_variant, .match_arm, .struct_init_field => {},
-            .module, .fn_decl, .struct_decl, .class_decl, .enum_decl, .interface_decl, .impl_block, .prop_decl, .import_decl => {},
-            .let_stmt, .return_stmt, .expr_stmt, .defer_stmt, .print_stmt, .while_expr, .for_range, .for_each => {},
+            .module, .fn_decl, .struct_decl, .enum_decl, .interface_decl, .impl_block, .import_decl => {},
+            .let_stmt, .return_stmt, .expr_stmt, .defer_stmt, .while_expr, .for_range, .for_each => {},
         }
     }
 };
@@ -580,7 +588,7 @@ test "resolve: enum declaration" {
 test "resolve: interface declaration" {
     var res = try runResolve(std.testing.allocator,
         \\interface Speakable {
-        \\    fn speak(self: *Self) -> String
+        \\    fn speak(self: &Self) -> String
         \\}
     );
     defer {
@@ -716,7 +724,7 @@ test "resolve: field access" {
         \\}
         \\fn main() {
         \\    let v: Vec2 = Vec2{ .x = 1.0, .y = 2.0 }
-        \\    let a := v.x
+        \\    let a = v.x
         \\}
     );
     defer {
