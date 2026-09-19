@@ -29,7 +29,7 @@ Implementation targets, per layer:
 | `compiler/semantic/types.zig` | `SemType` union incl. the `function` member and generic `app` representation, `TypePool` |
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
-| `compiler/semantic/typecheck.zig` | typing rules R4–R38, `?` rules R26–R29, constraint eval ordering |
+| `compiler/semantic/typecheck.zig` | typing rules R4–R39, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
 
@@ -448,17 +448,20 @@ instances live in the compiler's internal namespace; users never write them.
 
 A generic param is constrained **by the comptime code that mentions it**.
 
-- **R23a.** Comptime builtins evaluate to comptime values once their args are concrete:
+- **R23a.** The comptime builtin roster is final (ADR-0001 §3) — exactly six builtins,
+  and each evaluates to a comptime value once its args are concrete:
   - `@typeOf(x)` — the type of `x`;
   - `@sizeOf(T)` — `u64` byte size of `T` per §3;
+  - `@alignOf(T)` — `u64` natural alignment of `T` per §3;
   - `@hasField(T, "name")` — `bool`: true iff `T` is a non-generic-or-instantiated
     struct with that field;
-  - `@field(x, "name")` — dynamic-access field value (comptime when `x` is comptime).
-  (The roster beyond these four is finalized separately; the semantics of the four above
-  are fixed by this document.)
+  - `@field(x, "name")` — dynamic-access field value (comptime when `x` is comptime);
+  - `@assert(cond [, "msg"])` — comptime-only; a false condition is a compile error
+    (the comptime failure primitive). Nothing beyond these six exists; `@offsetOf`,
+    `@bitSizeOf`, and enum introspection are deliberately deferred (ADR-0001 §3).
 - **R23b.** During instantiation, a `comptime` expression containing substituted `T`
   is evaluated; a **false** expected condition (e.g. a `comptime if` guard that must
-  hold, an explicit `comptime { assert(...) }`) produces a compile error naming the
+  hold, an explicit `@assert(false, "…")`) produces a compile error naming the
   constraint: "generic constraint not satisfied: T = i32 does not satisfy
   @hasField(T, \"name\")". Type checking of the instantiated clone then stops at that
   use.
@@ -591,10 +594,12 @@ level before lowering:
 
 ### 9.2 Composition prelude — R31
 
-The prelude functions `id`, `compose`, `curry`, `uncurry`, `pipe` (`docs/syntax.md` §6)
-have source-expansion semantics: each is equivalent to an explicit closure, so each
-compiles through the exact closure machinery of §5–§6 (stack envs, hidden-env ABI,
-R16e direct-call fast path when operands are statically known):
+The composition prelude is **final** (ADR-0001 §1): exactly `id`, `compose`, `curry`,
+`uncurry`, `pipe` (`docs/syntax.md` §6.1). All five are compiler-implicit generic
+functions predeclared in every module's root scope. Each has source-expansion semantics:
+it is equivalent to an explicit closure, so each compiles through the exact closure
+machinery of §5–§6 (stack envs, hidden-env ABI, R16e direct-call fast path when operands
+are statically known):
 
 | Prelude call | Equivalent (source expansion) |
 |---|---|
@@ -606,13 +611,35 @@ R16e direct-call fast path when operands are statically known):
 
 - **R31a.** `compose(f, g).type = fn(A) -> C` when `g: fn(A) -> B` and `f: fn(B) -> C`;
   the captured-env types come from the operands (§4.2/R5 value typing, R11 closure
-  typing).
+  typing). `curry(f) : fn(A) -> fn(B) -> R` when `f: fn(A, B) -> R`;
+  `uncurry(h) : fn(A, B) -> R` when `h: fn(A) -> fn(B) -> R`; `id(x) = x`;
+  `pipe(x, f) = f(x)` typed `fn(T, fn(T) -> U) -> U`.
 - **R31b.** When `f`/`g` are statically known fn names (or lifted closures the compiler
   can see), the expansion's inner calls lower directly (`buildCall`) — `curry(add)(1)(2)`
   emits two direct calls with stack envs, no `call_ptr`, satisfying the "monomorphized to
   direct calls" requirement. Dynamic operands use fn-value `call_ptr` (§6.4).
 - **R31c.** `compose`/`curry` have no runtime identity: a `compose` expression is *not* a
   boxed heap object; it is the closure (16-byte fn value + env record).
+- **R31d.** **Name reservation.** `id`, `pipe`, `compose`, `curry`, `uncurry` (and the IO
+  prelude `print`, R39) are predeclared symbols in every module's root scope. Redefining
+  or shadowing them at any scope is an error — R6's at-most-one-`fn`-per-name rule extended
+  so the R16e/constraint machinery's by-name recognition of prelude uses is always sound.
+- **R31e.** Because all five are generic, their instantiation follows §7 (lazy per-args
+  clone, cache, mangling when lowered as fn instances). A user never writes them.
+
+### 9.3 IO prelude — R39
+
+`print(x: String)` (ADR-0001 §2; `docs/syntax.md` §6.2) is a predeclared, non-generic,
+runtime-only fn writing `x` + newline to stdout:
+
+- **R39a.** Lowers to a **direct extern call** (C runtime `puts`); it participates in the
+  uniform calling convention only as any extern call does (R17: `buildExternCall`, no env
+  slot). It is not zero-cost-monomorphized — it is IO.
+- **R39b.** `print` in any comptime context is a compile error ("cannot call IO prelude at
+  comptime").
+- **R39c.** `print` is the only prelude fn that is not a composition fn; it obeys §9.2's
+  name reservation (R31d). Formatted or other IO functions are outside the prelude
+  (future stdlib).
 
 ## 10. Interaction rules
 
@@ -653,10 +680,11 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | first-class fn values (call-through-ptr) | R3, R6, R14, R16 |
 | `compose`/`curry`/`id`/`pipe` zero-cost | R31 |
 | `\|>` pipe + hole | R30 |
+| `print` IO prelude | R39 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
-| `@hasField`/`@sizeOf`/`@field`/`@typeOf` constraints | R23 |
+| `@hasField`/`@sizeOf`/`@field`/`@typeOf`/`@alignOf`/`@assert` constraints | R23 |
 | structs as pure data, aggregates | R1, R17, R18 |
 | enum sum types | R2 |
 | region / implicit memory model | M1–M6, R10, R12 |

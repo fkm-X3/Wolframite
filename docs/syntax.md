@@ -344,15 +344,18 @@ a closure `|x| e` coerces to `fn(T) -> U` (its env is the captured set).
 ```
 
 `lhs |> rhs` threads `lhs` as an implicit argument into a call/closure on the rhs
-(binding at precedence level 1, loosest). Canonical form:
+(binding at precedence level 1, loosest). Canonical forms (finalized; `docs/semantics.md`
+R30):
 
 ```wfr
 speak(d)      ≡  d |> speak
-add(v1, v2)   ≡  v1 |> add(_, v2)     // `_` = hole filled by the piped value (target)
+add(v1, v2)   ≡  v1 |> add(_, v2)     // `_` = hole filled by the piped value
+add(v1, v2)   ≡  v1 |> add(v2)        // no hole: piped value is argument 0
 ```
 
-Exact `_`-hole semantics are finalized with the prelude decision; the minimum guaranteed
-form is function application: `d |> speak` ≡ `speak(d)`.
+With a single `_`-hole the piped value replaces the hole; without a hole it prepends as
+argument 0; against a bare fn name it is application. `|>` is the syntactic form of the
+prelude `pipe(x, f)` (R30f), which is the first-class form.
 
 ### 4.13 Error propagation `?`
 
@@ -386,14 +389,20 @@ fn main() -> Result[i32, String] {
 ```
 
 Comptime executes code during compilation (compile-time metaprogramming).
-Comptime builtins are prefixed with `@` and are usable in comptime contexts:
+Comptime builtins are prefixed with `@` and are usable in comptime contexts.
+The roster is **final** (locked in ADR-0001):
 
-- `@sizeOf(T)` — byte size of a type
-- `@hasField(T, "name")` — compile-time field presence test (drives generic constraints)
-- `@field(x, "name")` — dynamic-name field access
-- `@typeOf(x)` — type of an expression (comptime)
+- `@typeOf(x)` — type of an expression (comptime type value)
+- `@sizeOf(T)` — byte size of `T` (`u64`, layout rules in `docs/semantics.md` §3)
+- `@alignOf(T)` — natural alignment of `T` (`u64`)
+- `@hasField(T, "name")` — `bool`: true iff `T` is a struct with field `name` (drives generic constraints)
+- `@field(x, "name")` — dynamic-name field access (comptime iff `x` is comptime)
+- `@assert(cond [, "msg"])` — comptime-only; a false condition is a compile error (the
+  comptime failure primitive, R23b)
 
-The exact builtin roster is finalized separately; the syntax shape above is fixed now.
+Beyond this roster there are no comptime builtins; `@offsetOf`/`@bitSizeOf`/enum
+introspection are deliberately deferred (see ADR-0001). Generic constraints are *only*
+expressed through this roster (computed on substituted types, `docs/semantics.md` §7.5).
 
 ### 4.15 region
 
@@ -493,15 +502,36 @@ mutating fn takes `&mut T`: `fn push(v: &mut Vec2, d: f64) { v.* = ... }`.
 
 ## 6. Prelude (surface-level)
 
-The following builtins are in scope and are syntactically plain identifiers
-(no special tokens):
+The prelude is **compiler-implicit**: no source file, no `import`, no special tokens. The
+names below are predeclared plain identifiers in every module's root scope and **may not
+be redefined or shadowed** (a redefinition error; ADR-0001 §4). The roster is final.
 
-- `id(x)` — identity
-- `compose(f, g)` — `compose(f, g)(x) == f(g(x))`
-- `curry(f)` / `uncurry` — currying and uncurrying
-- `pipe(x, f)` — pipeline as a value (`pipe(x, f) == f(x)`)
+### 6.1 Composition prelude
 
-These must monomorphize to direct calls / stack envs (zero-cost functional abstractions).
+- `id(x)` — identity; `id(x) == x`
+- `pipe(x, f)` — functional pipeline; `pipe(x, f) == f(x)`; the first-class form of `|>` (R30)
+- `compose(f, g)` — right-to-left; `compose(f, g)(x) == f(g(x))`
+- `curry(f)` / `uncurry(h)` — currying/uncurrying; `curry(f)(a)(b) == f(a, b)`,
+  `uncurry(h)(a, b) == h(a)(b)`
+
+Typing: `id: fn(T) -> T`; `pipe: fn(T, fn(T) -> U) -> U`;
+`compose: fn(fn(B) -> C, fn(A) -> B) -> fn(A) -> C`;
+`curry: fn(fn(A, B) -> R) -> fn(A) -> fn(B) -> R`;
+`uncurry: fn(fn(A) -> fn(B) -> R) -> fn(A, B) -> R`.
+All five are generic functions instantiated by the ordinary generic machinery (R19–R21);
+each lowers through the closure machinery and monomorphizes to direct calls / stack envs
+(zero-cost functional abstractions, `docs/semantics.md` R31).
+
+### 6.2 IO prelude
+
+- `print(x: String)` — writes `x` plus a newline to stdout; lowered to a direct extern
+  call (C runtime `puts`). Runtime-only: comptime use is rejected. The only IO function in
+  this prelude; formatted/other IO is future stdlib work (ADR-0001 §2).
+
+### 6.3 Comptime builtins
+
+The six `@`-builtins are listed in §4.14. They are the *only* comptime builtins; the
+roster is final (ADR-0001 §3).
 
 ## 7. Conformance checklist (grammar coverage for the examples)
 
