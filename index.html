@@ -11,6 +11,18 @@
             --text: #e1e1e6;
             --accent: #ff6b4a;
             --code-bg: #0d0d0f;
+            
+            /* Syntax Highlighting Color Palette */
+            --syn-comment: #768390;
+            --syn-keyword: #ff6b4a;
+            --syn-type: #4eacff;
+            --syn-function: #d2a8ff;
+            --syn-string: #8ddb8c;
+            --syn-number: #f08c00;
+            --syn-operator: #f47067;
+            --syn-cmd: #e5c07b;
+            --syn-flag: #61afef;
+            --syn-url: #98c379;
         }
 
         body {
@@ -53,12 +65,27 @@
             border-radius: 8px;
             overflow-x: auto;
             border: 1px solid #2a2a30;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
         }
 
         code {
-            font-family: 'Courier New', Courier, monospace;
+            font-family: 'Fira Code', 'Cascadia Code', Consolas, 'Courier New', Courier, monospace;
+            font-size: 0.95rem;
             color: #f8f8f2;
+            tab-size: 4;
         }
+
+        /* Syntax Token Classes */
+        .tok-comment   { color: var(--syn-comment); font-style: italic; }
+        .tok-keyword   { color: var(--syn-keyword); font-weight: 600; }
+        .tok-type      { color: var(--syn-type); }
+        .tok-fn        { color: var(--syn-function); font-weight: 500; }
+        .tok-string    { color: var(--syn-string); }
+        .tok-num       { color: var(--syn-number); }
+        .tok-op        { color: var(--syn-operator); }
+        .tok-cmd       { color: var(--syn-cmd); font-weight: 600; }
+        .tok-flag      { color: var(--syn-flag); }
+        .tok-url       { color: var(--syn-url); text-decoration: underline; text-underline-offset: 2px; }
 
         .cta-buttons {
             display: flex;
@@ -77,6 +104,11 @@
             border: none;
             cursor: pointer;
             font-size: 1rem;
+            transition: opacity 0.2s ease;
+        }
+
+        .button:hover {
+            opacity: 0.9;
         }
 
         .button.secondary {
@@ -129,7 +161,7 @@
 
     <header>
         <h1>Wolframite</h1>
-        <p class="tagline">A fast, expressive, and lightweight programming language.</p>
+        <p class="tagline">A fast and lightweight programming language.</p>
         <div class="cta-buttons" style="justify-content: center;">
             <a href="#install" class="button">Get Started</a>
             <button id="docsBtn" class="button secondary">Documentation</button>
@@ -144,31 +176,30 @@
 
         <section id="example">
             <h2>Example Syntax</h2>
-            <pre><code>// Hello World in Wolframite
-fn main() -> i32 {
-    print("Hello, world!")
-    return 42
+            <pre><code><span class="tok-comment">// Hello World in Wolframite</span>
+<span class="tok-keyword">fn</span> <span class="tok-fn">main</span>() <span class="tok-op">-&gt;</span> <span class="tok-type">i32</span> {
+    <span class="tok-fn">print</span>(<span class="tok-string">"Hello, world!"</span>)
+    <span class="tok-keyword">return</span> <span class="tok-num">42</span>
 }</code></pre>
         </section>
 
         <section id="install">
             <h2>Quick Install</h2>
             <h3>Linux</h3>
-            <pre><code>curl -sSL https://fkm.is-a.dev/Wolframite/install.sh | sh</code></pre>
+            <pre><code><span class="tok-cmd">curl</span> <span class="tok-flag">-sSL</span> <span class="tok-url">https://fkm.is-a.dev/Wolframite/install.sh</span> <span class="tok-op">|</span> <span class="tok-cmd">sh</span></code></pre>
             <h3>Windows</h3>
-            <pre><code>irm https://fkm.is-a.dev/Wolframite/install.ps1 | iex</code></pre>
+            <pre><code><span class="tok-cmd">irm</span> <span class="tok-url">https://fkm.is-a.dev/Wolframite/install.ps1</span> <span class="tok-op">|</span> <span class="tok-cmd">iex</span></code></pre>
         </section>
     </main>
 
     <footer>
-        <p>&copy; 2026 Fkm_X3. Released under Apatche 2.0.</p>
+        <p>&copy; 2026 Fkm_X3. Released under Apache 2.0.</p>
     </footer>
 
-    <!-- Pop-up Overlay -->
     <div id="docsModal" class="modal-overlay">
         <div class="modal-box">
             <h3>Notice</h3>
-            <p>Doc's don't exist yet</p>
+            <p>Docs don't exist yet as the language is undergoing a syntax redo. Proper documentation outside of the <a href="https://github.com/fkm-X3/Wolframite/tree/main/docs">docs/</a> in the folder in the <a href="https://github.com/fkm-X3/Wolframite">Repo</a>.</p>
             <button id="closeModal" class="button" style="margin-top: 1rem;">Close</button>
         </div>
     </div>
