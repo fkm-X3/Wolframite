@@ -670,21 +670,27 @@ test "lexer: enum definition" {
     try std.testing.expectEqual(TokenTag.rbracket, tokens[4].tag);
 }
 
-test "lexer: interface definition" {
+test "lexer: impl and interface lex as identifiers" {
     const source =
-        \\interface Speakable {
-        \\    fn speak(self: *Self) -> String
-        \\}
+        \\interface Speakable
+        \\impl Vec2
     ;
 
     var lexer = Lexer.init(std.testing.allocator, source);
     defer lexer.deinit();
 
     const tokens = try lexer.tokenize();
-    try std.testing.expect(tokens.len > 5);
-    try std.testing.expectEqual(TokenTag.interface_kw, tokens[0].tag);
+    try std.testing.expectEqual(@as(usize, 6), tokens.len);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[0].tag);
+    try std.testing.expectEqualStrings("interface", tokens[0].lexeme(lexer.source));
     try std.testing.expectEqual(TokenTag.identifier, tokens[1].tag);
     try std.testing.expectEqualStrings("Speakable", tokens[1].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.newline, tokens[2].tag);
+    try std.testing.expectEqual(TokenTag.identifier, tokens[3].tag);
+    try std.testing.expectEqualStrings("impl", tokens[3].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.identifier, tokens[4].tag);
+    try std.testing.expectEqualStrings("Vec2", tokens[4].lexeme(lexer.source));
+    try std.testing.expectEqual(TokenTag.eof, tokens[5].tag);
 }
 
 test "lexer: for loop" {

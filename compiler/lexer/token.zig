@@ -14,8 +14,6 @@ pub const TokenTag = enum(u8) {
     mut_kw,
     struct_kw,
     enum_kw,
-    impl_kw,
-    interface_kw,
     return_kw,
     if_kw,
     else_kw,
@@ -96,8 +94,6 @@ pub const TokenTag = enum(u8) {
             .mut_kw => "mut",
             .struct_kw => "struct",
             .enum_kw => "enum",
-            .impl_kw => "impl",
-            .interface_kw => "interface",
             .return_kw => "return",
             .if_kw => "if",
             .else_kw => "else",
@@ -185,8 +181,6 @@ pub const KEYWORDS = init: {
         .{ "mut", .mut_kw },
         .{ "struct", .struct_kw },
         .{ "enum", .enum_kw },
-        .{ "impl", .impl_kw },
-        .{ "interface", .interface_kw },
         .{ "return", .return_kw },
         .{ "if", .if_kw },
         .{ "else", .else_kw },
@@ -244,4 +238,15 @@ test "drops class family keywords" {
     try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("this"));
     try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("final"));
     try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("print"));
+}
+
+test "impl and interface are plain identifiers" {
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("impl"));
+    try std.testing.expectEqual(@as(?TokenTag, null), lookupKeyword("interface"));
+}
+
+test "keeps data-and-function keywords" {
+    try std.testing.expectEqual(@as(?TokenTag, .struct_kw), lookupKeyword("struct"));
+    try std.testing.expectEqual(@as(?TokenTag, .enum_kw), lookupKeyword("enum"));
+    try std.testing.expectEqual(@as(?TokenTag, .fn_kw), lookupKeyword("fn"));
 }

@@ -229,14 +229,6 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.parseEnumDecl();
             },
-            .interface_kw => {
-                _ = self.advance();
-                return self.parseInterfaceDecl();
-            },
-            .impl_kw => {
-                _ = self.advance();
-                return self.parseImplBlock();
-            },
             .import_kw => {
                 _ = self.advance();
                 return self.parseImportDecl();
@@ -245,7 +237,7 @@ pub const Parser = struct {
                 return self.parseLetStmt();
             },
             else => {
-                self.errorHere("expected declaration (fn, struct, enum, interface, impl, import, comptime, let, mut)", .{});
+                self.errorHere("expected declaration (fn, struct, enum, import, comptime, let, mut)", .{});
                 return null;
             },
         }
@@ -381,90 +373,6 @@ pub const Parser = struct {
             .name = self.makeStringRef(name_tok),
             .generic_params = generic_params,
             .variants = self.arena.allocNodeList(variants.items) catch NodeList{ .indices = &.{} },
-        } });
-    }
-
-    fn parseInterfaceDecl(self: *Parser) ?NodeIdx {
-        const name_tok = self.expect(.identifier) orelse return null;
-        const generic_params = self.parseGenericParams() orelse NodeList{ .indices = &.{} };
-
-        if (self.expect(.lbrace) == null) return null;
-
-        var methods = std.ArrayList(NodeIdx).empty;
-        defer methods.deinit(self.allocator);
-
-        while (true) {
-            self.skipNewlinesAndSemicolons();
-            if (self.check(.rbrace)) break;
-
-            if (!self.check(.fn_kw)) {
-                self.errorHere("expected 'fn' in interface", .{});
-                self.recoverTo(.rbrace);
-                break;
-            }
-            _ = self.advance();
-
-            const name_tok2 = self.expect(.identifier) orelse {
-                self.recoverTo(.rbrace);
-                break;
-            };
-            const params = self.parseParamList() orelse {
-                self.recoverTo(.rbrace);
-                break;
-            };
-
-            var return_type: ?NodeIdx = null;
-            self.skipNewlinesAndSemicolons();
-            if (self.expectPeek(.arrow)) |_| {
-                return_type = self.parseExpr(Precedence.none.toInt());
-                self.skipNewlinesAndSemicolons();
-            }
-
-            methods.append(self.allocator, self.appendNode(.{ .fn_decl = .{
-                .name = self.makeStringRef(name_tok2),
-                .generic_params = NodeList{ .indices = &.{} },
-                .params = params,
-                .return_type = return_type,
-                .body = NodeIdx.none,
-            } })) catch unreachable;
-        }
-
-        _ = self.expect(.rbrace);
-        return self.appendNode(.{ .interface_decl = .{
-            .name = self.makeStringRef(name_tok),
-            .generic_params = generic_params,
-            .methods = self.arena.allocNodeList(methods.items) catch NodeList{ .indices = &.{} },
-        } });
-    }
-
-    fn parseImplBlock(self: *Parser) ?NodeIdx {
-        const self_type = self.parseExpr(Precedence.none.toInt()) orelse return null;
-        if (self.expect(.lbrace) == null) return null;
-
-        var methods = std.ArrayList(NodeIdx).empty;
-        defer methods.deinit(self.allocator);
-
-        while (true) {
-            self.skipNewlinesAndSemicolons();
-            if (self.check(.rbrace)) break;
-
-            if (!self.check(.fn_kw)) {
-                self.errorHere("expected 'fn' in impl block", .{});
-                self.recoverTo(.rbrace);
-                break;
-            }
-            _ = self.advance();
-            const method = self.parseFnDecl() orelse {
-                self.recoverTo(.rbrace);
-                break;
-            };
-            methods.append(self.allocator, method) catch unreachable;
-        }
-
-        _ = self.expect(.rbrace);
-        return self.appendNode(.{ .impl_block = .{
-            .self_type = self_type,
-            .methods = self.arena.allocNodeList(methods.items) catch NodeList{ .indices = &.{} },
         } });
     }
 
@@ -908,11 +816,6 @@ pub const Parser = struct {
                 const operand = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
                 return self.appendNode(.{ .move_expr = operand });
             },
-            .impl_kw => {
-                _ = self.advance();
-                const inner = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
-                return self.appendNode(.{ .impl_type = inner });
-            },
             .pipe, .pipe_pipe => return self.parseClosure(),
             .comptime_kw => return self.parseComptime(),
             .region_kw => return self.parseRegion(),
@@ -1201,6 +1104,20 @@ fn runTest(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     return TestResult{ .arena = arena, .node = module };
 }
 
+fn expectParseErrors(allocator: std.mem.Allocator, source: []const u8) !void {
+    var arena = ast.AstArena.init(allocator);
+    defer arena.deinit();
+    var lex = @import("../lexer/lexer.zig").Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    var diags = diag.Diagnostics.init(allocator);
+    diags.owns_messages = true;
+    defer diags.deinit();
+    var parser = Parser.init(allocator, tokens, source, &arena, &diags);
+    _ = parser.parseModule();
+    try std.testing.expect(diags.hasErrors());
+}
+
 fn getMod(res: *const TestResult) *const Node {
     return res.arena.get(res.node);
 }
@@ -1263,17 +1180,12 @@ test "parser: enum declaration" {
     try std.testing.expectEqual(@as(usize, 2), decl.enum_decl.variants.indices.len);
 }
 
-test "parser: interface declaration" {
-    var res = try runTest(std.testing.allocator,
+test "parser: interface declaration is rejected" {
+    try expectParseErrors(std.testing.allocator,
         \\interface Speakable {
         \\    fn speak(self: &Self) -> String
         \\}
     );
-    defer res.arena.deinit();
-    const mod = getMod(&res);
-    const decl = res.arena.get(mod.module.decls.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .interface_decl), tagOf(decl));
-    try std.testing.expectEqual(@as(usize, 1), decl.interface_decl.methods.indices.len);
 }
 
 test "parser: if expression" {
@@ -1485,18 +1397,22 @@ test "parser: single-expression function" {
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(res.arena.get(ret.value.?)));
 }
 
-test "parser: impl block" {
-    var res = try runTest(std.testing.allocator,
+test "parser: impl block is rejected" {
+    try expectParseErrors(std.testing.allocator,
         \\impl Vec2 {
         \\    fn zero() -> Vec2 {
         \\        return Vec2{ .x = 0.0, .y = 0.0 }
         \\    }
         \\}
     );
-    defer res.arena.deinit();
-    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .impl_block), tagOf(decl));
-    try std.testing.expectEqual(@as(usize, 1), decl.impl_block.methods.indices.len);
+}
+
+test "parser: impl type is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\fn describe(s: &impl Shape) -> i32 {
+        \\    return s.speak()
+        \\}
+    );
 }
 
 test "parser: struct init expression" {

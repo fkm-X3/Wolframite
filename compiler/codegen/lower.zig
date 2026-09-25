@@ -1842,8 +1842,8 @@ test "lower: string index access loads a byte" {
     try std.testing.expect(std.mem.indexOf(u8, text, "load") != null);
 }
 
-test "lower: interface method call dispatches through a vtable" {
-    var res = try checkLower(std.testing.allocator,
+test "lower: interface method call no longer parses" {
+    var res = try runLower(std.testing.allocator,
         \\interface Shape {
         \\    fn area(self: &Shape) -> i32
         \\    fn name(self: &Shape) -> i32
@@ -1866,10 +1866,5 @@ test "lower: interface method call dispatches through a vtable" {
         \\}
     );
     defer res.deinit();
-
-    var buf: [8192]u8 = undefined;
-    const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "vtable_Square_Shape") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "store") != null);
+    try std.testing.expect(res.diagnostics.hasErrors());
 }

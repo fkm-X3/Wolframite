@@ -585,7 +585,7 @@ test "resolve: enum declaration" {
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 
-test "resolve: interface declaration" {
+test "resolve: interface declaration no longer parses" {
     var res = try runResolve(std.testing.allocator,
         \\interface Speakable {
         \\    fn speak(self: &Self) -> String
@@ -596,7 +596,7 @@ test "resolve: interface declaration" {
         res.type_pool.deinit();
         res.diagnostics.deinit();
     }
-    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expect(res.diagnostics.hasErrors());
 }
 
 test "resolve: variable references and scoping" {
@@ -745,7 +745,7 @@ test "resolve: import declaration" {
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 
-test "resolve: impl block" {
+test "resolve: impl block no longer parses" {
     var res = try runResolve(std.testing.allocator,
         \\struct Vec2 {
         \\    x: f64
@@ -762,5 +762,5 @@ test "resolve: impl block" {
         res.type_pool.deinit();
         res.diagnostics.deinit();
     }
-    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expect(res.diagnostics.hasErrors());
 }
