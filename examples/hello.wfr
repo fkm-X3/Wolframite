@@ -1,3 +1,5 @@
+// This doesn't compile, no std lib means no print function.
+
 fn main() -> i32 {
     print("Hello, world!")
     return 42
