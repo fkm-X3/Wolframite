@@ -105,7 +105,7 @@ pub const Resolver = struct {
                     .decl_node = decl_idx,
                     .type_idx = TypeIdx.none,
                 });
-                const struct_scope = try self.scopes.pushScope(scope_idx);
+                _ = try self.scopes.pushScope(scope_idx);
                 for (s.fields.indices) |field_idx| {
                     const field = self.arena.get(field_idx);
                     const field_name = self.nameSlice(field.field.name);
@@ -118,9 +118,6 @@ pub const Resolver = struct {
                         .decl_node = field_idx,
                         .type_idx = TypeIdx.none,
                     });
-                }
-                for (s.methods.indices) |method_idx| {
-                    try self.collectFnInScope(method_idx, struct_scope);
                 }
                 self.scopes.popScope();
             },
@@ -147,22 +144,6 @@ pub const Resolver = struct {
                 }
                 self.scopes.popScope();
             },
-            .interface_decl => |i| {
-                try self.scopes.insert(self.nameSlice(i.name), .{
-                    .name = i.name,
-                    .kind = .interface_type,
-                    .decl_node = decl_idx,
-                    .type_idx = TypeIdx.none,
-                });
-                const iface_scope = try self.scopes.pushScope(scope_idx);
-                for (i.methods.indices) |method_idx| {
-                    try self.collectFnInScope(method_idx, iface_scope);
-                }
-                self.scopes.popScope();
-            },
-            .impl_block => |ib| {
-                _ = ib;
-            },
             .import_decl => |imp| {
                 const first_part = self.arena.get(imp.path.indices[0]);
                 const name = self.nameSlice(first_part.identifier);
@@ -177,45 +158,11 @@ pub const Resolver = struct {
         }
     }
 
-    fn collectFnInScope(self: *Resolver, method_idx: NodeIdx, _: u32) !void {
-        const method = self.arena.get(method_idx);
-        if (method.* != .fn_decl) return;
-        const fn_name = self.nameSlice(method.fn_decl.name);
-        if (self.scopes.lookupCurrent(fn_name) != null) {
-            self.errorAt(method_idx, "duplicate method '{s}'", .{fn_name});
-        }
-        try self.scopes.insert(fn_name, .{
-            .name = method.fn_decl.name,
-            .kind = .function,
-            .decl_node = method_idx,
-            .type_idx = TypeIdx.none,
-        });
-    }
-
     fn resolveDecl(self: *Resolver, decl_idx: NodeIdx) anyerror!void {
         const decl = self.arena.get(decl_idx);
         switch (decl.*) {
-            .fn_decl => |f| {
+            .fn_decl => {
                 try self.resolveFnDecl(decl_idx);
-                _ = f;
-            },
-            .struct_decl => |s| {
-                for (s.methods.indices) |method_idx| {
-                    try self.resolveDecl(method_idx);
-                }
-            },
-            .enum_decl => {},
-            .interface_decl => {},
-            .impl_block => |ib| {
-                try self.resolveExpr(ib.self_type);
-                const impl_scope = try self.scopes.pushScope(self.scopes.currentScope());
-                for (ib.methods.indices) |method_idx| {
-                    try self.collectFnInScope(method_idx, impl_scope);
-                }
-                for (ib.methods.indices) |method_idx| {
-                    try self.resolveDecl(method_idx);
-                }
-                self.scopes.popScope();
             },
             else => {},
         }
@@ -427,7 +374,19 @@ pub const Resolver = struct {
                     try self.resolveExpr(arg);
                 }
             },
-            .impl_type => |inner| try self.resolveExpr(inner),
+            .fn_type => |ft| {
+                for (ft.params.indices) |param_ty| {
+                    try self.resolveExpr(param_ty);
+                }
+                try self.resolveExpr(ft.return_type);
+            },
+            .fn_ref => |id| {
+                const name = self.nameSlice(id);
+                const sym = self.scopes.lookup(name, self.scopes.currentScope());
+                if (sym == null or sym.?.kind != .function) {
+                    self.errorAt(expr_idx, "'{s}' is not a function", .{name});
+                }
+            },
             .closure => |cl| {
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
                 for (cl.params.indices) |param_idx| {
@@ -507,7 +466,7 @@ pub const Resolver = struct {
                 try self.resolveMatchArms(m);
             },
             .param, .field, .enum_variant, .match_arm, .struct_init_field => {},
-            .module, .fn_decl, .struct_decl, .enum_decl, .interface_decl, .impl_block, .import_decl => {},
+            .module, .fn_decl, .struct_decl, .enum_decl, .import_decl => {},
             .let_stmt, .return_stmt, .expr_stmt, .defer_stmt, .while_expr, .for_range, .for_each => {},
         }
     }

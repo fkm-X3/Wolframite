@@ -288,30 +288,23 @@ pub const Parser = struct {
         if (self.expect(.lbrace) == null) return null;
 
         var fields = std.ArrayList(NodeIdx).empty;
-        var methods = std.ArrayList(NodeIdx).empty;
-        defer {
-            fields.deinit(self.allocator);
-            methods.deinit(self.allocator);
-        }
+        defer fields.deinit(self.allocator);
 
         while (true) {
             self.skipNewlinesAndSemicolons();
             if (self.check(.rbrace)) break;
 
             if (self.check(.fn_kw)) {
-                _ = self.advance();
-                const method = self.parseFnDecl() orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                methods.append(self.allocator, method) catch unreachable;
-            } else {
-                const field = self.parseField() orelse {
-                    self.recoverTo(.rbrace);
-                    break;
-                };
-                fields.append(self.allocator, field) catch unreachable;
+                self.errorHere("structs hold data only; declare a free function over the type instead", .{});
+                self.recoverTo(.rbrace);
+                break;
             }
+
+            const field = self.parseField() orelse {
+                self.recoverTo(.rbrace);
+                break;
+            };
+            fields.append(self.allocator, field) catch unreachable;
         }
 
         _ = self.expect(.rbrace);
@@ -319,7 +312,6 @@ pub const Parser = struct {
             .name = self.makeStringRef(name_tok),
             .generic_params = generic_params,
             .fields = self.arena.allocNodeList(fields.items) catch NodeList{ .indices = &.{} },
-            .methods = self.arena.allocNodeList(methods.items) catch NodeList{ .indices = &.{} },
         } });
     }
 
@@ -1163,7 +1155,6 @@ test "parser: struct declaration" {
     const decl = res.arena.get(mod.module.decls.indices[0]);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .struct_decl), tagOf(decl));
     try std.testing.expectEqual(@as(usize, 2), decl.struct_decl.fields.indices.len);
-    try std.testing.expectEqual(@as(usize, 0), decl.struct_decl.methods.indices.len);
 }
 
 test "parser: enum declaration" {
@@ -1257,8 +1248,8 @@ test "parser: import with alias" {
     try std.testing.expect(decl.import_decl.alias != null);
 }
 
-test "parser: struct with methods" {
-    var res = try runTest(std.testing.allocator,
+test "parser: struct with methods is rejected" {
+    try expectParseErrors(std.testing.allocator,
         \\struct Vec2 {
         \\    x: f64
         \\    y: f64
@@ -1268,11 +1259,6 @@ test "parser: struct with methods" {
         \\    }
         \\}
     );
-    defer res.arena.deinit();
-    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
-    try std.testing.expectEqual(@as(std.meta.Tag(Node), .struct_decl), tagOf(decl));
-    try std.testing.expectEqual(@as(usize, 2), decl.struct_decl.fields.indices.len);
-    try std.testing.expectEqual(@as(usize, 1), decl.struct_decl.methods.indices.len);
 }
 
 test "parser: let with type annotation" {

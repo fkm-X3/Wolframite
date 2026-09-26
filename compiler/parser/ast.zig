@@ -80,8 +80,14 @@ pub const Node = union(enum) {
     paren_expr: NodeIdx,
     struct_init: struct { ty: NodeIdx, fields: NodeList },
     range_expr: struct { start: NodeIdx, end: NodeIdx },
-    /// `impl Interface` type expression (`&impl Interface` = pointer to it).
-    impl_type: NodeIdx,
+    /// `fn(A, B) -> R`. Legal in type position (a first-class fn type) and in
+    /// expression position (a comptime type value, not a runtime function).
+    /// `params` holds one type node per parameter, in declaration order.
+    fn_type: struct { params: NodeList, return_type: NodeIdx },
+    /// A named function used as a value (`apply(add, 2, 3)`). The parser emits
+    /// a plain `identifier`; the resolver rewrites it here once the name is
+    /// known to denote a `fn`.
+    fn_ref: StringRef,
     /// Closure literal `|x, y| expr` or `|x| { ... }`. `env` is populated by
     /// the semantic passes (captured bindings); the parser leaves it empty.
     closure: struct { params: NodeList, body: NodeIdx, env: NodeList },
@@ -118,19 +124,12 @@ pub const Node = union(enum) {
         name: StringRef,
         generic_params: NodeList,
         fields: NodeList,
-        methods: NodeList,
     },
     enum_decl: struct {
         name: StringRef,
         generic_params: NodeList,
         variants: NodeList,
     },
-    interface_decl: struct {
-        name: StringRef,
-        generic_params: NodeList,
-        methods: NodeList,
-    },
-    impl_block: struct { self_type: NodeIdx, methods: NodeList },
     import_decl: struct { path: NodeList, alias: ?StringRef },
 
     // Control flow

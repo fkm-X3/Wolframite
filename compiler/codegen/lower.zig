@@ -1,9 +1,8 @@
 //! AST → Tungsten IR lowering.
 //!
 //! Walks a type-checked module and drives the Tungsten `api.Context` to build
-//! IR: one function per `fn`/method (methods mangled as `TypeName_method`),
-//! vtable globals per class, a deduplicated string literal pool, and
-//! alloca/malloc/field-offset lowering for structs/classes.
+//! IR: one function per `fn`, a deduplicated string literal pool, and
+//! alloca/malloc/field-offset lowering for structs.
 //!
 //! Value convention: every W value occupies one 8-byte slot (matching the
 //! backend's slot-based codegen). A `String` value is a pointer to a
@@ -38,28 +37,6 @@ const TypePool = types_mod.TypePool;
 const TypeIdx = types_mod.TypeIdx;
 const SemType = types_mod.SemType;
 
-/// Key for the synthetic per-(type, interface) vtable cache.
-const IfaceVtableKey = struct {
-    ty: NodeIdx,
-    iface: NodeIdx,
-};
-
-/// One method of a struct/class, plus its already-computed IR return type.
-pub const MethodEntry = struct {
-    fidx: api.FunctionIdx,
-    ret_ir: api.TypeIdx,
-};
-
-pub const MethodTable = struct {
-    by_name: std.StringHashMapUnmanaged(MethodEntry),
-    order: std.ArrayListUnmanaged(api.FunctionIdx),
-
-    fn deinit(self: *MethodTable, gpa: Allocator) void {
-        self.by_name.deinit(gpa);
-        self.order.deinit(gpa);
-    }
-};
-
 /// A name binding inside a function body.
 /// `value` is the SSA value (parameters) or slot pointer (locals);
 /// `ty` is the semantic type, resolved from the checker's cached node types.
@@ -92,14 +69,10 @@ pub const Lowerer = struct {
     f64_ty: api.TypeIdx,
     ptr_ty: api.TypeIdx,
 
-    /// fn_decl node -> created FunctionIdx (module functions and methods).
+    /// fn_decl node -> created FunctionIdx.
     fn_by_node: std.AutoHashMapUnmanaged(NodeIdx, api.FunctionIdx),
-    /// struct/class decl node -> method table.
-    methods: std.AutoHashMapUnmanaged(NodeIdx, MethodTable),
     /// class decl node -> vtable global.
     vtable_by_class: std.AutoHashMapUnmanaged(NodeIdx, api.GlobalIdx),
-    /// (type decl, interface decl) -> synthetic vtable in interface method order.
-    iface_vtables: std.AutoHashMapUnmanaged(IfaceVtableKey, api.GlobalIdx),
     /// (fn_decl node, FunctionIdx) pairs in creation order, for body lowering.
     all_functions: std.ArrayListUnmanaged(struct { node: NodeIdx, idx: api.FunctionIdx }),
 
@@ -146,9 +119,7 @@ pub const Lowerer = struct {
             .f64_ty = try ctx.floatType(.f64),
             .ptr_ty = undefined,
             .fn_by_node = .empty,
-            .methods = .empty,
             .vtable_by_class = .empty,
-            .iface_vtables = .empty,
             .all_functions = .empty,
             .params = .empty,
             .locals = .empty,
@@ -161,14 +132,8 @@ pub const Lowerer = struct {
     }
 
     pub fn deinit(self: *Lowerer) void {
-        var it = self.methods.valueIterator();
-        while (it.next()) |table| {
-            table.deinit(self.gpa);
-        }
-        self.methods.deinit(self.gpa);
         self.fn_by_node.deinit(self.gpa);
         self.vtable_by_class.deinit(self.gpa);
-        self.iface_vtables.deinit(self.gpa);
         self.all_functions.deinit(self.gpa);
         self.params.deinit(self.gpa);
         self.locals.deinit(self.gpa);
@@ -181,7 +146,7 @@ pub const Lowerer = struct {
     pub fn run(self: *Lowerer) !void {
         const module = self.arena.get(self.checker.module_node);
 
-        // Pass 1: create every function and index methods.
+        // Pass 1: create every function.
         for (module.module.decls.indices) |decl_idx| {
             const decl = self.arena.get(decl_idx);
             switch (decl.*) {
@@ -192,8 +157,6 @@ pub const Lowerer = struct {
                     }
                     _ = try self.createFunction(decl_idx, self.nameSlice(f.name));
                 },
-                .struct_decl => |s| try self.collectMethods(decl_idx, self.nameSlice(s.name), s.methods),
-                .impl_block => |ib| try self.collectImplMethods(decl_idx, ib),
                 else => {},
             }
         }
@@ -215,52 +178,6 @@ pub const Lowerer = struct {
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
         try self.all_functions.append(self.gpa, .{ .node = decl_idx, .idx = fidx });
         return fidx;
-    }
-
-    fn collectMethods(self: *Lowerer, decl_idx: NodeIdx, type_name: []const u8, methods: NodeList) !void {
-        const table = try self.methodTableFor(decl_idx);
-        for (methods.indices) |method_idx| {
-            const method = self.arena.get(method_idx);
-            if (method.* != .fn_decl) continue;
-            if (method.fn_decl.generic_params.indices.len > 0) continue;
-            const method_name = self.nameSlice(method.fn_decl.name);
-            const mangled = try std.fmt.allocPrint(self.gpa, "{s}_{s}", .{ type_name, method_name });
-            const fidx = try self.createFunction(method_idx, mangled);
-            self.gpa.free(mangled);
-            const ret_ir = self.irTypeFor(self.checker.nodeType(method_idx));
-            try table.by_name.put(self.gpa, method_name, .{ .fidx = fidx, .ret_ir = ret_ir });
-            try table.order.append(self.gpa, fidx);
-        }
-    }
-
-    fn collectImplMethods(self: *Lowerer, decl_idx: NodeIdx, ib: anytype) !void {
-        const st = self.arena.get(ib.self_type);
-        const type_name_ref: StringRef = switch (st.*) {
-            .identifier => |id| id,
-            .paren_expr => |p| switch (self.arena.get(p).*) {
-                .identifier => |id| id,
-                else => return,
-            },
-            else => return,
-        };
-        const type_name = self.nameSlice(type_name_ref);
-        const sym = self.checker.scopes.scopes.items[0].symbols.get(type_name) orelse {
-            self.codegenError(decl_idx, "impl for unknown type '{s}'", .{type_name});
-            return;
-        };
-        const target: NodeIdx = switch (sym.kind) {
-            .struct_type, .class_type => sym.decl_node,
-            else => return,
-        };
-        try self.collectMethods(target, type_name, ib.methods);
-    }
-
-    fn methodTableFor(self: *Lowerer, decl_idx: NodeIdx) !*MethodTable {
-        const gop = try self.methods.getOrPut(self.gpa, decl_idx);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .by_name = .empty, .order = .empty };
-        }
-        return gop.value_ptr;
     }
 
     fn lowerFunctionBody(self: *Lowerer, decl_idx: NodeIdx, fidx: api.FunctionIdx) !void {
@@ -1079,37 +996,13 @@ pub const Lowerer = struct {
                 const ret_ir = self.irTypeFor(self.checker.nodeType(sym.decl_node));
                 var args = try self.lowerArgs(c.args);
                 defer args.deinit(self.gpa);
-                try self.coerceInterfaceArgs(node_idx, sym.decl_node, c.args, &args);
                 return self.ctx.buildCall(fidx, ret_ir, args.items);
             },
             .field_access => |fa| {
-                const obj_ty = self.exprType(fa.object);
-                const obj_sem = self.type_pool.get(obj_ty);
-                var eff_sem = obj_sem;
-                if (eff_sem == .pointer) eff_sem = self.type_pool.get(eff_sem.pointer);
-                if (eff_sem == .interface_type) {
-                    return self.lowerIfaceMethodCall(node_idx, fa, c, eff_sem.interface_type);
-                }
-                const obj = try self.lowerExpr(fa.object);
-                const decl_node = self.declNodeOfType(obj_ty) orelse {
-                    self.codegenError(node_idx, "method call on non-struct/class value", .{});
-                    return self.ctx.buildIntConst(self.i64_ty, 0);
-                };
-                const table = self.methods.get(decl_node) orelse {
-                    self.codegenError(node_idx, "type has no methods", .{});
-                    return self.ctx.buildIntConst(self.i64_ty, 0);
-                };
-                const entry = table.by_name.get(self.nameSlice(fa.field)) orelse {
-                    self.codegenError(node_idx, "no method '{s}'", .{self.nameSlice(fa.field)});
-                    return self.ctx.buildIntConst(self.i64_ty, 0);
-                };
-                var args = try self.lowerArgs(c.args);
-                defer args.deinit(self.gpa);
-                var all_args = std.ArrayList(api.Value).empty;
-                defer all_args.deinit(self.gpa);
-                try all_args.append(self.gpa, obj);
-                try all_args.appendSlice(self.gpa, args.items);
-                return self.ctx.buildCall(entry.fidx, entry.ret_ir, all_args.items);
+                self.codegenError(node_idx, "there are no methods; call the free function, or the fn value held in '{s}'", .{
+                    self.nameSlice(fa.field),
+                });
+                return self.ctx.buildIntConst(self.i64_ty, 0);
             },
             else => {
                 self.codegenError(node_idx, "unsupported callee", .{});
@@ -1131,110 +1024,6 @@ pub const Lowerer = struct {
             _ = try self.ctx.buildStore(self.i64_ty, addr, val);
         }
         return block;
-    }
-
-    /// Call through an `*impl Interface` fat pointer: data pointer as the
-    /// receiver, callee loaded from the interface-ordered vtable.
-    fn lowerIfaceMethodCall(self: *Lowerer, node_idx: NodeIdx, fa: anytype, c: anytype, iface_decl: NodeIdx) !api.Value {
-        const iface = self.arena.get(iface_decl).interface_decl;
-        const method_name = self.nameSlice(fa.field);
-        var method_index: ?u64 = null;
-        for (iface.methods.indices, 0..) |m_idx, i| {
-            const m = self.arena.get(m_idx);
-            if (m.* != .fn_decl) continue;
-            if (std.mem.eql(u8, self.nameSlice(m.fn_decl.name), method_name)) {
-                method_index = i;
-                break;
-            }
-        }
-        const mi = method_index orelse {
-            self.codegenError(node_idx, "no method '{s}' on this interface", .{method_name});
-            return self.ctx.buildIntConst(self.i64_ty, 0);
-        };
-
-        const fp = try self.lowerExpr(fa.object);
-        const data = try self.ctx.buildLoad(self.i64_ty, fp);
-        const vtable_addr = try self.ctx.buildPtrAdd(self.ptr_ty, fp, try self.ctx.buildIntConst(self.i64_ty, 8));
-        const vtable = try self.ctx.buildLoad(self.ptr_ty, vtable_addr);
-        const slot_addr = try self.ctx.buildPtrAdd(self.ptr_ty, vtable, try self.ctx.buildIntConst(self.i64_ty, @intCast(8 * mi)));
-        const callee = try self.ctx.buildLoad(self.ptr_ty, slot_addr);
-
-        var args = try self.lowerArgs(c.args);
-        defer args.deinit(self.gpa);
-        var all_args = std.ArrayList(api.Value).empty;
-        defer all_args.deinit(self.gpa);
-        try all_args.append(self.gpa, data);
-        try all_args.appendSlice(self.gpa, args.items);
-        return self.ctx.buildCallPtr(self.irTypeFor(self.checker.nodeType(node_idx)), callee, all_args.items);
-    }
-
-    /// For every argument whose parameter is an `*impl Interface`, wrap the
-    /// value into a fat pointer `{ data, vtable }` block. Structs and classes
-    /// get a synthetic vtable global in interface method order; values that
-    /// are already fat pointers pass through unchanged.
-    fn coerceInterfaceArgs(self: *Lowerer, node_idx: NodeIdx, fn_decl: NodeIdx, arg_nodes: NodeList, args: *std.ArrayList(api.Value)) !void {
-        const f = self.arena.get(fn_decl).fn_decl;
-        const count = @min(f.params.indices.len, args.items.len);
-        for (0..count) |i| {
-            const param = self.arena.get(f.params.indices[i]);
-            const param_ty = try self.paramType(param.param.ty);
-            const sem = self.type_pool.get(param_ty);
-            if (sem != .pointer) continue;
-            const iface_ty = self.type_pool.get(sem.pointer);
-            if (iface_ty != .interface_type) continue;
-
-            const arg_ty = self.exprType(arg_nodes.indices[i]);
-            const arg_sem = self.type_pool.get(arg_ty);
-            const ty_decl: NodeIdx = switch (arg_sem) {
-                .struct_type => |n| n,
-                .class_type => |n| n,
-                else => continue, // already a fat pointer (or invalid, caught by the checker)
-            };
-            const vtable = try self.ifaceVtableFor(node_idx, ty_decl, iface_ty.interface_type) orelse {
-                self.codegenError(node_idx, "cannot pass value as this interface: missing method", .{});
-                continue;
-            };
-            const fp = try self.ctx.buildAllocaBytes(self.ptr_ty, 16);
-            _ = try self.ctx.buildStore(self.i64_ty, fp, args.items[i]);
-            const vt_addr = try self.ctx.buildPtrAdd(self.ptr_ty, fp, try self.ctx.buildIntConst(self.i64_ty, 8));
-            _ = try self.ctx.buildStore(self.i64_ty, vt_addr, try self.ctx.buildGlobalAddr(self.ptr_ty, vtable));
-            args.items[i] = fp;
-        }
-    }
-
-    /// The interface-ordered vtable global for (type, interface), created on
-    /// first use and cached.
-    fn ifaceVtableFor(self: *Lowerer, node_idx: NodeIdx, ty_decl: NodeIdx, iface_decl: NodeIdx) !?api.GlobalIdx {
-        const key = IfaceVtableKey{ .ty = ty_decl, .iface = iface_decl };
-        if (self.iface_vtables.get(key)) |g| return g;
-        const table = self.methods.get(ty_decl) orelse {
-            self.codegenError(node_idx, "type has no methods", .{});
-            return null;
-        };
-        const iface = self.arena.get(iface_decl).interface_decl;
-        var funcs = std.ArrayList(api.FunctionIdx).empty;
-        defer funcs.deinit(self.gpa);
-        for (iface.methods.indices) |m_idx| {
-            const m = self.arena.get(m_idx);
-            if (m.* != .fn_decl) continue;
-            const entry = table.by_name.get(self.nameSlice(m.fn_decl.name)) orelse {
-                self.codegenError(node_idx, "type is missing interface method '{s}'", .{self.nameSlice(m.fn_decl.name)});
-                return null;
-            };
-            try funcs.append(self.gpa, entry.fidx);
-        }
-        const decl = self.arena.get(ty_decl);
-        const type_name: []const u8 = switch (decl.*) {
-            .struct_decl => |s| self.nameSlice(s.name),
-            else => return null,
-        };
-        const name = std.fmt.allocPrint(self.gpa, "vtable_{s}_{s}", .{ type_name, self.nameSlice(iface.name) }) catch return null;
-        defer self.gpa.free(name);
-        const g = self.ctx.addFnArrayGlobal(name, funcs.items) catch |err| {
-            std.debug.panic("OOM in codegen: {s}", .{@errorName(err)});
-        };
-        self.iface_vtables.put(self.gpa, key, g) catch {};
-        return g;
     }
 
     fn lowerArgs(self: *Lowerer, list: NodeList) !std.ArrayList(api.Value) {
@@ -1396,16 +1185,6 @@ pub const Lowerer = struct {
             },
             // Pointers, strings, structs and classes all live in one slot.
             else => self.ptr_ty,
-        };
-    }
-
-    fn declNodeOfType(self: *Lowerer, ty: TypeIdx) ?NodeIdx {
-        const sem = self.type_pool.get(ty);
-        return switch (sem) {
-            .struct_type => |n| n,
-            .class_type => |n| n,
-            .pointer => |elem| self.declNodeOfType(elem),
-            else => null,
         };
     }
 

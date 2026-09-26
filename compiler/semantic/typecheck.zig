@@ -175,24 +175,8 @@ pub const TypeChecker = struct {
         const decl = self.arena.get(decl_idx);
         switch (decl.*) {
             .fn_decl => try self.checkFnDecl(decl_idx),
-            .struct_decl => try self.checkStructDecl(decl_idx),
             .enum_decl => try self.checkEnumDecl(decl_idx),
-            .interface_decl => try self.checkInterfaceDecl(decl_idx),
-            .impl_block => |ib| {
-                _ = ib;
-                for (decl.impl_block.methods.indices) |method_idx| {
-                    try self.checkDecl(method_idx);
-                }
-            },
             else => {},
-        }
-    }
-
-    fn checkStructDecl(self: *TypeChecker, decl_idx: NodeIdx) anyerror!void {
-        const decl = self.arena.get(decl_idx);
-        const s = decl.struct_decl;
-        for (s.methods.indices) |method_idx| {
-            try self.checkDecl(method_idx);
         }
     }
 
@@ -211,8 +195,6 @@ pub const TypeChecker = struct {
             }
         }
     }
-
-    fn checkInterfaceDecl(_: *TypeChecker, _: NodeIdx) !void {}
 
     fn checkFnDecl(self: *TypeChecker, fn_idx: NodeIdx) anyerror!void {
         const fn_decl = self.arena.get(fn_idx);
@@ -500,14 +482,21 @@ pub const TypeChecker = struct {
             .paren_expr => |p| {
                 return self.inferExprType(p);
             },
-            .impl_type => |inner| {
-                const inner_ty = self.inferExprType(inner);
-                const sem = self.type_pool.get(inner_ty);
-                if (sem != .interface_type) {
-                    self.errorAt(expr_idx, "'impl' requires an interface type, got a non-interface type", .{});
+            .fn_type => |ft| {
+                const params = self.allocator.alloc(TypeIdx, ft.params.indices.len) catch @panic("OOM");
+                for (ft.params.indices, 0..) |param_ty, i| {
+                    params[i] = self.inferTypeRef(param_ty);
+                }
+                return self.functionType(params, self.inferTypeRef(ft.return_type));
+            },
+            .fn_ref => |id| {
+                const name = self.nameSlice(id);
+                const sym = self.scopes.lookup(name, self.scopes.currentScope());
+                if (sym == null or sym.?.kind != .function) {
+                    self.errorAt(expr_idx, "'{s}' is not a function", .{name});
                     return self.void_ty;
                 }
-                return inner_ty;
+                return self.fnSignatureType(sym.?.decl_node);
             },
             .struct_init => |si| {
                 return self.inferExprType(si.ty);
@@ -607,13 +596,37 @@ pub const TypeChecker = struct {
         return self.inferExprType(expr_idx);
     }
 
+    /// The `function` type for a signature. `params` is copied into a slice
+    /// owned by the type pool.
+    fn functionType(self: *TypeChecker, params: []const TypeIdx, return_type: TypeIdx) TypeIdx {
+        const owned = self.allocator.alloc(TypeIdx, params.len) catch @panic("OOM");
+        @memcpy(owned, params);
+        return self.type_pool.add(.{ .function = .{
+            .param_types = owned,
+            .return_type = return_type,
+        } }) catch @panic("OOM");
+    }
+
+    /// The `function` type of a declared `fn`, built from its parameters and
+    /// return annotation. The reference itself carries no capture environment.
+    fn fnSignatureType(self: *TypeChecker, fn_idx: NodeIdx) TypeIdx {
+        const f = self.arena.get(fn_idx).fn_decl;
+        const params = self.allocator.alloc(TypeIdx, f.params.indices.len) catch @panic("OOM");
+        for (f.params.indices, 0..) |param_idx, i| {
+            const param = self.arena.get(param_idx);
+            params[i] = self.inferTypeRef(param.param.ty);
+        }
+        const return_type: TypeIdx = if (f.return_type) |ret| self.inferTypeRef(ret) else self.void_ty;
+        return self.functionType(params, return_type);
+    }
+
     // ========================================================================
     // Calls
     // ========================================================================
 
-    /// Type of a call expression. Handles plain function calls, enum variant
-    /// constructors (`Some(x)`), and method calls on structs/classes and
-    /// `*impl Interface` fat pointers.
+    /// Type of a call expression: plain function calls and enum variant
+    /// constructors (`Some(x)`). There is no method dispatch — `recv.f(...)`
+    /// is a field read of a function value, typed by `inferExprType`.
     fn inferCallType(self: *TypeChecker, expr_idx: NodeIdx, c: anytype) TypeIdx {
         for (c.args.indices) |arg| {
             _ = self.inferExprType(arg);
@@ -637,119 +650,18 @@ pub const TypeChecker = struct {
                 }
                 return self.i32_ty;
             },
-            .field_access => |fa| {
-                const obj_ty = self.inferExprType(fa.object);
-                return self.inferMethodReturn(expr_idx, obj_ty, self.nameSlice(fa.field)) orelse self.void_ty;
-            },
             else => return self.i32_ty,
         }
     }
 
-    /// Lightweight arg/param agreement: arg count plus interface satisfaction
-    /// for `*impl Interface` parameters. Deep type matching is left to the
-    /// lowerer's slot-based conventions.
+    /// Lightweight arg/param agreement: argument count only. Deep type
+    /// matching is left to the lowerer's slot-based conventions.
     fn checkCallArgs(self: *TypeChecker, node_idx: NodeIdx, params: NodeList, args: NodeList) void {
         if (params.indices.len != args.indices.len) {
             self.errorAt(node_idx, "call has {d} arguments but the function takes {d}", .{
                 args.indices.len, params.indices.len,
             });
         }
-        const count = @min(params.indices.len, args.indices.len);
-        for (0..count) |i| {
-            const param = self.arena.get(params.indices[i]);
-            const arg_ty = self.inferExprType(args.indices[i]);
-            const param_ty = self.inferTypeRef(param.param.ty);
-            if (self.paramWantsInterface(param_ty)) |iface_node| {
-                if (!self.satisfiesInterface(arg_ty, iface_node)) {
-                    self.errorAt(node_idx, "type '{s}' does not satisfy interface '{s}'", .{
-                        self.typeName(arg_ty), self.typeName(self.type_pool.add(.{ .interface_type = iface_node }) catch self.void_ty),
-                    });
-                }
-            }
-        }
-    }
-
-    /// If `ty` is a `*impl I` parameter type, return the interface decl node.
-    fn paramWantsInterface(self: *const TypeChecker, ty: TypeIdx) ?NodeIdx {
-        var sem = self.type_pool.get(ty);
-        if (sem == .pointer) sem = self.type_pool.get(sem.pointer);
-        if (sem == .interface_type) return sem.interface_type;
-        return null;
-    }
-
-    /// Structural satisfaction: every interface method name is present on the
-    /// type (own methods only; the method table has no inheritance yet).
-    fn satisfiesInterface(self: *const TypeChecker, ty: TypeIdx, iface_node: NodeIdx) bool {
-        const sem = self.type_pool.get(ty);
-        const decl_node: NodeIdx = switch (sem) {
-            .struct_type => |n| n,
-            else => return false,
-        };
-        const iface = self.arena.get(iface_node).interface_decl;
-        const decl = self.arena.get(decl_node);
-        const methods: []const NodeIdx = switch (decl.*) {
-            .struct_decl => |s| s.methods.indices,
-            else => return false,
-        };
-        outer: for (iface.methods.indices) |iface_method_idx| {
-            const iface_method = self.arena.get(iface_method_idx);
-            const want = self.nameSlice(iface_method.fn_decl.name);
-            for (methods) |method_idx| {
-                const method = self.arena.get(method_idx);
-                if (method.* == .fn_decl and std.mem.eql(u8, self.nameSlice(method.fn_decl.name), want)) continue :outer;
-            }
-            return false;
-        }
-        return true;
-    }
-
-    /// Return type of a method call on a struct/class/interface, or null if
-    /// the callee is not a method.
-    fn inferMethodReturn(self: *TypeChecker, node_idx: NodeIdx, obj_ty: TypeIdx, field: []const u8) ?TypeIdx {
-        var sem = self.type_pool.get(obj_ty);
-        if (sem == .pointer) sem = self.type_pool.get(sem.pointer);
-
-        var iface_node: ?NodeIdx = null;
-        var decl_node: ?NodeIdx = null;
-        switch (sem) {
-            .struct_type => |n| decl_node = n,
-            .interface_type => |n| iface_node = n,
-            else => return null,
-        }
-
-        if (iface_node) |inode| {
-            const iface = self.arena.get(inode).interface_decl;
-            for (iface.methods.indices) |method_idx| {
-                const method = self.arena.get(method_idx);
-                if (method.* != .fn_decl) continue;
-                if (std.mem.eql(u8, self.nameSlice(method.fn_decl.name), field)) {
-                    if (method.fn_decl.return_type) |ret| return self.inferExprType(ret);
-                    return self.void_ty;
-                }
-            }
-            self.errorAt(node_idx, "interface has no method '{s}'", .{field});
-            return null;
-        }
-
-        if (decl_node) |dnode| {
-            const decl = self.arena.get(dnode);
-            const methods: []const NodeIdx = switch (decl.*) {
-                .struct_decl => |s| s.methods.indices,
-                else => &.{},
-            };
-            for (methods) |method_idx| {
-                const method = self.arena.get(method_idx);
-                if (method.* != .fn_decl) continue;
-                if (std.mem.eql(u8, self.nameSlice(method.fn_decl.name), field)) {
-                    if (method.fn_decl.return_type) |ret| return self.inferExprType(ret);
-                    return self.void_ty;
-                }
-            }
-            self.errorAt(node_idx, "type has no method '{s}'", .{field});
-            return null;
-        }
-
-        return null;
     }
 
     // ========================================================================
@@ -922,9 +834,6 @@ pub const TypeChecker = struct {
             },
             .enum_decl => {
                 return self.type_pool.add(.{ .enum_type = decl_node }) catch @panic("OOM");
-            },
-            .interface_decl => {
-                return self.type_pool.add(.{ .interface_type = decl_node }) catch @panic("OOM");
             },
             .field => {
                 return self.inferTypeRefNode(decl.field.ty);
