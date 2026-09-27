@@ -396,6 +396,45 @@ pub const Parser = struct {
         } });
     }
 
+    /// `fn` '(' <type_list> ')' '->' <type> — a first-class fn type
+    /// (`docs/syntax.md` §4.10). The same node serves type position (`x:
+    /// fn(i32) -> i32`) and expression position, where it denotes a comptime
+    /// type value rather than a runtime function (`docs/semantics.md` R4b).
+    fn parseFnType(self: *Parser) ?NodeIdx {
+        _ = self.expect(.fn_kw) orelse return null;
+        if (self.expect(.lparen) == null) return null;
+
+        var params = std.ArrayList(NodeIdx).empty;
+        defer params.deinit(self.allocator);
+
+        while (true) {
+            self.skipNewlinesAndSemicolons();
+            if (self.check(.rparen)) break;
+            if (params.items.len > 0) {
+                if (self.expect(.comma) == null) break;
+                self.skipNewlinesAndSemicolons();
+                if (self.check(.rparen)) break;
+            }
+            const param_ty = self.parseExpr(Precedence.prefix.toInt()) orelse {
+                self.recoverTo(.rparen);
+                break;
+            };
+            params.append(self.allocator, param_ty) catch unreachable;
+            self.skipNewlinesAndSemicolons();
+        }
+        _ = self.expect(.rparen);
+
+        // The return type binds tighter than the `,` that closes an enclosing
+        // list, so `fn(A, B) -> R` never swallows the next argument.
+        if (self.expect(.arrow) == null) return null;
+        const return_type = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
+
+        return self.appendNode(.{ .fn_type = .{
+            .params = self.arena.allocNodeList(params.items) catch NodeList{ .indices = &.{} },
+            .return_type = return_type,
+        } });
+    }
+
     fn parseTypeRepr(self: *Parser) ?TypeRepr {
         const expr = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
         const node = self.arena.get(expr);
@@ -809,6 +848,7 @@ pub const Parser = struct {
                 return self.appendNode(.{ .move_expr = operand });
             },
             .pipe, .pipe_pipe => return self.parseClosure(),
+            .fn_kw => return self.parseFnType(),
             .comptime_kw => return self.parseComptime(),
             .region_kw => return self.parseRegion(),
             .at => return self.parseComptimeCall(),
@@ -866,7 +906,10 @@ pub const Parser = struct {
                 return self.appendNode(.{ .field_access = .{ .object = left, .field = self.makeStringRef(field_tok) } });
             },
             .pipeline => {
-                const right = self.parseExpr(prec) orelse return left;
+                // Left-associative (`docs/syntax.md` §4.8): `a |> f |> g`
+                // nests as `(a |> f) |> g`, so `prec + 1` keeps the next `|>`
+                // out of this right-hand side.
+                const right = self.parseExpr(prec + 1) orelse return left;
                 return self.appendNode(.{ .pipeline = .{ .lhs = left, .rhs = right } });
             },
             else => {
@@ -1082,7 +1125,7 @@ fn isRightAssoc(tag: TokenTag) bool {
     };
 }
 
-const TestResult = struct { arena: ast.AstArena, node: NodeIdx };
+const TestResult = struct { arena: ast.AstArena, node: NodeIdx, source: []const u8 };
 
 fn runTest(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     var arena = ast.AstArena.init(allocator);
@@ -1093,7 +1136,7 @@ fn runTest(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     diags.owns_messages = true;
     var parser = Parser.init(allocator, tokens, source, &arena, &diags);
     const module = parser.parseModule();
-    return TestResult{ .arena = arena, .node = module };
+    return TestResult{ .arena = arena, .node = module, .source = source };
 }
 
 fn expectParseErrors(allocator: std.mem.Allocator, source: []const u8) !void {
@@ -1116,6 +1159,20 @@ fn getMod(res: *const TestResult) *const Node {
 
 fn tagOf(node: *const Node) std.meta.Tag(Node) {
     return std.meta.activeTag(node.*);
+}
+
+fn nameOf(res: *const TestResult, id: ast.StringRef) []const u8 {
+    return id.slice(res.source);
+}
+
+fn declAt(res: *const TestResult, i: usize) *const Node {
+    return res.arena.get(res.arena.get(res.node).module.decls.indices[i]);
+}
+
+fn firstInitOfBody(res: *const TestResult) !*const Node {
+    const body = res.arena.get(declAt(res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    return res.arena.get(stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull);
 }
 
 test "parser: empty module" {
@@ -1327,7 +1384,7 @@ test "parser: print as field name after dot" {
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .field_access), tagOf(callee));
 }
 
-test "parser: method call with field access" {
+test "parser: field access in call position" {
     var res = try runTest(std.testing.allocator,
         \\fn main() {
         \\    foo.bar()
@@ -1493,6 +1550,219 @@ test "parser: pipeline operator" {
     const stmt = res.arena.get(body.block.stmts.indices[0]);
     const init = res.arena.get(stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(init));
+}
+
+test "parser: pipeline binds looser than arithmetic" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let y = a + b |> f
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(init));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(res.arena.get(init.pipeline.lhs)));
+    const rhs = res.arena.get(init.pipeline.rhs);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .identifier), tagOf(rhs));
+    try std.testing.expectEqualStrings("f", nameOf(&res, rhs.identifier));
+}
+
+test "parser: pipeline chain is left associative" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let y = x |> f |> g
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(init));
+    const inner = res.arena.get(init.pipeline.lhs);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(inner));
+    const rhs = res.arena.get(init.pipeline.rhs);
+    try std.testing.expectEqualStrings("g", nameOf(&res, rhs.identifier));
+}
+
+test "parser: pipeline with call and hole" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let v3 = v1 |> add(_, v2)
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(init));
+    const call = res.arena.get(init.pipeline.rhs);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(call));
+    try std.testing.expectEqual(@as(usize, 2), call.call.args.indices.len);
+    const hole = res.arena.get(call.call.args.indices[0]);
+    try std.testing.expectEqualStrings("_", nameOf(&res, hole.identifier));
+}
+
+test "parser: piped closure call" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let y = x |> |v| v + 1
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(init));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .closure), tagOf(res.arena.get(init.pipeline.rhs)));
+}
+
+test "parser: closure with block body" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let f = |x: i32| { let y = x + 1
+        \\        return y }
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .closure), tagOf(init));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .block), tagOf(res.arena.get(init.closure.body)));
+}
+
+test "parser: closure returning a closure" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let outer = |x| { let inner = |y| x + y
+        \\        return inner }
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    const body = res.arena.get(init.closure.body);
+    const inner_stmt = res.arena.get(body.block.stmts.indices[0]);
+    const inner = res.arena.get(inner_stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .closure), tagOf(inner));
+}
+
+test "parser: fn name used as a value" {
+    var res = try runTest(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 {
+        \\    return a + b
+        \\}
+        \\
+        \\fn main() -> i32 {
+        \\    return apply(add, 2, 3)
+        \\}
+    );
+    defer res.arena.deinit();
+    const main_decl = declAt(&res, 1);
+    const body = res.arena.get(main_decl.fn_decl.body);
+    const ret = res.arena.get(body.block.stmts.indices[0]);
+    const call = res.arena.get(ret.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(call));
+    try std.testing.expectEqual(@as(usize, 3), call.call.args.indices.len);
+    const fn_name = res.arena.get(call.call.args.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .identifier), tagOf(fn_name));
+    try std.testing.expectEqualStrings("add", nameOf(&res, fn_name.identifier));
+}
+
+test "parser: fn type in param position" {
+    var res = try runTest(std.testing.allocator,
+        \\fn apply(f: fn(i32, i32) -> i32, x: i32, y: i32) -> i32 {
+        \\    return f(x, y)
+        \\}
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    try std.testing.expectEqual(@as(usize, 3), decl.fn_decl.params.indices.len);
+    const param = res.arena.get(decl.fn_decl.params.indices[0]);
+    const fn_ty = res.arena.get(param.param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(fn_ty));
+    try std.testing.expectEqual(@as(usize, 2), fn_ty.fn_type.params.indices.len);
+    const ret = res.arena.get(fn_ty.fn_type.return_type);
+    try std.testing.expectEqualStrings("i32", nameOf(&res, ret.identifier));
+}
+
+test "parser: fn type as return type" {
+    var res = try runTest(std.testing.allocator,
+        \\fn make_adder(base: i32) -> fn(i32) -> i32 = |x| x + base
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    const return_ty = res.arena.get(decl.fn_decl.return_type orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(return_ty));
+    try std.testing.expectEqual(@as(usize, 1), return_ty.fn_type.params.indices.len);
+    const shorthand = res.arena.get(decl.fn_decl.body);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .return_stmt), tagOf(shorthand));
+    const closure = res.arena.get(shorthand.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .closure), tagOf(closure));
+}
+
+test "parser: fn type in let annotation" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let f: fn(i32) -> i32 = add
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    const fn_ty = res.arena.get(stmt.let_stmt.ty orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(fn_ty));
+    const init = res.arena.get(stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqualStrings("add", nameOf(&res, init.identifier));
+}
+
+test "parser: fn type in struct field" {
+    var res = try runTest(std.testing.allocator,
+        \\struct Handler {
+        \\    cb: fn(i32) -> i32
+        \\}
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    const field = res.arena.get(decl.struct_decl.fields.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(TypeRepr), .plain), @as(std.meta.Tag(TypeRepr), field.field.ty));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(res.arena.get(field.field.ty.plain)));
+}
+
+test "parser: zero-parameter and nested fn types" {
+    var res = try runTest(std.testing.allocator,
+        \\fn higher(f: fn() -> fn(i32) -> i32) -> fn(i32) -> i32 {
+        \\    return f()
+        \\}
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    const param = res.arena.get(decl.fn_decl.params.indices[0]);
+    const outer = res.arena.get(param.param.ty);
+    try std.testing.expectEqual(@as(usize, 0), outer.fn_type.params.indices.len);
+    const inner = res.arena.get(outer.fn_type.return_type);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(inner));
+    const decl_return = res.arena.get(decl.fn_decl.return_type orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(decl_return));
+}
+
+test "parser: fn type in expression position" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let t = fn(i32) -> i32
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .fn_type), tagOf(init));
+    try std.testing.expectEqual(@as(usize, 1), init.fn_type.params.indices.len);
+}
+
+test "parser: fn type without arrow is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\fn f(x: fn(i32) i32) -> i32 {
+        \\    return 0
+        \\}
+    );
+}
+
+test "parser: bare fn in type position is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\fn main() {
+        \\    let f: fn = add
+        \\}
+    );
 }
 
 test "parser: postfix try propagation" {
