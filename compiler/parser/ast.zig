@@ -77,6 +77,11 @@ pub const Node = union(enum) {
     call: struct { func: NodeIdx, args: NodeList },
     field_access: struct { object: NodeIdx, field: StringRef },
     index_access: struct { object: NodeIdx, index: NodeIdx },
+    /// `Name[A, B]` — a generic application. A single-argument application
+    /// (`Option[i32]`) stays an `index_access`; the semantic passes read a type
+    /// name on the left of one as a generic application. `args` holds one type
+    /// node per argument, in written order.
+    generic_app: struct { base: NodeIdx, args: NodeList },
     paren_expr: NodeIdx,
     struct_init: struct { ty: NodeIdx, fields: NodeList },
     range_expr: struct { start: NodeIdx, end: NodeIdx },
@@ -153,12 +158,12 @@ pub const Node = union(enum) {
 };
 
 pub const TypeRepr = union(enum) {
+    /// A type expression node: a name, a `generic_app`, an `fn_type`, ...
     plain: NodeIdx,
     /// `&T` shared reference.
     reference: NodeIdx,
     /// `&mut T` exclusive reference.
     mut_reference: NodeIdx,
-    generic_app: struct { base: NodeIdx, args: NodeList },
 };
 
 pub const AstArena = struct {

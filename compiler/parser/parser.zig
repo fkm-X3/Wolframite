@@ -44,6 +44,10 @@ pub const Parser = struct {
     arena: *ast.AstArena,
     diagnostics: *diag.Diagnostics,
     allocator: Allocator,
+    /// `?` is a postfix operator on expressions and never part of a type
+    /// (`docs/syntax.md` §4.13, §4.17). Set while a type reference is parsed so
+    /// `x: i32?` is reported instead of silently typing as `i32`.
+    in_type_ref: bool = false,
 
     pub fn init(
         allocator: Allocator,
@@ -62,7 +66,12 @@ pub const Parser = struct {
         };
     }
 
+    /// The token stream always ends with an `eof` sentinel, so a position past
+    /// the end is an `eof` too: a routine that consumed the sentinel (or the
+    /// error recovery that consumed it) must see `eof` again instead of
+    /// indexing out of bounds.
     fn peek(self: *const Parser) Token {
+        if (self.pos >= self.tokens.len) return self.tokens[self.tokens.len - 1];
         return self.tokens[self.pos];
     }
 
@@ -74,13 +83,16 @@ pub const Parser = struct {
     }
 
     fn advance(self: *Parser) Token {
-        const tok = self.tokens[self.pos];
-        self.pos += 1;
+        const tok = self.peek();
+        if (self.pos < self.tokens.len) {
+            self.pos += 1;
+        }
         return tok;
     }
 
     fn check(self: *const Parser, tag: TokenTag) bool {
-        return self.pos < self.tokens.len and self.tokens[self.pos].tag == tag;
+        if (self.pos >= self.tokens.len) return tag == .eof;
+        return self.tokens[self.pos].tag == tag;
     }
 
     fn expect(self: *Parser, tag: TokenTag) ?Token {
@@ -170,6 +182,11 @@ pub const Parser = struct {
         var params = std.ArrayList(NodeIdx).empty;
         defer params.deinit(self.allocator);
 
+        // Parameter annotations are type references (`docs/syntax.md` §4.2).
+        const saved_type_ref = self.in_type_ref;
+        self.in_type_ref = true;
+        defer self.in_type_ref = saved_type_ref;
+
         while (true) {
             self.skipNewlinesAndSemicolons();
             if (self.check(.rparen)) break;
@@ -253,6 +270,9 @@ pub const Parser = struct {
         self.skipNewlinesAndSemicolons();
         if (self.expectPeek(.arrow)) |_| {
             self.skipNewlinesAndSemicolons();
+            const saved_type_ref = self.in_type_ref;
+            self.in_type_ref = true;
+            defer self.in_type_ref = saved_type_ref;
             return_type = self.parseExpr(Precedence.prefix.toInt());
             self.skipNewlinesAndSemicolons();
         }
@@ -435,7 +455,14 @@ pub const Parser = struct {
         } });
     }
 
+    /// `T`, `&T`, `&mut T`, `T[A, B]`, ... A generic application stays a
+    /// `generic_app` node inside `plain`/`reference`, so every type position
+    /// carries the same node and no type representation is duplicated here.
     fn parseTypeRepr(self: *Parser) ?TypeRepr {
+        const saved_type_ref = self.in_type_ref;
+        self.in_type_ref = true;
+        defer self.in_type_ref = saved_type_ref;
+
         const expr = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
         const node = self.arena.get(expr);
         if (node.* == .unary_op) {
@@ -523,7 +550,6 @@ pub const Parser = struct {
                 .plain => |n| n,
                 .reference => |n| n,
                 .mut_reference => |n| n,
-                .generic_app => |g| g.base,
             };
             self.skipNewlinesAndSemicolons();
         }
@@ -719,6 +745,18 @@ pub const Parser = struct {
             if (tok.tag == .question) {
                 const qprec = Precedence.postfix.toInt();
                 if (qprec < min_prec) break;
+                if (self.in_type_ref) {
+                    self.errorTok(tok, "'?' propagates an error in expression position; it is not part of a type", .{});
+                    _ = self.advance();
+                    break;
+                }
+                // `?` binds to its primary (`docs/syntax.md` §8.6), so a second
+                // `?` would have nothing left to unwrap.
+                if (tagOf(self.arena.get(left)) == .try_propagate) {
+                    self.errorTok(tok, "'?' already unwrapped this value", .{});
+                    _ = self.advance();
+                    break;
+                }
                 _ = self.advance();
                 left = self.appendNode(.{ .try_propagate = left });
                 continue;
@@ -897,9 +935,42 @@ pub const Parser = struct {
                 } });
             },
             .lbracket => {
-                const index = self.parseExpr(Precedence.none.toInt()) orelse return left;
+                // `T[A, B]` — a generic application — shares this syntax with
+                // indexing `xs[0]`. A single argument is an `index_access`; the
+                // semantic passes read a type name on the left as a generic
+                // application (`Option[i32]`). Two or more arguments can only
+                // be a generic application, so they get their own node.
+                var args = std.ArrayList(NodeIdx).empty;
+                defer args.deinit(self.allocator);
+
+                while (true) {
+                    self.skipNewlinesAndSemicolons();
+                    if (self.check(.rbracket)) break;
+                    if (args.items.len != 0) {
+                        if (self.expect(.comma) == null) break;
+                        self.skipNewlinesAndSemicolons();
+                        if (self.check(.rbracket)) break;
+                    }
+                    const arg = self.parseExpr(Precedence.none.toInt()) orelse {
+                        self.recoverTo(.rbracket);
+                        break;
+                    };
+                    args.append(self.allocator, arg) catch unreachable;
+                    self.skipNewlinesAndSemicolons();
+                }
                 _ = self.expect(.rbracket);
-                return self.appendNode(.{ .index_access = .{ .object = left, .index = index } });
+
+                if (args.items.len == 0) {
+                    self.errorHere("expected an index or type argument inside '[]'", .{});
+                    return left;
+                }
+                if (args.items.len == 1) {
+                    return self.appendNode(.{ .index_access = .{ .object = left, .index = args.items[0] } });
+                }
+                return self.appendNode(.{ .generic_app = .{
+                    .base = left,
+                    .args = self.arena.allocNodeList(args.items) catch NodeList{ .indices = &.{} },
+                } });
             },
             .dot => {
                 const field_tok = self.expect(.identifier) orelse return left;
@@ -1127,15 +1198,23 @@ fn isRightAssoc(tag: TokenTag) bool {
 
 const TestResult = struct { arena: ast.AstArena, node: NodeIdx, source: []const u8 };
 
+/// Parses `source` and requires a clean result: tests built on this helper
+/// only assert AST shape, so a parser that also emitted a diagnostic (for
+/// example a shorthand body it silently skipped) would otherwise still pass.
 fn runTest(allocator: std.mem.Allocator, source: []const u8) !TestResult {
     var arena = ast.AstArena.init(allocator);
+    errdefer arena.deinit();
     var lex = @import("../lexer/lexer.zig").Lexer.init(allocator, source);
     defer lex.deinit();
     const tokens = try lex.tokenize();
     var diags = diag.Diagnostics.init(allocator);
     diags.owns_messages = true;
+    defer diags.deinit();
     var parser = Parser.init(allocator, tokens, source, &arena, &diags);
     const module = parser.parseModule();
+    if (diags.hasErrors()) {
+        std.debug.panic("unexpected parse error: {s}", .{diags.items.items[0].message});
+    }
     return TestResult{ .arena = arena, .node = module, .source = source };
 }
 
@@ -1151,6 +1230,43 @@ fn expectParseErrors(allocator: std.mem.Allocator, source: []const u8) !void {
     var parser = Parser.init(allocator, tokens, source, &arena, &diags);
     _ = parser.parseModule();
     try std.testing.expect(diags.hasErrors());
+}
+
+/// Rejects `source` and requires one diagnostic to mention `needle`, so a test
+/// pins the guidance the user sees rather than just "something went wrong".
+fn expectParseErrorContaining(allocator: std.mem.Allocator, source: []const u8, needle: []const u8) !void {
+    var arena = ast.AstArena.init(allocator);
+    defer arena.deinit();
+    var lex = @import("../lexer/lexer.zig").Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    var diags = diag.Diagnostics.init(allocator);
+    diags.owns_messages = true;
+    defer diags.deinit();
+    var parser = Parser.init(allocator, tokens, source, &arena, &diags);
+    _ = parser.parseModule();
+    try std.testing.expect(diags.hasErrors());
+    for (diags.items.items) |d| {
+        if (std.mem.indexOf(u8, d.message, needle) != null) return;
+    }
+    std.debug.panic("no diagnostic contained '{s}'", .{needle});
+}
+
+/// Parses `source` and drops the result, so a test can only assert "this does
+/// not crash". Diagnostics are expected and ignored.
+fn expectNoCrash(allocator: std.mem.Allocator, source: []const u8) !void {
+    var arena = ast.AstArena.init(allocator);
+    defer arena.deinit();
+    var lex = @import("../lexer/lexer.zig").Lexer.init(allocator, source);
+    defer lex.deinit();
+    // A prefix may not lex at all (an unterminated string); this test is about
+    // the parser's recovery from whatever did lex.
+    const tokens = lex.tokenize() catch return;
+    var diags = diag.Diagnostics.init(allocator);
+    diags.owns_messages = true;
+    defer diags.deinit();
+    var parser = Parser.init(allocator, tokens, source, &arena, &diags);
+    _ = parser.parseModule();
 }
 
 fn getMod(res: *const TestResult) *const Node {
@@ -1173,6 +1289,14 @@ fn firstInitOfBody(res: *const TestResult) !*const Node {
     const body = res.arena.get(declAt(res, 0).fn_decl.body);
     const stmt = res.arena.get(body.block.stmts.indices[0]);
     return res.arena.get(stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull);
+}
+
+/// Value of a shorthand `fn` body: `fn f() = expr` stores the expression as the
+/// value of an implicit `return`, not inside a block.
+fn shorthandValue(res: *const TestResult, decl_index: usize) !*const Node {
+    const body = res.arena.get(declAt(res, decl_index).fn_decl.body);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .return_stmt), tagOf(body));
+    return res.arena.get(body.return_stmt.value orelse return error.TestUnexpectedNull);
 }
 
 test "parser: empty module" {
@@ -1883,6 +2007,458 @@ test "parser: wildcard binding" {
     const stmt = res.arena.get(body.block.stmts.indices[0]);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .let_stmt), tagOf(stmt));
     try std.testing.expectEqual(@as(u32, 1), stmt.let_stmt.name.end - stmt.let_stmt.name.start);
+}
+
+// --- shorthand `fn` bodies (`docs/syntax.md` §4.3) ---
+
+test "parser: shorthand body is a pipeline" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(x: i32) -> i32 = x |> g |> h
+    );
+    defer res.arena.deinit();
+    const value = try shorthandValue(&res, 0);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(value));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(res.arena.get(value.pipeline.lhs)));
+    try std.testing.expectEqualStrings("h", nameOf(&res, res.arena.get(value.pipeline.rhs).identifier));
+}
+
+test "parser: shorthand body accepts a struct initializer" {
+    var res = try runTest(std.testing.allocator,
+        \\fn zero() -> Vec2 = Vec2 { .x = 0.0, .y = 0.0 }
+    );
+    defer res.arena.deinit();
+    const value = try shorthandValue(&res, 0);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .struct_init), tagOf(value));
+    try std.testing.expectEqual(@as(usize, 2), value.struct_init.fields.indices.len);
+}
+
+test "parser: shorthand body accepts if and match" {
+    var res = try runTest(std.testing.allocator,
+        \\fn abs(x: i32) -> i32 = if x > 0 { x } else { -x }
+        \\fn zero(x: i32) -> i32 = match x { 1 => 1, _ => 0 }
+    );
+    defer res.arena.deinit();
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .if_expr), tagOf(try shorthandValue(&res, 0)));
+    const match_expr = try shorthandValue(&res, 1);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .match_expr), tagOf(match_expr));
+    try std.testing.expectEqual(@as(usize, 2), match_expr.match_expr.arms.indices.len);
+}
+
+test "parser: shorthand body accepts a closure block and propagation" {
+    var res = try runTest(std.testing.allocator,
+        \\fn adder() -> Fn = |x| { x + 1 }
+        \\fn f() -> i32 = g()?
+    );
+    defer res.arena.deinit();
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .closure), tagOf(try shorthandValue(&res, 0)));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(try shorthandValue(&res, 1)));
+}
+
+test "parser: shorthand body on a generic function" {
+    var res = try runTest(std.testing.allocator,
+        \\fn first[T](xs: Slice[T]) -> T = xs[0]
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    try std.testing.expectEqual(@as(usize, 1), decl.fn_decl.generic_params.indices.len);
+    const gp = res.arena.get(decl.fn_decl.generic_params.indices[0]);
+    try std.testing.expectEqualStrings("T", nameOf(&res, gp.identifier));
+    const value = try shorthandValue(&res, 0);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(value));
+}
+
+test "parser: function without a body is rejected" {
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f(x: i32) -> i32
+    , "for function body");
+}
+
+// --- generic applications (`docs/syntax.md` §4.6, §6.1) ---
+
+test "parser: multi-argument generic application" {
+    var res = try runTest(std.testing.allocator,
+        \\fn unwrap(r: Result[i32, String]) -> Pair[i32, f64] { return p }
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    const param = res.arena.get(decl.fn_decl.params.indices[0]);
+    const arg = res.arena.get(param.param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(arg));
+    try std.testing.expectEqualStrings("Result", nameOf(&res, res.arena.get(arg.generic_app.base).identifier));
+    try std.testing.expectEqual(@as(usize, 2), arg.generic_app.args.indices.len);
+    try std.testing.expectEqualStrings("i32", nameOf(&res, res.arena.get(arg.generic_app.args.indices[0]).identifier));
+    try std.testing.expectEqualStrings("String", nameOf(&res, res.arena.get(arg.generic_app.args.indices[1]).identifier));
+
+    const ret = res.arena.get(decl.fn_decl.return_type orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(ret));
+    try std.testing.expectEqualStrings("Pair", nameOf(&res, res.arena.get(ret.generic_app.base).identifier));
+}
+
+test "parser: nested and multi-argument generic applications" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(a: Result[Option[i32], String], b: Pair[Pair[i32, f64], Pair[i32, f64]], c: Vec[Vec[Vec[i32]]]) { }
+    );
+    defer res.arena.deinit();
+    const params = declAt(&res, 0).fn_decl.params;
+
+    const a = res.arena.get(res.arena.get(params.indices[0]).param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(a));
+    const a0 = res.arena.get(a.generic_app.args.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(a0));
+    try std.testing.expectEqualStrings("Option", nameOf(&res, res.arena.get(a0.index_access.object).identifier));
+
+    const b = res.arena.get(res.arena.get(params.indices[1]).param.ty);
+    try std.testing.expectEqual(@as(usize, 2), b.generic_app.args.indices.len);
+    const b0 = res.arena.get(b.generic_app.args.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(b0));
+    try std.testing.expectEqual(@as(usize, 2), b0.generic_app.args.indices.len);
+    try std.testing.expectEqualStrings("f64", nameOf(&res, res.arena.get(b0.generic_app.args.indices[1]).identifier));
+
+    const c = res.arena.get(res.arena.get(params.indices[2]).param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(c));
+    const c0 = res.arena.get(c.index_access.index);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(c0));
+    const c00 = res.arena.get(c0.index_access.index);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(c00));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .identifier), tagOf(res.arena.get(c00.index_access.index)));
+}
+
+test "parser: generic arguments span newlines and allow a trailing comma" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(r: Result[
+        \\    i32,
+        \\    String,
+        \\]) { }
+    );
+    defer res.arena.deinit();
+    const arg = res.arena.get(res.arena.get(declAt(&res, 0).fn_decl.params.indices[0]).param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(arg));
+    try std.testing.expectEqual(@as(usize, 2), arg.generic_app.args.indices.len);
+    try std.testing.expectEqualStrings("String", nameOf(&res, res.arena.get(arg.generic_app.args.indices[1]).identifier));
+}
+
+test "parser: generic application in let annotation and struct field" {
+    var res = try runTest(std.testing.allocator,
+        \\struct Holder {
+        \\    value: Result[i32, String]
+        \\}
+        \\fn f() {
+        \\    let pair: Pair[i32, f64] = g()
+        \\}
+    );
+    defer res.arena.deinit();
+    const field = res.arena.get(declAt(&res, 0).struct_decl.fields.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(TypeRepr), .plain), @as(std.meta.Tag(TypeRepr), field.field.ty));
+    const field_ty = res.arena.get(field.field.ty.plain);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(field_ty));
+    try std.testing.expectEqual(@as(usize, 2), field_ty.generic_app.args.indices.len);
+
+    const body = res.arena.get(declAt(&res, 1).fn_decl.body);
+    const let_stmt = res.arena.get(body.block.stmts.indices[0]);
+    const annotation = res.arena.get(let_stmt.let_stmt.ty orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(annotation));
+    try std.testing.expectEqualStrings("Pair", nameOf(&res, res.arena.get(annotation.generic_app.base).identifier));
+}
+
+test "parser: reference to a multi-argument generic" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(shared: &Result[i32, String], owned: &mut Result[i32, String]) { }
+    );
+    defer res.arena.deinit();
+    const params = declAt(&res, 0).fn_decl.params;
+    for (params.indices) |idx| {
+        const unary = res.arena.get(res.arena.get(idx).param.ty);
+        try std.testing.expectEqual(@as(std.meta.Tag(Node), .unary_op), tagOf(unary));
+        const app = res.arena.get(unary.unary_op.operand);
+        try std.testing.expectEqual(@as(std.meta.Tag(Node), .generic_app), tagOf(app));
+        try std.testing.expectEqual(@as(usize, 2), app.generic_app.args.indices.len);
+    }
+}
+
+test "parser: single-argument brackets stay an index access" {
+    var res = try runTest(std.testing.allocator,
+        \\fn first(xs: Slice[i32]) -> i32 { return xs[0] }
+    );
+    defer res.arena.deinit();
+    const decl = declAt(&res, 0);
+    const param_ty = res.arena.get(res.arena.get(decl.fn_decl.params.indices[0]).param.ty);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(param_ty));
+    try std.testing.expectEqualStrings("Slice", nameOf(&res, res.arena.get(param_ty.index_access.object).identifier));
+    const body = res.arena.get(decl.fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    const value = res.arena.get(stmt.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(value));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .int_literal), tagOf(res.arena.get(value.index_access.index)));
+}
+
+test "parser: multi-argument generic application nests behind a call and a shift" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() {
+        \\    let a = make()[0]
+        \\    let b = x << 1
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const a = res.arena.get(res.arena.get(body.block.stmts.indices[0]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(a));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(res.arena.get(a.index_access.object)));
+    const b = res.arena.get(res.arena.get(body.block.stmts.indices[1]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(b));
+}
+
+test "parser: empty bracket list is rejected" {
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f(xs: Slice[]) { }
+    , "inside '[]'");
+}
+
+test "parser: unterminated generic argument list is rejected" {
+    // Regression: recovering from the missing `]` must not walk past the end of
+    // the token stream.
+    try expectParseErrors(std.testing.allocator,
+        \\fn f(r: Pair[i32, f64) { }
+    );
+    try expectParseErrors(std.testing.allocator,
+        \\fn f(r: Pair[i32,
+    );
+}
+
+test "parser: no prefix of a dense program crashes" {
+    // Every recovery path in the parser has to survive input that stops in the
+    // middle of a token, a list, or a block.
+    const source =
+        \\struct Pair[A, B] { first: A
+        \\    second: B }
+        \\fn unwrap(r: Result[Pair[i32, f64], String]) -> i32 = match r? { Ok(p) => p.first, Err(_) => 0 }
+        \\fn main() {
+        \\    let xs: Vec[i32] = Vec[i32]{ 1, 2 }
+        \\    for v in xs |> iter { g(v)? }
+        \\    while next()? { |v| v? }
+        \\}
+    ;
+    var i: usize = 0;
+    while (i <= source.len) : (i += 1) {
+        try expectNoCrash(std.testing.allocator, source[0..i]);
+    }
+}
+
+// --- pipe chains (`docs/syntax.md` §5.2) ---
+
+test "parser: pipe binds looser than comparison" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() {
+        \\    let y = x |> f == 0
+        \\}
+    );
+    defer res.arena.deinit();
+    const pipe = try firstInitOfBody(&res);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(pipe));
+    const rhs = res.arena.get(pipe.pipeline.rhs);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(rhs));
+    try std.testing.expectEqual(@as(BinaryOp, .eq), rhs.binary_op.op);
+}
+
+test "parser: pipe inside call arguments, match arms and return" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() -> i32 {
+        \\    let a = g(x |> f, 2)
+        \\    let b = match x |> f { 1 => 1, _ => 0 }
+        \\    return x |> h
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const call_init = res.arena.get(res.arena.get(body.block.stmts.indices[0]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    const call = res.arena.get(call_init.call.args.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(call));
+    const match_init = res.arena.get(res.arena.get(body.block.stmts.indices[1]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(res.arena.get(match_init.match_expr.scrutinee)));
+    const ret = res.arena.get(body.block.stmts.indices[2]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(res.arena.get(ret.return_stmt.value orelse return error.TestUnexpectedNull)));
+}
+
+test "parser: pipe with propagation and a following stage" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() {
+        \\    let y = x |> g()?
+        \\    let z = x |> g()? |> h
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const first = res.arena.get(res.arena.get(body.block.stmts.indices[0]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(first.pipeline.rhs)));
+    const second = res.arena.get(res.arena.get(body.block.stmts.indices[1]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(second));
+    const inner = res.arena.get(second.pipeline.lhs);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(inner));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(inner.pipeline.rhs)));
+}
+
+test "parser: pipe in a struct initializer field" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() {
+        \\    let p = Point { .x = xs |> len, .y = 0 }
+        \\}
+    );
+    defer res.arena.deinit();
+    const init = try firstInitOfBody(&res);
+    const field0 = res.arena.get(init.struct_init.fields.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .pipeline), tagOf(res.arena.get(field0.struct_init_field.value)));
+}
+
+// --- postfix `?` propagation (`docs/syntax.md` §8.6) ---
+
+test "parser: propagation chains through call, field and index" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() -> i32 { return g()?.h()[0]? }
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    const outer = res.arena.get(stmt.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(outer));
+    const index = res.arena.get(outer.try_propagate);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(index));
+    const call = res.arena.get(index.index_access.object);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(call));
+    const field = res.arena.get(call.call.func);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .field_access), tagOf(field));
+    const inner = res.arena.get(field.field_access.object);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(inner));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .call), tagOf(res.arena.get(inner.try_propagate)));
+}
+
+test "parser: propagation in argument lists, closures and match arms" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() -> i32 {
+        \\    let a = g(h()?, 2)
+        \\    let b = |v| v?
+        \\    let c = match r? { Some(v) => v?, _ => 0 }
+        \\    return r.value?
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const a = res.arena.get(res.arena.get(body.block.stmts.indices[0]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    const a0 = res.arena.get(a.call.args.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(a0));
+    const b = res.arena.get(res.arena.get(body.block.stmts.indices[1]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    const b_body = res.arena.get(b.closure.body);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(b_body));
+    const c = res.arena.get(res.arena.get(body.block.stmts.indices[2]).let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    const arm = res.arena.get(c.match_expr.arms.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(arm.match_arm.body)));
+    const ret = res.arena.get(body.block.stmts.indices[3]);
+    const value = res.arena.get(ret.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(value));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .field_access), tagOf(res.arena.get(value.try_propagate)));
+}
+
+test "parser: propagation in statement, if, while, for, defer and comptime positions" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() -> i32 {
+        \\    g()?
+        \\    if r? { return 1 }
+        \\    while r? { }
+        \\    for v in r? { }
+        \\    defer r?
+        \\    comptime { r? }
+        \\    return 0
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .expr_stmt), tagOf(stmt));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(stmt.expr_stmt.expr)));
+    const if_stmt = res.arena.get(body.block.stmts.indices[1]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(if_stmt.if_expr.cond)));
+    const while_stmt = res.arena.get(body.block.stmts.indices[2]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(while_stmt.while_expr.cond)));
+    const for_stmt = res.arena.get(body.block.stmts.indices[3]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(for_stmt.for_each.iterable)));
+    const defer_stmt = res.arena.get(body.block.stmts.indices[4]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(defer_stmt.defer_stmt.expr)));
+    const comptime_stmt = res.arena.get(body.block.stmts.indices[5]);
+    const comptime_block = res.arena.get(comptime_stmt.expr_stmt.expr);
+    const inner = res.arena.get(comptime_block.comptime_block);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .try_propagate), tagOf(res.arena.get(res.arena.get(inner.block.stmts.indices[0]).expr_stmt.expr)));
+}
+
+test "parser: doubled propagation is rejected" {
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f() -> i32 { return g()?? }
+    , "already unwrapped");
+}
+
+test "parser: propagation is rejected in type positions" {
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f() { let x: i32? = 1 }
+    , "not part of a type");
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f(x: i32?) { }
+    , "not part of a type");
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f() -> Result[i32, String]? { return r }
+    , "not part of a type");
+    try expectParseErrorContaining(std.testing.allocator,
+        \\struct S { value: i32? }
+    , "not part of a type");
+    try expectParseErrorContaining(std.testing.allocator,
+        \\fn f() { let g: fn(i32) -> i32? = h }
+    , "not part of a type");
+}
+
+// --- removed OOP syntax ---
+
+test "parser: class declaration is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\class Animal {
+        \\    name: String
+        \\}
+    );
+}
+
+test "parser: property block is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\class Counter {
+        \\    prop count: i32 {
+        \\        get => this.count
+        \\        set(v) { this.count = v }
+        \\    }
+        \\}
+    );
+}
+
+test "parser: struct inheritance is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\struct Dog(Animal) {
+        \\    name: String
+        \\}
+    );
+}
+
+test "parser: fat pointer to an impl is rejected" {
+    try expectParseErrors(std.testing.allocator,
+        \\fn speak(s: *impl Speakable) -> String { return s.speak() }
+    );
+}
+
+test "parser: impl and interface are ordinary identifiers" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f() {
+        \\    let impl = 1
+        \\    let interface = impl + 1
+        \\}
+    );
+    defer res.arena.deinit();
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const second = res.arena.get(body.block.stmts.indices[1]);
+    const init = res.arena.get(second.let_stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(init));
+    try std.testing.expectEqualStrings("impl", nameOf(&res, res.arena.get(init.binary_op.left).identifier));
 }
 
 fn exprToBinaryOp(op: BinaryOp) []const u8 {

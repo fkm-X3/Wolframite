@@ -479,6 +479,16 @@ pub const TypeChecker = struct {
                 _ = self.inferExprType(ia.index);
                 return self.inferElementType(expr_idx, obj_ty);
             },
+            .generic_app => |ga| {
+                // `Pair[i32, f64]`: the arguments are type references and the
+                // application denotes the applied type itself until
+                // monomorphization resolves the substitution.
+                _ = self.inferExprType(ga.base);
+                for (ga.args.indices) |arg| {
+                    _ = self.inferExprType(arg);
+                }
+                return self.inferExprType(ga.base);
+            },
             .paren_expr => |p| {
                 return self.inferExprType(p);
             },
@@ -816,7 +826,6 @@ pub const TypeChecker = struct {
                 const pointee = self.inferExprType(n);
                 break :blk self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
             },
-            .generic_app => |g| self.inferExprType(g.base),
         };
     }
 
@@ -1179,4 +1188,27 @@ test "typecheck: print is an ordinary identifier until the prelude builtin lands
         res.diagnostics.deinit();
     }
     try std.testing.expect(res.diagnostics.hasErrors());
+}
+
+test "typecheck: generic application is accepted in type position" {
+    var res = try runCheck(std.testing.allocator,
+        \\struct Pair[A, B] {
+        \\    first: A
+        \\    second: B
+        \\}
+        \\struct Holder {
+        \\    pair: Pair[i32, f64]
+        \\}
+        \\fn main() -> Pair[i32, f64] {
+        \\    let p: Pair[i32, f64] = Pair[i32, f64]{ .first = 1, .second = 2.0 }
+        \\    let h: Holder = Holder{ .pair = p }
+        \\    return p
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
 }

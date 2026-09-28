@@ -432,6 +432,12 @@ pub const Resolver = struct {
                 try self.resolveExpr(ia.object);
                 try self.resolveExpr(ia.index);
             },
+            .generic_app => |ga| {
+                try self.resolveExpr(ga.base);
+                for (ga.args.indices) |arg| {
+                    try self.resolveExpr(arg);
+                }
+            },
             .paren_expr => |p| {
                 try self.resolveExpr(p);
             },

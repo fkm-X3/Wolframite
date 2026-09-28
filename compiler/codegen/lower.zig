@@ -734,6 +734,10 @@ pub const Lowerer = struct {
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
             .index_access => |ia| return self.lowerIndexAccess(node_idx, ia),
+            .generic_app => {
+                self.codegenError(node_idx, "generic application is not lowered yet", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
             .paren_expr => |p| return self.lowerExpr(p),
             .struct_init => |si| return self.lowerStructInit(node_idx, si),
             .range_expr => {
