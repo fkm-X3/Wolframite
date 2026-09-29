@@ -622,6 +622,7 @@ pub const TypeChecker = struct {
     fn fnSignatureType(self: *TypeChecker, fn_idx: NodeIdx) TypeIdx {
         const f = self.arena.get(fn_idx).fn_decl;
         const params = self.allocator.alloc(TypeIdx, f.params.indices.len) catch @panic("OOM");
+        defer self.allocator.free(params);
         for (f.params.indices, 0..) |param_idx, i| {
             const param = self.arena.get(param_idx);
             params[i] = self.inferTypeRef(param.param.ty);

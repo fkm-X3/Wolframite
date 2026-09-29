@@ -1651,3 +1651,26 @@ test "lower: interface method call no longer parses" {
     defer res.deinit();
     try std.testing.expect(res.diagnostics.hasErrors());
 }
+
+test "lower: a fn value is not lowered yet" {
+    var res = try runLower(std.testing.allocator,
+        \\fn inc(x: i32) -> i32 {
+        \\    return x + 1
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = inc
+        \\    return f(1)
+        \\}
+    );
+    defer res.deinit();
+    try std.testing.expect(res.diagnostics.hasErrors());
+    var reported_unlowered = false;
+    for (res.diagnostics.items.items) |item| {
+        if (item.phase == .codegen and
+            std.mem.indexOf(u8, item.message, "not lowered") != null)
+        {
+            reported_unlowered = true;
+        }
+    }
+    try std.testing.expect(reported_unlowered);
+}

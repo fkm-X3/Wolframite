@@ -25,8 +25,13 @@ pub fn isBuiltinTypeName(name: []const u8) bool {
         std.mem.eql(u8, name, "u32") or std.mem.eql(u8, name, "u64") or
         std.mem.eql(u8, name, "f32") or std.mem.eql(u8, name, "f64") or
         std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "String") or
-        std.mem.eql(u8, name, "void") or std.mem.eql(u8, name, "Self");
+        std.mem.eql(u8, name, "void");
 }
+
+/// The role an expression plays at its use site. Only a `fn` name in
+/// `.value` position is a function value; in `.type_ref` and `.pattern`
+/// position a name denotes a type or a binding and is left untouched.
+const ExprPos = enum { value, type_ref, pattern };
 
 pub const Resolver = struct {
     allocator: Allocator,
@@ -190,7 +195,7 @@ pub const Resolver = struct {
             if (self.scopes.lookupCurrent(param_name) != null) {
                 self.errorAt(param_idx, "duplicate parameter '{s}'", .{param_name});
             }
-            try self.resolveExpr(param.param.ty);
+            try self.resolveTypeRef(param.param.ty);
             try self.scopes.insert(param_name, .{
                 .name = param.param.name,
                 .kind = .param,
@@ -200,7 +205,7 @@ pub const Resolver = struct {
         }
 
         if (f.return_type) |ret_ty| {
-            try self.resolveExpr(ret_ty);
+            try self.resolveTypeRef(ret_ty);
         }
 
         if (f.body != NodeIdx.none) {
@@ -222,10 +227,10 @@ pub const Resolver = struct {
             },
             .let_stmt => |l| {
                 if (l.ty) |ty| {
-                    try self.resolveExpr(ty);
+                    try self.resolveTypeRef(ty);
                 }
                 if (l.init_expr) |init_val| {
-                    try self.resolveExpr(init_val);
+                    try self.resolveValue(init_val);
                 }
                 try self.scopes.insert(self.nameSlice(l.name), .{
                     .name = l.name,
@@ -236,29 +241,29 @@ pub const Resolver = struct {
             },
             .return_stmt => |r| {
                 if (r.value) |val| {
-                    try self.resolveExpr(val);
+                    try self.resolveValue(val);
                 }
             },
             .expr_stmt => |e| {
-                try self.resolveExpr(e.expr);
+                try self.resolveValue(e.expr);
             },
             .defer_stmt => |d| {
-                try self.resolveExpr(d.expr);
+                try self.resolveValue(d.expr);
             },
             .if_expr => |i| {
-                try self.resolveExpr(i.cond);
+                try self.resolveValue(i.cond);
                 try self.resolveStmt(i.then_body);
                 if (i.else_body) |else_b| {
                     try self.resolveStmt(else_b);
                 }
             },
             .while_expr => |w| {
-                try self.resolveExpr(w.cond);
+                try self.resolveValue(w.cond);
                 try self.resolveStmt(w.body);
             },
             .for_range => |fr| {
-                try self.resolveExpr(fr.start);
-                try self.resolveExpr(fr.end);
+                try self.resolveValue(fr.start);
+                try self.resolveValue(fr.end);
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
                 try self.scopes.insert(self.nameSlice(fr.var_name), .{
                     .name = fr.var_name,
@@ -270,7 +275,7 @@ pub const Resolver = struct {
                 self.scopes.popScope();
             },
             .for_each => |fe| {
-                try self.resolveExpr(fe.iterable);
+                try self.resolveValue(fe.iterable);
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
                 try self.scopes.insert(self.nameSlice(fe.var_name), .{
                     .name = fe.var_name,
@@ -282,14 +287,14 @@ pub const Resolver = struct {
                 self.scopes.popScope();
             },
             .match_expr => |m| {
-                try self.resolveExpr(m.scrutinee);
+                try self.resolveValue(m.scrutinee);
                 try self.resolveMatchArms(m);
             },
             .fn_decl => {
                 try self.resolveFnDecl(stmt_idx);
             },
             else => {
-                try self.resolveExpr(stmt_idx);
+                try self.resolveValue(stmt_idx);
             },
         }
     }
@@ -323,42 +328,90 @@ pub const Resolver = struct {
                     }
                 }
                 for (pattern.call.args.indices) |arg_idx| {
-                    try self.resolveExpr(arg_idx);
+                    try self.resolveAt(.value, arg_idx);
                 }
                 if (arm.match_arm.guard) |guard| {
-                    try self.resolveExpr(guard);
+                    try self.resolveAt(.value, guard);
                 }
-                try self.resolveExpr(arm.match_arm.body);
+                try self.resolveAt(.value, arm.match_arm.body);
                 self.scopes.popScope();
             } else {
-                try self.resolveExpr(arm.match_arm.pattern);
+                try self.resolveAt(.pattern, arm.match_arm.pattern);
                 if (arm.match_arm.guard) |guard| {
-                    try self.resolveExpr(guard);
+                    try self.resolveAt(.value, guard);
                 }
-                try self.resolveExpr(arm.match_arm.body);
+                try self.resolveAt(.value, arm.match_arm.body);
             }
         }
     }
 
-    fn resolveExpr(self: *Resolver, expr_idx: NodeIdx) anyerror!void {
+    /// Resolve a name: report it when it is not visible anywhere up the scope
+    /// stack, otherwise return the symbol it denotes.
+    fn resolveName(self: *Resolver, expr_idx: NodeIdx) ?Symbol {
+        const id = self.arena.get(expr_idx).identifier;
+        const name = self.nameSlice(id);
+        if (std.mem.eql(u8, name, "_")) return null;
+        if (isBuiltinTypeName(name)) return null;
+        if (ast.findEnumVariant(self.arena, self.source, self.module_node, name) != null) return null;
+        return self.scopes.lookup(name, self.scopes.currentScope()) orelse {
+            self.errorAt(expr_idx, "undefined identifier '{s}'", .{name});
+            return null;
+        };
+    }
+
+    /// A `fn` name used as a value is a first-class function. Rewrite the
+    /// identifier into an `fn_ref` so downstream passes read the reference
+    /// instead of re-deriving it from the name. `main` and uninstantiated
+    /// generic `fn`s are not function values and are left as plain names.
+    fn bindFnValue(self: *Resolver, expr_idx: NodeIdx, sym: Symbol) void {
+        const name = self.nameSlice(sym.name);
+        const f = self.arena.get(sym.decl_node).fn_decl;
+        if (f.generic_params.indices.len > 0) {
+            self.errorAt(expr_idx, "generic fn '{s}' requires type arguments to be used as a value", .{name});
+            return;
+        }
+        if (std.mem.eql(u8, name, "main")) {
+            self.errorAt(expr_idx, "'main' cannot be used as a value", .{});
+            return;
+        }
+        self.arena.set(expr_idx, .{ .fn_ref = sym.name });
+    }
+
+    /// A bare name in head position names the entity being applied or indexed,
+    /// not a function value: `add(1, 2)`, `fns[0]` and `first[[i32]]` all keep
+    /// the name. Anything else in head position (a field or element holding a
+    /// function) is an ordinary value.
+    fn resolveHead(self: *Resolver, expr_idx: NodeIdx) anyerror!void {
+        if (self.arena.get(expr_idx).* == .identifier) {
+            _ = self.resolveName(expr_idx);
+            return;
+        }
+        try self.resolveAt(.value, expr_idx);
+    }
+
+    fn resolveValue(self: *Resolver, expr_idx: NodeIdx) anyerror!void {
+        return self.resolveAt(.value, expr_idx);
+    }
+
+    fn resolveTypeRef(self: *Resolver, expr_idx: NodeIdx) anyerror!void {
+        return self.resolveAt(.type_ref, expr_idx);
+    }
+
+    fn resolveAt(self: *Resolver, pos: ExprPos, expr_idx: NodeIdx) anyerror!void {
         const expr = self.arena.get(expr_idx);
         switch (expr.*) {
-            .identifier => |id| {
-                const name = self.nameSlice(id);
-                if (std.mem.eql(u8, name, "_")) return;
-                if (isBuiltinTypeName(name)) return;
-                if (ast.findEnumVariant(self.arena, self.source, self.module_node, name) != null) return;
-                if (self.scopes.lookup(name, self.scopes.currentScope())) |_| {
-                } else {
-                    self.errorAt(expr_idx, "undefined identifier '{s}'", .{name});
+            .identifier => {
+                const sym = self.resolveName(expr_idx) orelse return;
+                if (pos == .value and sym.kind == .function) {
+                    self.bindFnValue(expr_idx, sym);
                 }
             },
             .binary_op => |b| {
-                try self.resolveExpr(b.left);
-                try self.resolveExpr(b.right);
+                try self.resolveAt(.value, b.left);
+                try self.resolveAt(.value, b.right);
             },
             .unary_op => |u| {
-                try self.resolveExpr(u.operand);
+                try self.resolveAt(.value, u.operand);
             },
             .call => |c| {
                 const callee = self.arena.get(c.func);
@@ -368,17 +421,18 @@ pub const Resolver = struct {
                     // Enum variant constructor: the name resolves inside the
                     // enum's own scope, not the current one.
                 } else {
-                    try self.resolveExpr(c.func);
+                    // A direct call names the function; it is not a fn value.
+                    try self.resolveHead(c.func);
                 }
                 for (c.args.indices) |arg| {
-                    try self.resolveExpr(arg);
+                    try self.resolveAt(.value, arg);
                 }
             },
             .fn_type => |ft| {
                 for (ft.params.indices) |param_ty| {
-                    try self.resolveExpr(param_ty);
+                    try self.resolveTypeRef(param_ty);
                 }
-                try self.resolveExpr(ft.return_type);
+                try self.resolveTypeRef(ft.return_type);
             },
             .fn_ref => |id| {
                 const name = self.nameSlice(id);
@@ -392,7 +446,7 @@ pub const Resolver = struct {
                 for (cl.params.indices) |param_idx| {
                     const param = self.arena.get(param_idx);
                     if (param.param.ty != NodeIdx.none) {
-                        try self.resolveExpr(param.param.ty);
+                        try self.resolveTypeRef(param.param.ty);
                     }
                     try self.scopes.insert(self.nameSlice(param.param.name), .{
                         .name = param.param.name,
@@ -401,56 +455,56 @@ pub const Resolver = struct {
                         .type_idx = TypeIdx.none,
                     });
                 }
-                try self.resolveExpr(cl.body);
+                try self.resolveAt(.value, cl.body);
                 self.scopes.popScope();
             },
             .comptime_block => |inner| try self.resolveStmt(inner),
-            .comptime_expr => |inner| try self.resolveExpr(inner),
+            .comptime_expr => |inner| try self.resolveAt(.value, inner),
             .comptime_call => |cc| {
                 for (cc.args.indices) |arg| {
-                    try self.resolveExpr(arg);
+                    try self.resolveAt(.value, arg);
                 }
             },
             .pipeline => |p| {
-                try self.resolveExpr(p.lhs);
-                try self.resolveExpr(p.rhs);
+                try self.resolveAt(.value, p.lhs);
+                try self.resolveAt(.value, p.rhs);
             },
-            .try_propagate => |inner| try self.resolveExpr(inner),
-            .move_expr => |inner| try self.resolveExpr(inner),
+            .try_propagate => |inner| try self.resolveAt(.value, inner),
+            .move_expr => |inner| try self.resolveAt(.value, inner),
             .region_expr => |r| {
                 if (r.allocator) |alloc_ty| {
-                    try self.resolveExpr(alloc_ty);
+                    try self.resolveTypeRef(alloc_ty);
                 }
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
                 try self.resolveStmt(r.body);
                 self.scopes.popScope();
             },
             .field_access => |fa| {
-                try self.resolveExpr(fa.object);
+                try self.resolveAt(.value, fa.object);
             },
             .index_access => |ia| {
-                try self.resolveExpr(ia.object);
-                try self.resolveExpr(ia.index);
+                try self.resolveHead(ia.object);
+                try self.resolveAt(.value, ia.index);
             },
             .generic_app => |ga| {
-                try self.resolveExpr(ga.base);
+                try self.resolveHead(ga.base);
                 for (ga.args.indices) |arg| {
-                    try self.resolveExpr(arg);
+                    try self.resolveTypeRef(arg);
                 }
             },
             .paren_expr => |p| {
-                try self.resolveExpr(p);
+                try self.resolveAt(pos, p);
             },
             .struct_init => |si| {
-                try self.resolveExpr(si.ty);
+                try self.resolveTypeRef(si.ty);
                 for (si.fields.indices) |field_idx| {
                     const field = self.arena.get(field_idx);
-                    try self.resolveExpr(field.struct_init_field.value);
+                    try self.resolveAt(.value, field.struct_init_field.value);
                 }
             },
             .range_expr => |r| {
-                try self.resolveExpr(r.start);
-                try self.resolveExpr(r.end);
+                try self.resolveAt(.value, r.start);
+                try self.resolveAt(.value, r.end);
             },
             .int_literal, .float_literal, .string_literal, .char_literal, .bool_literal, .null_literal => {},
             .block => |b| {
@@ -461,14 +515,14 @@ pub const Resolver = struct {
                 self.scopes.popScope();
             },
             .if_expr => |i| {
-                try self.resolveExpr(i.cond);
+                try self.resolveAt(.value, i.cond);
                 try self.resolveStmt(i.then_body);
                 if (i.else_body) |else_b| {
                     try self.resolveStmt(else_b);
                 }
             },
             .match_expr => |m| {
-                try self.resolveExpr(m.scrutinee);
+                try self.resolveAt(.value, m.scrutinee);
                 try self.resolveMatchArms(m);
             },
             .param, .field, .enum_variant, .match_arm, .struct_init_field => {},
@@ -494,6 +548,29 @@ fn runResolve(allocator: Allocator, source: []const u8) !struct { arena: AstAren
         try resolver.resolve();
     }
     return .{ .arena = arena, .type_pool = type_pool, .diagnostics = diags };
+}
+
+/// Number of `fn_ref` nodes the resolver produced.
+fn countFnRefs(arena: *const AstArena) usize {
+    var count: usize = 0;
+    for (arena.nodes.items) |node| {
+        if (std.meta.activeTag(node) == .fn_ref) count += 1;
+    }
+    return count;
+}
+
+fn firstFnRefName(arena: *const AstArena, source: []const u8) ?[]const u8 {
+    for (arena.nodes.items) |node| {
+        if (std.meta.activeTag(node) == .fn_ref) return node.fn_ref.slice(source);
+    }
+    return null;
+}
+
+fn hasMessage(diagnostics: *const diag.Diagnostics, needle: []const u8) bool {
+    for (diagnostics.items.items) |item| {
+        if (std.mem.indexOf(u8, item.message, needle) != null) return true;
+    }
+    return false;
 }
 
 test "resolve: empty module" {
@@ -728,4 +805,170 @@ test "resolve: impl block no longer parses" {
         res.diagnostics.deinit();
     }
     try std.testing.expect(res.diagnostics.hasErrors());
+}
+
+test "resolve: Self is not a builtin type name" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn identity(x: Self) -> Self {
+        \\    return x
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "undefined identifier 'Self'"));
+}
+
+test "resolve: fn name in value position becomes an fn_ref" {
+    const source =
+        \\fn add(a: i32, b: i32) -> i32 {
+        \\    return a + b
+        \\}
+        \\fn apply(f: fn(i32, i32) -> i32, x: i32, y: i32) -> i32 {
+        \\    return f(x, y)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = add
+        \\    return apply(f, 1, 2)
+        \\}
+    ;
+    var res = try runResolve(std.testing.allocator, source);
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), countFnRefs(&res.arena));
+    try std.testing.expectEqualStrings("add", firstFnRefName(&res.arena, source).?);
+}
+
+test "resolve: a direct call keeps the callee a plain name" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 {
+        \\    return a + b
+        \\}
+        \\fn main() -> i32 {
+        \\    return add(1, 2)
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
+}
+
+test "resolve: fn value in a pipeline, an argument, and a field" {
+    const source =
+        \\struct Handler {
+        \\    f: fn(i32) -> i32
+        \\}
+        \\fn inc(x: i32) -> i32 {
+        \\    return x + 1
+        \\}
+        \\fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+        \\    return f(x)
+        \\}
+        \\fn main() -> i32 {
+        \\    let h = Handler{ .f = inc }
+        \\    let y = 1 |> inc
+        \\    return apply(inc, y) + h.f(2)
+        \\}
+    ;
+    var res = try runResolve(std.testing.allocator, source);
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 3), countFnRefs(&res.arena));
+    try std.testing.expectEqualStrings("inc", firstFnRefName(&res.arena, source).?);
+}
+
+test "resolve: a local shadows a module fn of the same name" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 {
+        \\    return a + b
+        \\}
+        \\fn main() -> i32 {
+        \\    let add = 1
+        \\    return add
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
+}
+
+test "resolve: an uninstantiated generic fn is not a value" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn first[T](list: T) -> T {
+        \\    return list
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = first
+        \\    return 0
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "generic fn 'first' requires type arguments"));
+    try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
+}
+
+test "resolve: main is not a value" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn helper() -> i32 {
+        \\    return 1
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = main
+        \\    return helper()
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'main' cannot be used as a value"));
+    try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
+}
+
+test "resolve: a fn type annotation is not a fn value" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+        \\    return f(x)
+        \\}
+        \\fn main() -> i32 {
+        \\    let g: fn(i32) -> i32 = inc
+        \\    return g(1)
+        \\}
+        \\fn inc(x: i32) -> i32 {
+        \\    return x + 1
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), countFnRefs(&res.arena));
 }

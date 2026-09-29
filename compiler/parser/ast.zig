@@ -199,6 +199,13 @@ pub const AstArena = struct {
         return &self.nodes.items[@as(usize, @intCast(idx.toInt()))];
     }
 
+    /// Overwrite an existing node in place. The semantic passes use this to
+    /// rewrite a node once the name it holds is known to denote a different
+    /// entity (e.g. an `identifier` that names a `fn` becomes an `fn_ref`).
+    pub fn set(self: *AstArena, idx: NodeIdx, node: Node) void {
+        self.nodes.items[@as(usize, @intCast(idx.toInt()))] = node;
+    }
+
     pub fn allocNodeList(self: *AstArena, indices: []const NodeIdx) !NodeList {
         const copy = try self.allocator.alloc(NodeIdx, indices.len);
         @memcpy(copy, indices);

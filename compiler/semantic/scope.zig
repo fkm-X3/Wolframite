@@ -5,14 +5,15 @@ const NodeIdx = ast.NodeIdx;
 const types = @import("types.zig");
 const TypeIdx = types.TypeIdx;
 
+/// `function` is a value symbol: a `fn` name used in expression position is a
+/// first-class function value, not a namespace entry. There is no `class`/
+/// `interface` kind — polymorphism is comptime generics.
 pub const SymbolKind = enum(u8) {
     local,
     param,
     function,
     struct_type,
-    class_type,
     enum_type,
-    interface_type,
     generic_param,
     module,
 };
