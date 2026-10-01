@@ -1,0 +1,13 @@
+.{
+    .name = .WfrStd,
+    .version = "0.0.0",
+    .fingerprint = 0x187bfa4c08a65d73, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

@@ -23,6 +23,8 @@ const ast = @import("../parser/ast.zig");
 const diag = @import("../diagnostics.zig");
 const types_mod = @import("../semantic/types.zig");
 const typecheck_mod = @import("../semantic/typecheck.zig");
+const scope_mod = @import("../semantic/scope.zig");
+const prelude = @import("../prelude.zig");
 const string_mod = @import("string.zig");
 const class_mod = @import("class.zig");
 
@@ -989,6 +991,9 @@ pub const Lowerer = struct {
                     self.codegenError(node_idx, "unknown function '{s}'", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
                 };
+                if (sym.kind == .prelude_fn) {
+                    return self.lowerPreludeCall(node_idx, sym, c);
+                }
                 if (sym.kind != .function) {
                     self.codegenError(node_idx, "'{s}' is not a function", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -1013,6 +1018,28 @@ pub const Lowerer = struct {
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
         }
+    }
+
+    /// Lower a prelude call to a direct extern call into the runtime.
+    ///
+    /// This is the whole reason prelude names live in a table: there is no
+    /// `fn` to call, so the call becomes a named symbol in the object file and
+    /// the linker resolves it against `libs/std`. Arguments are already IR
+    /// values in the platform ABI, so a `String` argument arrives as the
+    /// pointer `lowerString` built — exactly what the runtime's `*const String`
+    /// parameter expects, with no marshalling in between.
+    fn lowerPreludeCall(self: *Lowerer, node_idx: NodeIdx, sym: scope_mod.Symbol, c: anytype) !api.Value {
+        if (sym.prelude.index >= prelude.roster.len) {
+            self.codegenError(node_idx, "prelude function '{s}' is not in the roster", .{
+                sym.displayName(self.source),
+            });
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const entry = prelude.roster[sym.prelude.index];
+
+        var args = try self.lowerArgs(c.args);
+        defer args.deinit(self.gpa);
+        return self.ctx.buildExternCall(entry.symbol, self.void_ty, args.items);
     }
 
     /// Lower an enum variant constructor (`Some(x)`): stack block with the
@@ -1175,13 +1202,12 @@ pub const Lowerer = struct {
                     32 => self.i32_ty,
                     else => self.i64_ty,
                 }
-            else
-                switch (i.bits) {
-                    8 => self.u8_ty,
-                    16 => self.u16_ty,
-                    32 => self.u32_ty,
-                    else => self.u64_ty,
-                },
+            else switch (i.bits) {
+                8 => self.u8_ty,
+                16 => self.u16_ty,
+                32 => self.u32_ty,
+                else => self.u64_ty,
+            },
             .float => |f| switch (f) {
                 .f32 => self.f32_ty,
                 .f64 => self.f64_ty,
@@ -1358,6 +1384,23 @@ test "lower: arithmetic and calls" {
     const text = res.text(&buf);
     try std.testing.expect(std.mem.indexOf(u8, text, "add %0, %1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "call @fn0(%") != null);
+}
+
+test "lower: print lowers to an extern call into the runtime" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    print("Hello, world!")
+        \\    return 42
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The prelude name is gone: what reaches the IR is the runtime symbol.
+    try std.testing.expect(std.mem.indexOf(u8, text, "wfr_std_print") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "extern_call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "iconst 42") != null);
 }
 
 test "lower: expression-body fn shorthand returns its value" {

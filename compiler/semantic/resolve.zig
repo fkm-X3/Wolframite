@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("../parser/ast.zig");
 const diag = @import("../diagnostics.zig");
+const prelude = @import("../prelude.zig");
 const scope_mod = @import("scope.zig");
 const types_mod = @import("types.zig");
 
@@ -71,12 +72,32 @@ pub const Resolver = struct {
 
         const module_scope = try self.scopes.pushScope(null);
 
+        try self.declarePrelude(module_scope);
+
         for (decls.indices) |decl_idx| {
             try self.collectDecl(decl_idx, module_scope);
         }
 
         for (decls.indices) |decl_idx| {
             try self.resolveDecl(decl_idx);
+        }
+    }
+
+    /// Predeclare the prelude roster in the module root scope.
+    ///
+    /// This runs before `collectDecl` so a program that declares `fn print`
+    /// collides with the reservation instead of silently replacing it — the
+    /// roster owns the name, not the other way round.
+    fn declarePrelude(self: *Resolver, scope_idx: u32) !void {
+        _ = scope_idx;
+        for (prelude.roster, 0..) |entry, i| {
+            try self.scopes.insert(entry.name, .{
+                .name = .{ .start = 0, .end = @intCast(entry.name.len) },
+                .kind = .prelude_fn,
+                .decl_node = NodeIdx.none,
+                .type_idx = TypeIdx.none,
+                .prelude = .{ .index = @intCast(i) },
+            });
         }
     }
 
@@ -92,11 +113,25 @@ pub const Resolver = struct {
         self.diagnostics.add(.@"error", .semantic, msg, null) catch {};
     }
 
+    /// Reject a declaration or binding that takes a prelude name.
+    ///
+    /// The roster owns these names: shadowing one would make the same spelling
+    /// mean two things, and the direct-call lowering keys off the name
+    /// (ADR-0001 §4). Reporting here rather than letting `insert` overwrite the
+    /// predeclared symbol keeps the meaning of the name singular.
+    fn checkPreludeCollision(self: *Resolver, node: NodeIdx, name: []const u8) bool {
+        if (!prelude.isReserved(name)) return false;
+        self.errorAt(node, "cannot redefine prelude function '{s}'", .{name});
+        return true;
+    }
+
     fn collectDecl(self: *Resolver, decl_idx: NodeIdx, scope_idx: u32) !void {
         const decl = self.arena.get(decl_idx);
         switch (decl.*) {
             .fn_decl => |f| {
-                try self.scopes.insert(self.nameSlice(f.name), .{
+                const name = self.nameSlice(f.name);
+                if (self.checkPreludeCollision(decl_idx, name)) return;
+                try self.scopes.insert(name, .{
                     .name = f.name,
                     .kind = .function,
                     .decl_node = decl_idx,
@@ -104,7 +139,9 @@ pub const Resolver = struct {
                 });
             },
             .struct_decl => |s| {
-                try self.scopes.insert(self.nameSlice(s.name), .{
+                const struct_name = self.nameSlice(s.name);
+                if (self.checkPreludeCollision(decl_idx, struct_name)) return;
+                try self.scopes.insert(struct_name, .{
                     .name = s.name,
                     .kind = .struct_type,
                     .decl_node = decl_idx,
@@ -127,7 +164,9 @@ pub const Resolver = struct {
                 self.scopes.popScope();
             },
             .enum_decl => |e| {
-                try self.scopes.insert(self.nameSlice(e.name), .{
+                const enum_name = self.nameSlice(e.name);
+                if (self.checkPreludeCollision(decl_idx, enum_name)) return;
+                try self.scopes.insert(enum_name, .{
                     .name = e.name,
                     .kind = .enum_type,
                     .decl_node = decl_idx,
@@ -152,6 +191,7 @@ pub const Resolver = struct {
             .import_decl => |imp| {
                 const first_part = self.arena.get(imp.path.indices[0]);
                 const name = self.nameSlice(first_part.identifier);
+                if (self.checkPreludeCollision(decl_idx, name)) return;
                 try self.scopes.insert(name, .{
                     .name = first_part.identifier,
                     .kind = .module,
@@ -181,6 +221,7 @@ pub const Resolver = struct {
         for (f.generic_params.indices) |gp_idx| {
             const gp = self.arena.get(gp_idx);
             const gp_name = self.nameSlice(gp.identifier);
+            if (self.checkPreludeCollision(gp_idx, gp_name)) continue;
             try self.scopes.insert(gp_name, .{
                 .name = gp.identifier,
                 .kind = .generic_param,
@@ -195,6 +236,7 @@ pub const Resolver = struct {
             if (self.scopes.lookupCurrent(param_name) != null) {
                 self.errorAt(param_idx, "duplicate parameter '{s}'", .{param_name});
             }
+            if (self.checkPreludeCollision(param_idx, param_name)) continue;
             try self.resolveTypeRef(param.param.ty);
             try self.scopes.insert(param_name, .{
                 .name = param.param.name,
@@ -232,7 +274,9 @@ pub const Resolver = struct {
                 if (l.init_expr) |init_val| {
                     try self.resolveValue(init_val);
                 }
-                try self.scopes.insert(self.nameSlice(l.name), .{
+                const local_name = self.nameSlice(l.name);
+                if (self.checkPreludeCollision(stmt_idx, local_name)) return;
+                try self.scopes.insert(local_name, .{
                     .name = l.name,
                     .kind = .local,
                     .decl_node = stmt_idx,
@@ -265,6 +309,10 @@ pub const Resolver = struct {
                 try self.resolveValue(fr.start);
                 try self.resolveValue(fr.end);
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
+                if (self.checkPreludeCollision(stmt_idx, self.nameSlice(fr.var_name))) {
+                    self.scopes.popScope();
+                    return;
+                }
                 try self.scopes.insert(self.nameSlice(fr.var_name), .{
                     .name = fr.var_name,
                     .kind = .local,
@@ -277,6 +325,10 @@ pub const Resolver = struct {
             .for_each => |fe| {
                 try self.resolveValue(fe.iterable);
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
+                if (self.checkPreludeCollision(stmt_idx, self.nameSlice(fe.var_name))) {
+                    self.scopes.popScope();
+                    return;
+                }
                 try self.scopes.insert(self.nameSlice(fe.var_name), .{
                     .name = fe.var_name,
                     .kind = .local,
@@ -319,6 +371,7 @@ pub const Resolver = struct {
                 for (pattern.call.args.indices, 0..) |arg_idx, i| {
                     const arg = self.arena.get(arg_idx);
                     if (i < variant.enum_variant.fields.indices.len and arg.* == .identifier) {
+                        if (self.checkPreludeCollision(arg_idx, self.nameSlice(arg.identifier))) continue;
                         try self.scopes.insert(self.nameSlice(arg.identifier), .{
                             .name = arg.identifier,
                             .kind = .local,
@@ -402,8 +455,16 @@ pub const Resolver = struct {
         switch (expr.*) {
             .identifier => {
                 const sym = self.resolveName(expr_idx) orelse return;
-                if (pos == .value and sym.kind == .function) {
-                    self.bindFnValue(expr_idx, sym);
+                if (pos != .value) return;
+                switch (sym.kind) {
+                    .function => self.bindFnValue(expr_idx, sym),
+                    // A prelude entry is not a Wolframite `fn` value: it has no
+                    // body and no type to instantiate, so taking it as a value
+                    // cannot mean anything yet.
+                    .prelude_fn => self.errorAt(expr_idx, "prelude function '{s}' cannot be used as a value", .{
+                        sym.displayName(self.source),
+                    }),
+                    else => {},
                 }
             },
             .binary_op => |b| {
@@ -445,6 +506,7 @@ pub const Resolver = struct {
                 _ = try self.scopes.pushScope(self.scopes.currentScope());
                 for (cl.params.indices) |param_idx| {
                     const param = self.arena.get(param_idx);
+                    if (self.checkPreludeCollision(param_idx, self.nameSlice(param.param.name))) continue;
                     if (param.param.ty != NodeIdx.none) {
                         try self.resolveTypeRef(param.param.ty);
                     }
@@ -951,7 +1013,124 @@ test "resolve: main is not a value" {
     try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
 }
 
-test "resolve: a fn type annotation is not a fn value" {
+test "resolve: print resolves without a declaration" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    print("Hello, world!")
+        \\    return 42
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+    // A direct call keeps the callee a plain name; the lowerer resolves it.
+    try std.testing.expectEqual(@as(usize, 0), countFnRefs(&res.arena));
+}
+
+test "resolve: a program cannot redefine a prelude function" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn print(s: String) {
+        \\    return
+        \\}
+        \\fn main() -> i32 {
+        \\    return 0
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot redefine prelude function 'print'"));
+}
+
+test "resolve: a local cannot shadow a prelude function" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let print = 1
+        \\    return print
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot redefine prelude function 'print'"));
+}
+
+test "resolve: a prelude name cannot be bound by any declaration kind" {
+    // Every binder the resolver knows about has to route through the same check,
+    // otherwise a program could smuggle a local `print` in through the one
+    // construct that forgot.
+    const sources = [_][]const u8{
+        \\struct print { }
+        \\fn main() -> i32 { return 0 }
+        ,
+        \\enum print { A }
+        \\fn main() -> i32 { return 0 }
+        ,
+        \\import print
+        \\fn main() -> i32 { return 0 }
+        ,
+        \\fn print(s: String) { }
+        \\fn main() -> i32 { return 0 }
+        ,
+        \\fn main(print: i32) -> i32 { return print }
+        ,
+        \\fn main[T](print: T) -> i32 { return 0 }
+        ,
+        \\fn main() -> i32 {
+        \\    for print in 0..3 { return print }
+        \\    return 0
+        \\}
+        ,
+        \\fn main() -> i32 {
+        \\    let items = "abc"
+        \\    for print in items { return 1 }
+        \\    return 0
+        \\}
+        ,
+        \\fn main() -> i32 {
+        \\    let f = |print: i32| print
+        \\    return 0
+        \\}
+        ,
+    };
+    for (sources) |src| {
+        var res = try runResolve(std.testing.allocator, src);
+        defer {
+            res.arena.deinit();
+            res.type_pool.deinit();
+            res.diagnostics.deinit();
+        }
+        try std.testing.expect(res.diagnostics.hasErrors());
+        try std.testing.expect(hasMessage(&res.diagnostics, "cannot redefine prelude function 'print'"));
+    }
+}
+
+test "resolve: a prelude function cannot be used as a value" {
+    var res = try runResolve(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let f = print
+        \\    return 0
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "prelude function 'print' cannot be used as a value"));
+}
+
+test "resolve: resolve: a fn type annotation is not a fn value" {
     var res = try runResolve(std.testing.allocator,
         \\fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
         \\    return f(x)

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("../parser/ast.zig");
 const diag = @import("../diagnostics.zig");
+const prelude = @import("../prelude.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
 
@@ -169,6 +170,12 @@ pub const TypeChecker = struct {
     }
     pub fn nodeType(self: *const TypeChecker, node: NodeIdx) TypeIdx {
         return self.getNodeType(node);
+    }
+
+    /// The type of a `void`-returning expression, for callers that need to
+    /// compare against a call result.
+    pub fn voidTypeIndex(self: *const TypeChecker) TypeIdx {
+        return self.void_ty;
     }
 
     fn checkDecl(self: *TypeChecker, decl_idx: NodeIdx) anyerror!void {
@@ -652,6 +659,9 @@ pub const TypeChecker = struct {
                     return self.type_pool.add(.{ .enum_type = vi.enum_decl }) catch self.void_ty;
                 }
                 if (self.scopes.lookup(name, self.scopes.currentScope())) |sym| {
+                    if (sym.kind == .prelude_fn) {
+                        return self.checkPreludeCall(expr_idx, sym, c);
+                    }
                     if (sym.kind == .function) {
                         const f = self.arena.get(sym.decl_node).fn_decl;
                         self.checkCallArgs(expr_idx, f.params, c.args);
@@ -663,6 +673,58 @@ pub const TypeChecker = struct {
             },
             else => return self.i32_ty,
         }
+    }
+
+    /// Type a prelude call against its roster signature and return the entry's
+    /// return type.
+    ///
+    /// A prelude entry has no AST declaration, so `checkCallArgs` does not
+    /// apply — arity and argument types are read off the roster row instead.
+    /// Each argument was already typed above, so the check here is a real
+    /// comparison rather than an arity count.
+    fn checkPreludeCall(self: *TypeChecker, node_idx: NodeIdx, sym: scope_mod.Symbol, c: anytype) TypeIdx {
+        if (sym.prelude.index >= prelude.roster.len) {
+            self.errorAt(node_idx, "prelude function '{s}' is not in the roster", .{
+                sym.displayName(self.source),
+            });
+            return self.void_ty;
+        }
+        const entry = prelude.roster[sym.prelude.index];
+        const name = entry.name;
+
+        if (entry.params.len != c.args.indices.len) {
+            self.errorAt(node_idx, "'{s}' takes {d} argument(s), got {d}", .{
+                name, entry.params.len, c.args.indices.len,
+            });
+            return self.typeForParam(entry.return_type);
+        }
+
+        for (c.args.indices, 0..) |arg, i| {
+            const want = entry.params[i];
+            const want_ty = self.typeForParam(want);
+            const got_ty = self.getNodeType(arg);
+            if (want == .void) {
+                self.errorAt(node_idx, "'{s}' takes no arguments", .{name});
+                break;
+            }
+            if (!self.typesEqual(want_ty, got_ty)) {
+                self.errorAt(node_idx, "'{s}' expects '{s}', got '{s}'", .{
+                    name, self.typeName(want_ty), self.typeName(got_ty),
+                });
+            }
+        }
+
+        return self.typeForParam(entry.return_type);
+    }
+
+    fn typeForParam(self: *const TypeChecker, param: prelude.ParamType) TypeIdx {
+        return switch (param) {
+            .string => self.string_ty,
+            .i64 => self.i64_ty,
+            .u64 => self.u64_ty,
+            .f64 => self.f64_ty,
+            .void => self.void_ty,
+        };
     }
 
     /// Lightweight arg/param agreement: argument count only. Deep type
@@ -959,6 +1021,26 @@ fn runCheck(allocator: Allocator, source: []const u8) !struct { arena: AstArena,
     return .{ .arena = arena, .type_pool = type_pool, .diagnostics = diags };
 }
 
+/// Whether any diagnostic message contains `needle`. Used to pin the wording of
+/// the prelude's own diagnostics without depending on unrelated ones.
+fn hasMessage(diagnostics: *const diag.Diagnostics, needle: []const u8) bool {
+    for (diagnostics.items.items) |item| {
+        if (std.mem.indexOf(u8, item.message, needle) != null) return true;
+    }
+    return false;
+}
+
+/// The index of the AST node holding the `print(...)` call in `source`, if any.
+fn findPrintCall(arena: *const AstArena, source: []const u8) ?NodeIdx {
+    for (arena.nodes.items, 0..) |node, i| {
+        if (node != .call) continue;
+        const callee = arena.get(node.call.func);
+        if (callee.* != .identifier) continue;
+        if (std.mem.eql(u8, callee.identifier.slice(source), "print")) return @enumFromInt(i);
+    }
+    return null;
+}
+
 test "typecheck: empty module" {
     var res = try runCheck(std.testing.allocator, "");
     defer {
@@ -1176,7 +1258,7 @@ test "typecheck: comparison returns bool" {
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 
-test "typecheck: print is an ordinary identifier until the prelude builtin lands" {
+test "typecheck: print resolves through the prelude" {
     var res = try runCheck(std.testing.allocator,
         \\fn main() -> i32 {
         \\    print("hello")
@@ -1188,7 +1270,74 @@ test "typecheck: print is an ordinary identifier until the prelude builtin lands
         res.type_pool.deinit();
         res.diagnostics.deinit();
     }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: print takes a String and nothing else" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    print(42)
+        \\    return 0
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
     try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'print' expects 'String', got 'i32'"));
+}
+
+test "typecheck: print is arity checked" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    print("a", "b")
+        \\    return 0
+        \\}
+    );
+    defer {
+        res.arena.deinit();
+        res.type_pool.deinit();
+        res.diagnostics.deinit();
+    }
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'print' takes 1 argument(s), got 2"));
+}
+
+test "typecheck: a prelude call is void" {
+    const source =
+        \\fn main() -> i32 {
+        \\    print("hello")
+        \\    return 42
+        \\}
+    ;
+    const allocator = std.testing.allocator;
+    var arena = AstArena.init(allocator);
+    defer arena.deinit();
+    var lex = @import("../lexer/lexer.zig").Lexer.init(allocator, source);
+    defer lex.deinit();
+    const tokens = try lex.tokenize();
+    var diags = diag.Diagnostics.init(allocator);
+    diags.owns_messages = true;
+    defer diags.deinit();
+    var parser = @import("../parser/parser.zig").Parser.init(allocator, tokens, source, &arena, &diags);
+    const module_node = parser.parseModule();
+    var type_pool = types_mod.TypePool.init(allocator);
+    defer type_pool.deinit();
+
+    var resolver = @import("resolve.zig").Resolver.init(allocator, &arena, source, &type_pool, &diags, module_node);
+    defer resolver.deinit();
+    try resolver.resolve();
+    var checker = TypeChecker.init(allocator, &arena, source, &type_pool, &diags, &resolver.scopes, module_node);
+    defer checker.deinit();
+    try checker.check();
+
+    const call = findPrintCall(&arena, source).?;
+    // `print` produces no value a program can bind, so an i32 must not come
+    // back from it.
+    try std.testing.expect(checker.nodeType(call) == checker.voidTypeIndex());
+    try std.testing.expect(!diags.hasErrors());
 }
 
 test "typecheck: generic application is accepted in type position" {

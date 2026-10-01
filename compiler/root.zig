@@ -3,6 +3,7 @@ pub const lexer = @import("lexer/lexer.zig");
 pub const token = @import("lexer/token.zig");
 pub const ast = @import("parser/ast.zig");
 pub const parser = @import("parser/parser.zig");
+pub const prelude = @import("prelude.zig");
 pub const types = @import("semantic/types.zig");
 pub const scope = @import("semantic/scope.zig");
 pub const resolve = @import("semantic/resolve.zig");
@@ -15,6 +16,7 @@ test {
     _ = @import("lexer/token.zig");
     _ = @import("parser/ast.zig");
     _ = @import("parser/parser.zig");
+    _ = @import("prelude.zig");
     _ = @import("semantic/types.zig");
     _ = @import("semantic/scope.zig");
     _ = @import("semantic/resolve.zig");

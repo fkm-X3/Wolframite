@@ -118,6 +118,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(ore_exe);
 
+    // wfr_std — the Wolframite runtime library. Prelude calls such as `print`
+    // lower to extern calls against this archive, which `ore` links in
+    // alongside the program's assembly. It is installed to `zig-out/lib`, which
+    // is where `src/ore/link.zig` looks for it.
+    //
+    // The runtime must not link libc: it talks to the kernel directly (kernel32
+    // on Windows, raw syscalls on Linux), so `.link_libc` stays false here.
+    const wfr_std_mod = b.createModule(.{
+        .root_source_file = b.path("libs/std/src/std.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    const wfr_std_lib = b.addLibrary(.{
+        .name = "wfr_std",
+        .linkage = .static,
+        .root_module = wfr_std_mod,
+    });
+    b.installArtifact(wfr_std_lib);
+
     const run_ore_cmd = b.addRunArtifact(ore_exe);
     run_ore_cmd.step.dependOn(b.getInstallStep());
     const ore_step = b.step("ore", "Run the ore CLI");
@@ -202,6 +222,16 @@ pub fn build(b: *std.Build) void {
 
     const test_compiler_step = b.step("test-compiler", "Run compiler tests");
     test_compiler_step.dependOn(&run_compiler_tests.step);
+
+    // Wolframite runtime tests
+    const std_tests = b.addTest(.{
+        .root_module = wfr_std_mod,
+    });
+    const run_std_tests = b.addRunArtifact(std_tests);
+    test_step.dependOn(&run_std_tests.step);
+
+    const test_std_step = b.step("test-std", "Run Wolframite runtime tests");
+    test_std_step.dependOn(&run_std_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

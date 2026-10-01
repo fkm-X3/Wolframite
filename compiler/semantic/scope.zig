@@ -8,6 +8,12 @@ const TypeIdx = types.TypeIdx;
 /// `function` is a value symbol: a `fn` name used in expression position is a
 /// first-class function value, not a namespace entry. There is no `class`/
 /// `interface` kind — polymorphism is comptime generics.
+///
+/// `prelude_fn` is a name the resolver predeclares from `compiler/prelude.zig`.
+/// It is never bound by a declaration, has no `decl_node` pointing into the
+/// AST, and lowers to an extern call rather than a Wolframite `fn` — so every
+/// pass that walks symbols has to handle it explicitly instead of assuming
+/// `.function` implies a body.
 pub const SymbolKind = enum(u8) {
     local,
     param,
@@ -16,6 +22,17 @@ pub const SymbolKind = enum(u8) {
     enum_type,
     generic_param,
     module,
+    prelude_fn,
+};
+
+/// Which prelude entry a `prelude_fn` symbol denotes. Index into
+/// `compiler/prelude.zig`'s roster; `std.math.maxInt(u8)` would fit in 8 bits,
+/// but the roster is an explicit small list rather than a packed bitfield so
+/// adding an entry does not change the layout.
+pub const PreludeSlot = struct {
+    index: u8,
+
+    pub const none: PreludeSlot = .{ .index = std.math.maxInt(u8) };
 };
 
 pub const Symbol = struct {
@@ -23,6 +40,23 @@ pub const Symbol = struct {
     kind: SymbolKind,
     decl_node: NodeIdx,
     type_idx: TypeIdx,
+    /// Set only for `.prelude_fn`; `PreludeSlot.none` otherwise.
+    prelude: PreludeSlot = PreludeSlot.none,
+
+    /// The name to print in a diagnostic.
+    ///
+    /// A `name` is a `StringRef` into the program's source, and a prelude
+    /// symbol has no source text at all — its name lives in the roster. Reading
+    /// `name.slice` on a prelude symbol would report whatever the first
+    /// characters of the program happen to be, so anything that formats a
+    /// symbol name goes through here instead.
+    pub fn displayName(self: Symbol, source: []const u8) []const u8 {
+        if (self.kind == .prelude_fn and self.prelude.index != PreludeSlot.none.index) {
+            const roster = @import("../prelude.zig").roster;
+            if (self.prelude.index < roster.len) return roster[self.prelude.index].name;
+        }
+        return self.name.slice(source);
+    }
 };
 
 pub const Scope = struct {

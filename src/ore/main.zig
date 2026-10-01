@@ -212,6 +212,11 @@ fn linkBinary(gpa: Allocator, io: Io, asm_path: []const u8) !u8 {
             reportErr(io, "error: could not write the link shim\n", .{});
             return 1;
         },
+        error.StdLibMissing => {
+            reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
+            reportErr(io, "       run 'zig build' from the repository root first\n", .{});
+            return 1;
+        },
     };
 
     link_mod.deleteFile(io, asm_path);
@@ -279,6 +284,11 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         },
         error.WriteFailed => {
             reportErr(io, "error: could not write the link shim\n", .{});
+            return 1;
+        },
+        error.StdLibMissing => {
+            reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
+            reportErr(io, "       run 'zig build' from the repository root first\n", .{});
             return 1;
         },
     };
@@ -485,10 +495,9 @@ fn reportDiagnostics(io: Io, path: []const u8, diagnostics: *const diag_mod.Diag
         var w: Io.File.Writer = .init(.stderr(), io, &buf);
         if (item.location) |loc| {
             w.interface.print("{s}:{d}:{d}: {s} [{s}]: {s}\n", .{
-                path,           loc.line,
-                loc.column,     @tagName(item.severity),
-                @tagName(item.phase),
-                item.message,
+                path,                 loc.line,
+                loc.column,           @tagName(item.severity),
+                @tagName(item.phase), item.message,
             }) catch {};
         } else {
             w.interface.print("{s}: {s} [{s}]: {s}\n", .{
