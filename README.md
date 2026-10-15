@@ -2,7 +2,10 @@
 
 [![CI](https://github.com/fkm-X3/Wolframite/actions/workflows/ci.yml/badge.svg)](https://github.com/fkm-X3/Wolframite/actions/workflows/ci.yml)
 
-Wolframite, the lang built ontop of Tungsten
+Wolframite, the lang built on top of Tungsten
+
+> [!IMPORTANT]
+> This project is not abandoned (I'm going to continue working on it soon) and the syntax is locked to Zig 0.16.
 
 ## Quick Install
 
