@@ -14,6 +14,13 @@ pub const FloatKind = enum {
     f64,
 };
 
+/// The semantic type of a value or a named type. There is no `class_type` or
+/// `interface_type`: polymorphism is comptime generics (R19), so a `struct` is a
+/// plain aggregate (`struct_type`) and there is no vtable/interface type.
+///
+/// `function` is the first-class fn type `fn(A, B) -> R` (R4). Its captured set
+/// is **not** part of the type — two closures with the same visible signature
+/// are the same type even when they capture different bindings (R4a).
 pub const SemType = union(enum) {
     void,
     bool_type,
@@ -26,12 +33,14 @@ pub const SemType = union(enum) {
     },
     string_type,
     struct_type: NodeIdx,
-    class_type: NodeIdx,
     enum_type: NodeIdx,
     array: struct { elem: TypeIdx, size: ?u64 },
     slice: TypeIdx,
-    interface_type: NodeIdx,
     generic_param: struct { name: StringRef, index: u32 },
+    /// An unresolved type: the placeholder for a closure parameter or closure
+    /// return type that is inferred rather than annotated (R11b). Comparisons
+    /// against an `inferred` operand are permissive so a not-yet-resolved
+    /// closure does not produce a cascade of spurious errors.
     inferred,
 };
 

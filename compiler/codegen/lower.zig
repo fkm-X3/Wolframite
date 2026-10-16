@@ -1071,28 +1071,13 @@ pub const Lowerer = struct {
         const sem = self.type_pool.get(ty);
         const decl_node = switch (sem) {
             .struct_type => |n| n,
-            .class_type => |n| n,
             else => {
-                self.codegenError(node_idx, "struct init on a non-struct/class type", .{});
+                self.codegenError(node_idx, "struct init on a non-struct type", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
         };
-        const is_class = sem == .class_type;
 
-        var base: api.Value = undefined;
-        if (is_class) {
-            const vtable_g = self.vtable_by_class.get(decl_node) orelse {
-                self.codegenError(node_idx, "class has no vtable", .{});
-                return self.ctx.buildIntConst(self.i64_ty, 0);
-            };
-            const size_val = try self.ctx.buildIntConst(self.i64_ty, class_mod.classSize(self.arena, decl_node));
-            base = try self.ctx.buildMalloc(self.ptr_ty, size_val);
-            _ = try self.ctx.buildStore(self.i64_ty, base, try self.ctx.buildGlobalAddr(self.ptr_ty, vtable_g));
-            const rc_addr = try self.ctx.buildPtrAdd(self.ptr_ty, base, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.ref_count_offset)));
-            _ = try self.ctx.buildStore(self.i64_ty, rc_addr, try self.ctx.buildIntConst(self.i64_ty, 0));
-        } else {
-            base = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.structSize(self.arena, decl_node));
-        }
+        const base = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.structSize(self.arena, decl_node));
 
         const decl = self.arena.get(decl_node);
         const fields: []const NodeIdx = switch (decl.*) {
@@ -1101,10 +1086,9 @@ pub const Lowerer = struct {
         };
 
         // Each field slot gets its initializer, or zero if omitted.
-        const field_base: u64 = if (is_class) class_mod.class_header_size else 0;
         for (fields, 0..) |field_idx, i| {
             const field_name = self.nameSlice(self.arena.get(field_idx).field.name);
-            const offset: u64 = field_base + 8 * @as(u64, @intCast(i));
+            const offset: u64 = 8 * @as(u64, @intCast(i));
             var init_val: ?api.Value = null;
             for (si.fields.indices) |init_idx| {
                 const init_field = self.arena.get(init_idx).struct_init_field;
@@ -1130,32 +1114,20 @@ pub const Lowerer = struct {
         const field_name = self.nameSlice(fa.field);
 
         var decl_node: ?NodeIdx = null;
-        var is_class = false;
         switch (sem) {
             .struct_type => |n| decl_node = n,
-            .class_type => |n| {
-                decl_node = n;
-                is_class = true;
-            },
             .pointer => |elem| switch (self.type_pool.get(elem)) {
                 .struct_type => |n| decl_node = n,
-                .class_type => |n| {
-                    decl_node = n;
-                    is_class = true;
-                },
                 else => {},
             },
             else => {},
         }
         const target = decl_node orelse {
-            self.codegenError(node_idx, "field access on a non-struct/class type", .{});
+            self.codegenError(node_idx, "field access on a non-struct type", .{});
             return null;
         };
 
-        const offset = if (is_class)
-            class_mod.classFieldOffset(self.arena, self.source, target, field_name)
-        else
-            class_mod.structFieldOffset(self.arena, self.source, target, field_name);
+        const offset = class_mod.structFieldOffset(self.arena, self.source, target, field_name);
         const off = offset orelse {
             self.codegenError(node_idx, "no such field '{s}'", .{field_name});
             return null;
