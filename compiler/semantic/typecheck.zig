@@ -91,6 +91,9 @@ pub const TypeChecker = struct {
 
     fn_ret_type: TypeIdx,
     in_function: bool,
+    /// Whether the expression being typed sits inside a `comptime` context,
+    /// where `?` has no success/error split to branch on (R29c).
+    in_comptime: bool,
 
     type_name_buf: [2][16]u8,
     type_name_toggle: u1 = 0,
@@ -163,6 +166,7 @@ pub const TypeChecker = struct {
             .node_types = node_types,
             .fn_ret_type = void_ty,
             .in_function = false,
+            .in_comptime = false,
             .type_name_buf = undefined,
             .type_name_toggle = 0,
             .pending = .empty,
@@ -638,10 +642,19 @@ pub const TypeChecker = struct {
                 return self.inferClosureType(expr_idx, cl, null);
             },
             .comptime_block => |inner| {
+                const prev_comptime = self.in_comptime;
+                self.in_comptime = true;
                 tryStd(self.checkStmt(inner));
+                self.in_comptime = prev_comptime;
                 return self.void_ty;
             },
-            .comptime_expr => |inner| return self.inferExprType(inner),
+            .comptime_expr => |inner| {
+                const prev_comptime = self.in_comptime;
+                self.in_comptime = true;
+                const ty = self.inferExprType(inner);
+                self.in_comptime = prev_comptime;
+                return ty;
+            },
             .comptime_call => |cc| {
                 for (cc.args.indices) |arg| {
                     _ = self.inferExprType(arg);
@@ -651,7 +664,7 @@ pub const TypeChecker = struct {
             .pipeline => |p| {
                 return self.inferPipeline(expr_idx, p);
             },
-            .try_propagate => |inner| return self.inferExprType(inner),
+            .try_propagate => |inner| return self.inferPropagate(expr_idx, inner),
             .move_expr => |inner| return self.inferExprType(inner),
             .region_expr => |r| {
                 if (r.allocator) |alloc_ty| {
@@ -951,9 +964,16 @@ pub const TypeChecker = struct {
             // An expression body's type is the closure's return type; a block
             // body's explicit `return`s already fixed it, and a body with no
             // return is `void`. Resolution is first-wins, so a fixed return is
-            // never overwritten.
+            // never overwritten — which is what lets `?` fix the return type to
+            // the propagated enum (R29a) even though the whole `?` expression
+            // has the success payload's type.
             if (self.isConcrete(body_ty)) self.resolvePlaceholder(ph, body_ty);
             ret_ty = if (self.pending.get(expr_idx)) |p| (p.resolved orelse ph) else body_ty;
+            if (!body_is_block and self.isConcrete(body_ty) and !self.typesEqual(ret_ty, body_ty)) {
+                self.errorAt(expr_idx, "closure body has type '{s}' but is expected to return '{s}'", .{
+                    self.typeName(body_ty), self.typeName(ret_ty),
+                });
+            }
         } else if (!body_is_block and !self.typesEqual(ret_ty, body_ty)) {
             self.errorAt(expr_idx, "closure body has type '{s}' but is expected to return '{s}'", .{
                 self.typeName(body_ty), self.typeName(ret_ty),
@@ -1432,6 +1452,120 @@ pub const TypeChecker = struct {
         _ = self.inferExprType(piped);
         self.errorAt(node_idx, "cannot pipe into a value of type '{s}'", .{self.typeName(rhs_ty)});
         return self.void_ty;
+    }
+
+    // ========================================================================
+    // Error propagation `?` (R26-R29)
+    // ========================================================================
+
+    /// The variant decomposition of an enum `?` can propagate on (R26).
+    pub const PropagateShape = struct {
+        /// Declaration index of the single-payload success variant.
+        success_index: u32,
+        /// Type of the success variant's payload: the type of `x?`.
+        success_payload_ty: TypeIdx,
+        /// Declaration index of the error variant.
+        error_index: u32,
+        /// Payload field count on the error variant (0 or 1).
+        error_field_count: u32,
+        /// Type of the error payload (`void` when the error variant is bare).
+        error_payload_ty: TypeIdx,
+    };
+
+    /// The success/error split of an enum `?` can propagate on, or null when the
+    /// enum does not have the required shape (R26): exactly two variants, one
+    /// with exactly one payload field (the success variant, `Ok(T)` / `Some(T)`)
+    /// and the other with 0 or 1 fields (the error variant, `Err(E)` / `None`).
+    /// Declaration order breaks the tie for a `Result`-shaped enum: the first
+    /// one-field variant is the success variant. There is no hard-coded
+    /// `Result`/`Option`; the shape alone decides.
+    pub fn propagateShape(self: *TypeChecker, enum_node: NodeIdx) ?PropagateShape {
+        const decl = self.arena.get(enum_node);
+        if (decl.* != .enum_decl) return null;
+        const variants = decl.enum_decl.variants.indices;
+        if (variants.len != 2) return null;
+
+        var success: ?usize = null;
+        var err: ?usize = null;
+        for (variants, 0..) |variant_idx, i| {
+            const fields = self.arena.get(variant_idx).enum_variant.fields;
+            if (fields.indices.len == 1 and success == null) {
+                success = i;
+            } else if (fields.indices.len <= 1 and err == null) {
+                err = i;
+            } else {
+                return null;
+            }
+        }
+        const success_i = success orelse return null;
+        const error_i = err orelse return null;
+
+        const success_variant = self.arena.get(variants[success_i]).enum_variant;
+        const error_variant = self.arena.get(variants[error_i]).enum_variant;
+        const error_count = error_variant.fields.indices.len;
+
+        return .{
+            .success_index = @intCast(success_i),
+            .success_payload_ty = self.inferExprType(success_variant.fields.indices[0]),
+            .error_index = @intCast(error_i),
+            .error_field_count = @intCast(error_count),
+            .error_payload_ty = if (error_count == 1)
+                self.inferExprType(error_variant.fields.indices[0])
+            else
+                self.void_ty,
+        };
+    }
+
+    /// Whether `ty` is an instance of the enum declared at `enum_node`.
+    fn isEnumDecl(self: *const TypeChecker, ty: TypeIdx, enum_node: NodeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .enum_type => |node| node == enum_node,
+            else => false,
+        };
+    }
+
+    /// Type `x?` (R26-R29). The operand must be a two-variant enum with a
+    /// single-payload success variant and a 0-or-1-field error variant; the
+    /// expression has the success payload's type. The enclosing fn/closure must
+    /// return an instance of the same enum declaration (R27a) — that enum is the
+    /// branch-to-return target of R28. Substituting the instance's type arguments
+    /// into the payload (R27b/R27c) is monomorphization's job, so a generic
+    /// enum's payload is still its declared (unresolved) type here.
+    fn inferPropagate(self: *TypeChecker, expr_idx: NodeIdx, operand: NodeIdx) TypeIdx {
+        if (self.in_comptime) {
+            self.errorAt(expr_idx, "'?' cannot propagate at comptime", .{});
+            return self.inferExprType(operand);
+        }
+
+        const operand_ty = self.inferExprType(operand);
+        // A closure parameter whose type is still inferred cannot be inspected.
+        // Leaving the placeholder in place lets the binder raise its own
+        // "cannot infer parameter type" diagnostic instead of a cascade here.
+        if (self.isInferred(operand_ty)) return operand_ty;
+
+        const sem = self.type_pool.get(operand_ty);
+        if (sem != .enum_type) {
+            self.errorAt(expr_idx, "'?' needs a Result or Option value, got '{s}'", .{self.typeName(operand_ty)});
+            return self.void_ty;
+        }
+        const enum_node = sem.enum_type;
+        const shape = self.propagateShape(enum_node) orelse {
+            self.errorAt(expr_idx, "'?' needs a one-payload success variant and an error variant", .{});
+            return self.void_ty;
+        };
+
+        // R27a: the enclosing fn/closure must return an instance of the same
+        // enum declaration so its error branch can `return` that enum. R29a: in
+        // a closure whose return type is still being inferred, `?` fixes it to
+        // the operand's enum (first-wins, so an earlier `return` already
+        // settled it).
+        const enclosing = self.pendingResolved(self.fn_ret_type);
+        if (self.isInferred(enclosing)) {
+            self.resolvePlaceholder(self.fn_ret_type, operand_ty);
+        } else if (!self.isEnumDecl(enclosing, enum_node)) {
+            self.errorAt(expr_idx, "'?' requires the enclosing function to return the same Result/Option type", .{});
+        }
+        return shape.success_payload_ty;
     }
 
     // ========================================================================
@@ -2353,4 +2487,257 @@ test "typecheck: a hole outside a pipeline is an error" {
     defer deinitCheck(&res);
     try std.testing.expect(res.diagnostics.hasErrors());
     try std.testing.expect(hasMessage(&res.diagnostics, "'_' hole outside a pipeline"));
+}
+
+// ---------------------------------------------------------------------------
+// Error propagation `?` (R26-R29)
+// ---------------------------------------------------------------------------
+
+test "typecheck: `?` on a concrete Result-shaped enum yields the success payload" {
+    var res = try runCheck(std.testing.allocator,
+        \\struct Config {
+        \\    port: i32
+        \\}
+        \\enum LoadResult {
+        \\    Ok(Config)
+        \\    Err(i32)
+        \\}
+        \\fn load() -> LoadResult {
+        \\    return Ok(Config{ .port = 8080 })
+        \\}
+        \\fn main() -> LoadResult {
+        \\    let c = load()?
+        \\    let p: i32 = c.port
+        \\    return Ok(Config{ .port = p })
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: `?` accepts generic Result and Option in a matching fn" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\enum Option[T] {
+        \\    Some(T)
+        \\    None
+        \\}
+        \\fn fetch() -> Result[i32, String] {
+        \\    return Ok(1)
+        \\}
+        \\fn find() -> Option[i32] {
+        \\    return Some(1)
+        \\}
+        \\fn from_result() -> Result[i32, String] {
+        \\    let x = fetch()?
+        \\    return Ok(x)
+        \\}
+        \\fn from_option() -> Option[i32] {
+        \\    let y = find()?
+        \\    return Some(y)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: `?` requires the enclosing fn to return the same enum" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\enum Option[T] {
+        \\    Some(T)
+        \\    None
+        \\}
+        \\fn f(r: Result[i32, String]) -> Option[i32] {
+        \\    let x = r?
+        \\    return Some(1)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'?' requires the enclosing function to return the same Result/Option type"));
+}
+
+test "typecheck: `?` in a void fn is rejected" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\fn f(r: Result[i32, String]) {
+        \\    let x = r?
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "enclosing function"));
+}
+
+test "typecheck: `?` on a non-enum value is rejected" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn f() -> i32 {
+        \\    let x = 1?
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'?' needs a Result or Option value, got 'i32'"));
+}
+
+test "typecheck: `?` rejects a three-variant enum" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Three {
+        \\    A(i32)
+        \\    B
+        \\    C
+        \\}
+        \\fn f(x: Three) -> Three {
+        \\    let y = x?
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'?' needs a one-payload success variant and an error variant"));
+}
+
+test "typecheck: `?` rejects a two-variant enum with no payload variant" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Neither {
+        \\    A
+        \\    B
+        \\}
+        \\fn f(x: Neither) -> Neither {
+        \\    let y = x?
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "one-payload success variant"));
+}
+
+test "typecheck: `?` rejects a multi-field error variant" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Wide {
+        \\    Ok(i32)
+        \\    Err(i32, i32)
+        \\}
+        \\fn f(x: Wide) -> Wide {
+        \\    let y = x?
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "one-payload success variant"));
+}
+
+test "typecheck: `?` at comptime is rejected" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\fn f(r: Result[i32, String]) -> Result[i32, String] {
+        \\    comptime {
+        \\        let x = r?
+        \\    }
+        \\    return Ok(1)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'?' cannot propagate at comptime"));
+}
+
+test "typecheck: chained `?` on a self-referential enum" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Nest {
+        \\    Ok(Nest)
+        \\    Err(i32)
+        \\}
+        \\fn f(n: Nest) -> Nest {
+        \\    let a = n?
+        \\    let b = a?
+        \\    return b
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: `?` in a closure fixes its inferred return to the enum" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = |r: Result[i32, String]| {
+        \\        let x = r?
+        \\        return Ok(1)
+        \\    }
+        \\    return 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: an expression-bodied closure cannot drop the propagated enum" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Result[T, E] {
+        \\    Ok(T)
+        \\    Err(E)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f = |r: Result[i32, String]| r?
+        \\    return 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "closure body has type"));
+}
+
+test "typecheck: a full two-arm enum match still type-checks" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Load {
+        \\    Ok(i32)
+        \\    Err(i32)
+        \\}
+        \\fn f(r: Load) -> Load {
+        \\    return match r {
+        \\        Ok(v) => Ok(v),
+        \\        Err(e) => Err(e),
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: `?` in a match arm body" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Load {
+        \\    Ok(i32)
+        \\    Err(i32)
+        \\}
+        \\fn f(r: Load, o: Load) -> Load {
+        \\    return match r {
+        \\        Ok(v) => Ok(v),
+        \\        Err(_) => Ok(o?),
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
 }

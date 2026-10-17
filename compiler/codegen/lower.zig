@@ -262,6 +262,18 @@ pub const Lowerer = struct {
         }
     }
 
+    /// Emit pending defers from index `marker` onward, last first, without
+    /// consuming them. An early-return path (the error branch of `?`) must run
+    /// the defers it unwinds, but the enclosing block keeps them for its own
+    /// exit, so the list is left intact.
+    fn emitDefersFrom(self: *Lowerer, marker: usize) !void {
+        var i = self.pending_defers.items.len;
+        while (i > marker) {
+            i -= 1;
+            _ = try self.lowerExpr(self.pending_defers.items[i]);
+        }
+    }
+
     fn popLocalScope(self: *Lowerer, marker: usize) !void {
         while (self.shadows.items.len > marker) {
             const entry = self.shadows.items[self.shadows.items.len - 1];
@@ -748,6 +760,7 @@ pub const Lowerer = struct {
             },
             .if_expr => |i| return self.lowerIfExpr(node_idx, i),
             .match_expr => return self.lowerMatchExpr(node_idx),
+            .try_propagate => |inner| return self.lowerPropagate(node_idx, inner),
             .while_expr, .for_range, .for_each => {
                 self.codegenError(node_idx, "loops in expression position are not supported", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -784,6 +797,55 @@ pub const Lowerer = struct {
 
         if (has_value) return last_val;
         return self.ctx.buildIntConst(self.i64_ty, 0);
+    }
+
+    /// Lower `x?` (R28): load the operand's tag, branch to a propagate block on
+    /// the error variant and to an ok block otherwise. The propagate block
+    /// rebuilds the enclosing function's enum from the error payload (or the
+    /// bare error variant), runs the defers it unwinds, and returns it; the ok
+    /// block loads the success payload, which is the value of the expression.
+    /// The propagate path terminates, so no phi is needed.
+    fn lowerPropagate(self: *Lowerer, node_idx: NodeIdx, inner: NodeIdx) !api.Value {
+        const operand = try self.lowerExpr(inner);
+        const operand_ty = self.exprType(inner);
+        const sem = self.type_pool.get(operand_ty);
+        if (sem != .enum_type) {
+            self.codegenError(node_idx, "cannot propagate a non-enum value", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const shape = self.checker.propagateShape(sem.enum_type) orelse {
+            self.codegenError(node_idx, "cannot propagate this enum: no one-payload success variant and error variant", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        };
+
+        const tag = try self.ctx.buildLoad(self.i64_ty, operand);
+        const err_tag = try self.ctx.buildIntConst(self.i64_ty, @intCast(shape.error_index));
+        const is_err = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, tag, err_tag);
+
+        const propagate_b = try self.ctx.appendBlock();
+        const ok_b = try self.ctx.appendBlock();
+        _ = try self.ctx.buildCondBr(is_err, propagate_b, ok_b);
+
+        // Error path: construct the error variant of the enclosing return enum
+        // and return it. The operand and the enclosing function share the enum
+        // declaration (R27a), so the variant's index and payload layout match.
+        self.setBlock(propagate_b);
+        const err_value = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.enumSizeFor(shape.error_field_count));
+        _ = try self.ctx.buildStore(self.i64_ty, err_value, try self.ctx.buildIntConst(self.i64_ty, @intCast(shape.error_index)));
+        if (shape.error_field_count == 1) {
+            const src_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+            const payload = try self.ctx.buildLoad(self.i64_ty, src_addr);
+            const dst_addr = try self.ctx.buildPtrAdd(self.ptr_ty, err_value, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+            _ = try self.ctx.buildStore(self.i64_ty, dst_addr, payload);
+        }
+        try self.emitDefersFrom(0);
+        _ = try self.ctx.buildRet(err_value);
+        self.terminated();
+
+        // Success path: the payload is the value of `x?`.
+        self.setBlock(ok_b);
+        const payload_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+        return self.ctx.buildLoad(self.i64_ty, payload_addr);
     }
 
     fn lowerChar(self: *Lowerer, ref: StringRef) !api.Value {
@@ -1688,4 +1750,54 @@ test "lower: a fn value is not lowered yet" {
         }
     }
     try std.testing.expect(reported_unlowered);
+}
+
+test "lower: `?` branches to an early return on the error variant" {
+    var res = try checkLower(std.testing.allocator,
+        \\enum Maybe {
+        \\    None
+        \\    Some(i32)
+        \\}
+        \\fn get() -> Maybe {
+        \\    return Some(1)
+        \\}
+        \\fn main() -> Maybe {
+        \\    let v = get()?
+        \\    return Some(v)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The propagate path is a compare of the tag against the error variant
+    // index, a conditional branch, and a `ret` on the taken path (R28/R28a).
+    try std.testing.expect(std.mem.indexOf(u8, text, "icmp eq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cond_br") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %") != null);
+}
+
+test "lower: `?` rebuilds the error variant from its payload" {
+    var res = try checkLower(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(i32)
+        \\}
+        \\fn get() -> Res {
+        \\    return Err(5)
+        \\}
+        \\fn main() -> Res {
+        \\    let v = get()?
+        \\    return Ok(v)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The error variant carries one field, so the propagate path copies it:
+    // one payload slot plus the tag is a 16-byte block.
+    try std.testing.expect(std.mem.indexOf(u8, text, "icmp eq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
 }
