@@ -105,6 +105,9 @@ pub const TypeChecker = struct {
     /// Reverse index: a placeholder `TypeIdx` -> the binder node behind it.
     pending_by_type: std.AutoHashMapUnmanaged(TypeIdx, NodeIdx),
 
+    /// Cache for instantiated generic functions: (decl, args hash/signature) -> applied_fn sig/type
+    instantiations: std.AutoHashMapUnmanaged(u64, TypeIdx),
+
     void_ty: TypeIdx,
     bool_ty: TypeIdx,
     i8_ty: TypeIdx,
@@ -171,6 +174,7 @@ pub const TypeChecker = struct {
             .type_name_toggle = 0,
             .pending = .empty,
             .pending_by_type = .empty,
+            .instantiations = .empty,
             .void_ty = void_ty,
             .bool_ty = bool_ty,
             .i8_ty = i8_ty,
@@ -208,6 +212,7 @@ pub const TypeChecker = struct {
         self.node_types.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.pending_by_type.deinit(self.allocator);
+        self.instantiations.deinit(self.allocator);
         self.scopes.deinit();
     }
 
@@ -267,8 +272,7 @@ pub const TypeChecker = struct {
         const decl = self.arena.get(decl_idx);
         const e = decl.enum_decl;
         // Type the variant payload types so match arms can bind them.
-        // Generic enums (Option[T]) leave payloads unresolved until
-        // monomorphization lands.
+        // Generic enums (Option[T]) leave payloads unresolved.
         if (e.generic_params.indices.len == 0) {
             for (e.variants.indices) |variant_idx| {
                 const variant = self.arena.get(variant_idx);
@@ -478,6 +482,56 @@ pub const TypeChecker = struct {
         return ty;
     }
 
+    fn inferGenericApp(self: *TypeChecker, expr_idx: NodeIdx, ga: anytype) TypeIdx {
+        const base = self.inferExprType(ga.base);
+        // Type arguments of the application (`Pair[i32, f64]` -> i32, f64).
+        const arg_count = ga.args.indices.len;
+        const args = self.allocator.alloc(TypeIdx, arg_count) catch @panic("OOM");
+        defer self.allocator.free(args);
+        for (ga.args.indices, 0..) |arg_idx, i| {
+            args[i] = self.inferExprType(arg_idx);
+        }
+
+        const base_sem = self.type_pool.get(base);
+        switch (base_sem) {
+            .struct_type => |decl_node| {
+                const decl = self.arena.get(decl_node);
+                if (decl.* != .struct_decl) return self.void_ty;
+                const gp_count = decl.struct_decl.generic_params.indices.len;
+                if (gp_count != arg_count) {
+                    self.errorAt(expr_idx, "struct expects {d} generic argument(s), got {d}", .{ gp_count, arg_count });
+                    return self.void_ty;
+                }
+                const key = genericAppKey(decl_node, args);
+                if (self.instantiations.get(key)) |cached| return cached;
+                const owned = self.allocator.alloc(TypeIdx, arg_count) catch @panic("OOM");
+                @memcpy(owned, args);
+                const applied = self.type_pool.add(.{ .applied_struct = .{ .decl = decl_node, .args = owned } }) catch @panic("OOM");
+                self.instantiations.put(self.allocator, key, applied) catch @panic("OOM");
+                return applied;
+            },
+            .enum_type => |decl_node| {
+                const decl = self.arena.get(decl_node);
+                if (decl.* != .enum_decl) return self.void_ty;
+                const gp_count = decl.enum_decl.generic_params.indices.len;
+                if (gp_count != arg_count) {
+                    self.errorAt(expr_idx, "enum expects {d} generic argument(s), got {d}", .{ gp_count, arg_count });
+                    return self.void_ty;
+                }
+                const key = genericAppKey(decl_node, args);
+                if (self.instantiations.get(key)) |cached| return cached;
+                const owned = self.allocator.alloc(TypeIdx, arg_count) catch @panic("OOM");
+                @memcpy(owned, args);
+                const applied = self.type_pool.add(.{ .applied_enum = .{ .decl = decl_node, .args = owned } }) catch @panic("OOM");
+                self.instantiations.put(self.allocator, key, applied) catch @panic("OOM");
+                return applied;
+            },
+            else => {
+                return base;
+            },
+        }
+    }
+
     fn inferExprTypeInner(self: *TypeChecker, expr_idx: NodeIdx, expr: *const Node) TypeIdx {
         switch (expr.*) {
             .int_literal => return self.i32_ty,
@@ -601,14 +655,7 @@ pub const TypeChecker = struct {
                 return self.inferElementType(expr_idx, obj_ty);
             },
             .generic_app => |ga| {
-                // `Pair[i32, f64]`: the arguments are type references and the
-                // application denotes the applied type itself until
-                // monomorphization resolves the substitution.
-                _ = self.inferExprType(ga.base);
-                for (ga.args.indices) |arg| {
-                    _ = self.inferExprType(arg);
-                }
-                return self.inferExprType(ga.base);
+                return self.inferGenericApp(expr_idx, ga);
             },
             .paren_expr => |p| {
                 return self.inferExprType(p);
@@ -853,10 +900,31 @@ pub const TypeChecker = struct {
 
     /// Type a struct literal and check each provided field against its declared
     /// type. Generic struct fields (generic params not yet substituted) are left
-    /// unchecked until monomorphization (R25).
+    /// unchecked (R25).
     fn inferStructInit(self: *TypeChecker, expr_idx: NodeIdx, si: anytype) TypeIdx {
         const ty = self.inferExprType(si.ty);
         const sem = self.type_pool.get(ty);
+        if (sem == .applied_struct) {
+            const decl_node = sem.applied_struct.decl;
+            const args = sem.applied_struct.args;
+            // Apply substitution to field types for applied struct
+            for (si.fields.indices) |field_idx| {
+                const f = self.arena.get(field_idx).struct_init_field;
+                if (self.structFieldType(decl_node, self.nameSlice(f.name))) |et| {
+                    // Substitute if it's a generic param? simple substitution
+                    const et_subst = self.substType(et, args, decl_node);
+                    const got = self.inferExprTypeExpected(f.value, et_subst);
+                    if (!self.typesEqual(et_subst, got)) {
+                        self.errorAt(expr_idx, "field '{s}' expects '{s}' but got '{s}'", .{
+                            self.nameSlice(f.name), self.typeName(et_subst), self.typeName(got),
+                        });
+                    }
+                } else {
+                    _ = self.inferExprType(f.value);
+                }
+            }
+            return ty;
+        }
         if (sem != .struct_type) {
             for (si.fields.indices) |field_idx| {
                 _ = self.inferExprType(self.arena.get(field_idx).struct_init_field.value);
@@ -1212,6 +1280,11 @@ pub const TypeChecker = struct {
             self.checkArgList(expr_idx, sem.function.param_types, c.args, null, null);
             return sem.function.return_type;
         }
+        if (sem == .applied_fn) {
+            const sig = self.type_pool.get(sem.applied_fn.sig).function;
+            self.checkArgList(expr_idx, sig.param_types, c.args, null, null);
+            return sig.return_type;
+        }
         for (c.args.indices) |arg| _ = self.inferExprType(arg);
         self.errorAt(expr_idx, "cannot call a value of type '{s}'", .{self.typeName(callee_ty)});
         return self.void_ty;
@@ -1424,6 +1497,11 @@ pub const TypeChecker = struct {
             self.checkArgList(node_idx, sem.function.param_types, c.args, piped, hole);
             return sem.function.return_type;
         }
+        if (sem == .applied_fn) {
+            const sig = self.type_pool.get(sem.applied_fn.sig).function;
+            self.checkArgList(node_idx, sig.param_types, c.args, piped, hole);
+            return sig.return_type;
+        }
         _ = self.inferExprType(piped);
         for (c.args.indices) |a| _ = self.inferExprType(a);
         self.errorAt(node_idx, "cannot pipe into a value of type '{s}'", .{self.typeName(callee_ty)});
@@ -1437,6 +1515,20 @@ pub const TypeChecker = struct {
         const sem = self.type_pool.get(rhs_ty);
         if (sem == .function) {
             const f = sem.function;
+            if (f.param_types.len >= 1 and f.param_types[0] != self.void_ty) {
+                const got = self.inferExprTypeExpected(piped, f.param_types[0]);
+                if (!self.typesEqual(f.param_types[0], got)) {
+                    self.errorAt(node_idx, "piped value expects '{s}' but got '{s}'", .{
+                        self.typeName(f.param_types[0]), self.typeName(got),
+                    });
+                }
+            } else {
+                _ = self.inferExprType(piped);
+            }
+            return f.return_type;
+        }
+        if (sem == .applied_fn) {
+            const f = self.type_pool.get(sem.applied_fn.sig).function;
             if (f.param_types.len >= 1 and f.param_types[0] != self.void_ty) {
                 const got = self.inferExprTypeExpected(piped, f.param_types[0]);
                 if (!self.typesEqual(f.param_types[0], got)) {
@@ -1520,6 +1612,7 @@ pub const TypeChecker = struct {
     fn isEnumDecl(self: *const TypeChecker, ty: TypeIdx, enum_node: NodeIdx) bool {
         return switch (self.type_pool.get(ty)) {
             .enum_type => |node| node == enum_node,
+            .applied_enum => |a| a.decl == enum_node,
             else => false,
         };
     }
@@ -1529,8 +1622,8 @@ pub const TypeChecker = struct {
     /// expression has the success payload's type. The enclosing fn/closure must
     /// return an instance of the same enum declaration (R27a) — that enum is the
     /// branch-to-return target of R28. Substituting the instance's type arguments
-    /// into the payload (R27b/R27c) is monomorphization's job, so a generic
-    /// enum's payload is still its declared (unresolved) type here.
+    /// into the payload (R27b/R27c) is not done here, so a generic enum's payload
+    /// is still its declared (unresolved) type.
     fn inferPropagate(self: *TypeChecker, expr_idx: NodeIdx, operand: NodeIdx) TypeIdx {
         if (self.in_comptime) {
             self.errorAt(expr_idx, "'?' cannot propagate at comptime", .{});
@@ -1544,11 +1637,11 @@ pub const TypeChecker = struct {
         if (self.isInferred(operand_ty)) return operand_ty;
 
         const sem = self.type_pool.get(operand_ty);
-        if (sem != .enum_type) {
+        if (sem != .enum_type and sem != .applied_enum) {
             self.errorAt(expr_idx, "'?' needs a Result or Option value, got '{s}'", .{self.typeName(operand_ty)});
             return self.void_ty;
         }
-        const enum_node = sem.enum_type;
+        const enum_node = if (sem == .enum_type) sem.enum_type else sem.applied_enum.decl;
         const shape = self.propagateShape(enum_node) orelse {
             self.errorAt(expr_idx, "'?' needs a one-payload success variant and an error variant", .{});
             return self.void_ty;
@@ -1604,8 +1697,14 @@ pub const TypeChecker = struct {
 
     fn checkMatchStmt(self: *TypeChecker, stmt_idx: NodeIdx, m: anytype) anyerror!void {
         const scrut_ty = self.inferExprType(m.scrutinee);
-        if (self.type_pool.get(scrut_ty) == .enum_type) {
-            const enum_node = self.type_pool.get(scrut_ty).enum_type;
+        const scrut_sem = self.type_pool.get(scrut_ty);
+        if (scrut_sem == .enum_type) {
+            const enum_node = scrut_sem.enum_type;
+            for (m.arms.indices) |arm_idx| {
+                _ = try self.checkEnumArm(arm_idx, enum_node);
+            }
+        } else if (scrut_sem == .applied_enum) {
+            const enum_node = scrut_sem.applied_enum.decl;
             for (m.arms.indices) |arm_idx| {
                 _ = try self.checkEnumArm(arm_idx, enum_node);
             }
@@ -1694,8 +1793,8 @@ pub const TypeChecker = struct {
             // A type name used as a generic application (`Option[i32]`) is
             // not real indexing: the application denotes the type itself.
             // Unresolved identifiers (e.g. `Slice[T]` inside a generic fn)
-            // fall back to i32 until monomorphization lands.
-            .struct_type, .enum_type => obj_ty,
+            // fall back to i32.
+            .struct_type, .applied_struct, .enum_type, .applied_enum, .applied_fn => obj_ty,
             .void, .inferred => self.i32_ty,
             else => blk: {
                 self.errorAt(node_idx, "cannot index a value of type '{s}'", .{self.typeName(obj_ty)});
@@ -1724,10 +1823,31 @@ pub const TypeChecker = struct {
         for (s.fields.indices) |field_idx| {
             const field = self.arena.get(field_idx);
             if (std.mem.eql(u8, self.nameSlice(field.field.name), field_name)) {
-                return self.inferTypeRefNode(field.field.ty);
+                return self.declFieldType(s.generic_params, field.field.ty);
             }
         }
         return null;
+    }
+
+    /// The semantic type of a declared field. A field typed directly by one of
+    /// the declaration's generic parameters (`first: A`) becomes a
+    /// `generic_param` placeholder that an application substitutes; every other
+    /// type is resolved in place.
+    fn declFieldType(self: *TypeChecker, generic_params: NodeList, ty: ast.TypeRepr) TypeIdx {
+        if (ty == .plain) {
+            const inner = self.arena.get(ty.plain);
+            if (inner.* == .identifier) {
+                const id = inner.identifier;
+                const name = self.nameSlice(id);
+                for (generic_params.indices, 0..) |gp_idx, i| {
+                    const gp = self.arena.get(gp_idx);
+                    if (std.mem.eql(u8, self.nameSlice(gp.identifier), name)) {
+                        return self.type_pool.add(.{ .generic_param = .{ .name = id, .index = @intCast(i) } }) catch @panic("OOM");
+                    }
+                }
+            }
+        }
+        return self.inferTypeRefNode(ty);
     }
 
     fn inferTypeRefNode(self: *TypeChecker, ty: ast.TypeRepr) TypeIdx {
@@ -1738,6 +1858,19 @@ pub const TypeChecker = struct {
                 break :blk self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
             },
         };
+    }
+
+    fn substType(self: *TypeChecker, ty: TypeIdx, args: []const TypeIdx, _: NodeIdx) TypeIdx {
+        const sem = self.type_pool.get(ty);
+        switch (sem) {
+            .generic_param => |gp| {
+                if (gp.index < args.len) {
+                    return args[gp.index];
+                }
+                return ty;
+            },
+            else => return ty,
+        }
     }
 
     fn resolveDeclType(self: *TypeChecker, decl_node: NodeIdx) TypeIdx {
@@ -1782,6 +1915,13 @@ pub const TypeChecker = struct {
     }
 
     fn semTypesEqual(self: *const TypeChecker, a: SemType, b: SemType) bool {
+        // A generic declaration and an application of it denote the same type
+        // until the application's type arguments are substituted by
+        // instantiation, which does not happen at this stage.
+        if (a == .applied_enum and b == .enum_type) return a.applied_enum.decl == b.enum_type;
+        if (a == .enum_type and b == .applied_enum) return a.enum_type == b.applied_enum.decl;
+        if (a == .applied_struct and b == .struct_type) return a.applied_struct.decl == b.struct_type;
+        if (a == .struct_type and b == .applied_struct) return a.struct_type == b.applied_struct.decl;
         if (@as(std.meta.Tag(SemType), a) != @as(std.meta.Tag(SemType), b)) return false;
         switch (a) {
             .void, .bool_type, .string_type, .inferred => return true,
@@ -1798,7 +1938,10 @@ pub const TypeChecker = struct {
                 return true;
             },
             .struct_type => |an| return an == b.struct_type,
+            .applied_struct => |aa| return aa.decl == b.applied_struct.decl and self.typeListsEqual(aa.args, b.applied_struct.args),
             .enum_type => |an| return an == b.enum_type,
+            .applied_enum => |aa| return aa.decl == b.applied_enum.decl and self.typeListsEqual(aa.args, b.applied_enum.args),
+            .applied_fn => |aa| return aa.decl == b.applied_fn.decl and self.typeListsEqual(aa.args, b.applied_fn.args) and self.typesEqual(aa.sig, b.applied_fn.sig),
             .array => |aa| {
                 const ba = b.array;
                 return self.typesEqual(aa.elem, ba.elem) and aa.size == ba.size;
@@ -1806,6 +1949,14 @@ pub const TypeChecker = struct {
             .slice => |ae| return self.typesEqual(ae, b.slice),
             .generic_param => |ag| return ag.index == b.generic_param.index,
         }
+    }
+
+    fn typeListsEqual(self: *const TypeChecker, a: []const TypeIdx, b: []const TypeIdx) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |pa, pb| {
+            if (!self.typesEqual(pa, pb)) return false;
+        }
+        return true;
     }
 
     fn typeName(self: *TypeChecker, idx: TypeIdx) []const u8 {
@@ -1823,7 +1974,10 @@ pub const TypeChecker = struct {
             .function => "function",
             .string_type => "String",
             .struct_type => "struct",
+            .applied_struct => "struct",
             .enum_type => "enum",
+            .applied_enum => "enum",
+            .applied_fn => "function",
             .array => "array",
             .slice => "slice",
             .generic_param => "generic",
@@ -1842,6 +1996,18 @@ fn tryStd(what: anyerror!void) void {
 
 fn tryStdTy(what: anyerror!TypeIdx) TypeIdx {
     return what catch @panic("OOM");
+}
+
+/// A stable key for an application of a generic declaration: the declaration
+/// node plus its type arguments. Lets `inferGenericApp` reuse the resolved type
+/// for repeats of the same application within a compilation.
+fn genericAppKey(decl_node: NodeIdx, args: []const TypeIdx) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    h = (h ^ @as(u64, @intFromEnum(decl_node))) *% 0x100000001b3;
+    for (args) |arg| {
+        h = (h ^ @as(u64, @intFromEnum(arg))) *% 0x100000001b3;
+    }
+    return h;
 }
 
 const CheckRun = struct {
@@ -2211,11 +2377,7 @@ test "typecheck: generic application is accepted in type position" {
         \\    return p
         \\}
     );
-    defer {
-        res.arena.deinit();
-        res.type_pool.deinit();
-        res.diagnostics.deinit();
-    }
+    defer deinitCheck(&res);
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 

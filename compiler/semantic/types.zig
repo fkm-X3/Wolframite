@@ -33,7 +33,27 @@ pub const SemType = union(enum) {
     },
     string_type,
     struct_type: NodeIdx,
+    /// An applied generic struct: `Pair[i32, f64]` denotes the struct
+    /// declaration `decl` with type arguments `args` substituted for its
+    /// generic parameters.
+    applied_struct: struct {
+        decl: NodeIdx,
+        args: []const TypeIdx,
+    },
     enum_type: NodeIdx,
+    /// An applied generic enum: `Option[T]` with concrete `args`.
+    applied_enum: struct {
+        decl: NodeIdx,
+        args: []const TypeIdx,
+    },
+    /// The type of a generic function application used as a value or the
+    /// concrete signature of an instantiated generic function.
+    applied_fn: struct {
+        decl: NodeIdx,
+        args: []const TypeIdx,
+        /// The concrete `function` type (params + return) after substitution.
+        sig: TypeIdx,
+    },
     array: struct { elem: TypeIdx, size: ?u64 },
     slice: TypeIdx,
     generic_param: struct { name: StringRef, index: u32 },
@@ -62,6 +82,15 @@ pub const TypePool = struct {
             switch (t) {
                 .function => |f| {
                     self.allocator.free(f.param_types);
+                },
+                .applied_struct => |a| {
+                    if (a.args.len > 0) self.allocator.free(a.args);
+                },
+                .applied_enum => |a| {
+                    if (a.args.len > 0) self.allocator.free(a.args);
+                },
+                .applied_fn => |a| {
+                    if (a.args.len > 0) self.allocator.free(a.args);
                 },
                 else => {},
             }
