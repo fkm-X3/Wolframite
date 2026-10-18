@@ -465,6 +465,14 @@ pub const Context = struct {
         return self.builder.buildGlobalAddr(type_idx, global);
     }
 
+    /// Materialize the address of a module-level function as an SSA value.
+    /// This is how a lifted closure body is paired with `buildFnValue`: take
+    /// the callee's address, build a `{ fn_ptr, env_ptr }` record around it,
+    /// then `buildCallPtr` through that record.
+    pub fn buildFuncAddr(self: *Context, type_idx: TypeIdx, func: FunctionIdx) !Value {
+        return self.builder.buildFuncAddr(type_idx, func);
+    }
+
     // ========================================================================
     // Instruction Building — SSA
     // ========================================================================
@@ -761,8 +769,8 @@ test "emit assembly with globals floats and heap" {
     const alloc = try ctx.buildMalloc(ptr_ty, one);
     _ = try ctx.buildGlobalAddr(ptr_ty, str_global);
     // Indirect call through a fn value; `alloc` stands in as the opaque
-    // callee address (there is no fn-address op yet). The exact call_ptr
-    // lowering lands with the slot-based codegen pass.
+    // callee address (the exact fn-address pairing via func_addr is covered
+    // by the "call through fn value with env record" test below).
     const sig = try ctx.funcType(i64_ty, &.{ i64_ty, i64_ty });
     const fv_ty = try ctx.fnValueType(sig);
     const fv = try ctx.buildFnValue(fv_ty, alloc, try ctx.buildIntConst(i64_ty, 0));
@@ -854,26 +862,33 @@ test "call through fn value with env record" {
     try std.testing.expectEqual(@as(u32, 8), ctx.envRecordSize(&.{i64_ty}));
     try std.testing.expectEqual(@as(u32, 32), ctx.envRecordSize(&.{ i64_ty, fv_ty, i64_ty }));
 
-    // Creation + call site: env = buildEnvRecord({40}); fv = (fn_addr, env);
-    // return call_ptr fv(x). The callee address arrives as a parameter
-    // (there is no fn-address op yet).
-    const caller = try ctx.addFunction("caller", i64_ty, 2);
+    // Creation + call site: env = buildEnvRecord({40}); fv = (func_addr,
+    // env); return call_ptr fv(x). func_addr pairs the lifted callee with
+    // the fn value (no parameter workaround needed).
+    const lifted = try ctx.addFunction("__closure_0", i64_ty, 2);
+    ctx.setCurrentFunction(lifted);
+    const l_entry = try ctx.appendBlock();
+    ctx.setCurrentBlock(l_entry);
+    const captured = try ctx.buildLoad(i64_ty, ctx.getParam(0));
+    _ = try ctx.buildRet(try ctx.buildAdd(i64_ty, captured, ctx.getParam(1)));
+
+    const caller = try ctx.addFunction("caller", i64_ty, 1);
     ctx.setCurrentFunction(caller);
     const entry = try ctx.appendBlock();
     ctx.setCurrentBlock(entry);
 
-    const fn_addr = ctx.getParam(0);
-    const x = ctx.getParam(1);
+    const x = ctx.getParam(0);
 
-    const captured = try ctx.buildIntConst(i64_ty, 40);
-    const env = try ctx.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = captured }});
+    const fn_addr = try ctx.buildFuncAddr(i64_ty, lifted);
+    const forty = try ctx.buildIntConst(i64_ty, 40);
+    const env = try ctx.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
     const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
     const r = try ctx.buildCallPtr(i64_ty, fv, &.{x});
     _ = try ctx.buildRet(r);
 
-    // iconst, env alloca + store, then buildFnValue's five instructions,
-    // then the indirect call and ret.
-    try std.testing.expectEqual(@as(usize, 10), ctx.getInstructionCountIn(caller));
+    // func_addr, iconst, env alloca + store, then buildFnValue's five
+    // instructions, then the indirect call and ret.
+    try std.testing.expectEqual(@as(usize, 11), ctx.getInstructionCountIn(caller));
 
     // Empty capture set: no record, null env (R8b).
     try std.testing.expectEqual(Value.none, try ctx.buildEnvRecord(&.{}));
@@ -885,5 +900,6 @@ test "call through fn value with env record" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%0)") != null);
 }

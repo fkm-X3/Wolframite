@@ -593,6 +593,28 @@ const null_env = try ctx.buildIntConst(i64_ty, 0);
 const fv = try ctx.buildFnValue(fv_ty, fn_addr, null_env);
 ```
 
+#### `buildFuncAddr`
+
+```zig
+pub fn buildFuncAddr(self: *Context, type_idx: TypeIdx, func: FunctionIdx) !Value
+```
+
+`func_addr @func` — materialize the address of a module-level function as an
+SSA value (emitted as `lea rax, [rel _func]`).
+
+This is how a lifted closure body is paired with `buildFnValue`: take the
+callee's address, build a `{ fn_ptr, env_ptr }` record around it, then
+`buildCallPtr` through that record.
+
+```zig
+const lifted = try ctx.addFunction("__closure_0", i64_ty, 2);
+// ...
+const fn_addr = try ctx.buildFuncAddr(i64_ty, lifted);
+const env = try ctx.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = captured }});
+const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
+const r = try ctx.buildCallPtr(i64_ty, fv, &.{ x });
+```
+
 ### Closure Environments
 
 #### `EnvField`

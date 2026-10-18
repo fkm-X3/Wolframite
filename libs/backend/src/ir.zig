@@ -86,6 +86,8 @@ pub const Opcode = enum(u8) {
     malloc,
     // Globals
     global_addr,
+    /// Get address of a function (produces a function pointer value).
+    func_addr,
     // SSA
     phi,
 };
@@ -108,6 +110,7 @@ pub const Instruction = struct {
     pub fn producesValue(self: Instruction) bool {
         return switch (self.opcode) {
             .br, .cond_br, .ret, .ret_void, .store, .extern_call => false,
+            .func_addr => true,
             else => true,
         };
     }
@@ -842,6 +845,15 @@ pub const Builder = struct {
             .operands = try self.appendOperands(&.{@intFromEnum(global)}),
         });
     }
+
+    /// Get the address of a function as an SSA value.
+    pub fn buildFuncAddr(self: *Builder, type_idx: TypeIdx, func_idx: FunctionIdx) !Value {
+        return self.appendInstruction(.{
+            .opcode = .func_addr,
+            .type_idx = type_idx,
+            .operands = try self.appendOperands(&.{@intFromEnum(func_idx)}),
+        });
+    }
 };
 
 pub const PhiIncoming = struct {
@@ -984,6 +996,7 @@ fn printInstruction(module: *Module, func: Function, inst: Instruction, writer: 
             const gname = module.strings.get(module.globals.items[ops[0]].name);
             try w.print("global_addr @{s}", .{gname});
         },
+        .func_addr => try w.print("func_addr @fn{d}", .{ops[0]}),
         .alloca => {
             if (ops.len == 0) {
                 try w.print("alloca", .{});
@@ -1224,24 +1237,24 @@ test "call through fn value with captured env record" {
     const captured = try builder.buildLoad(i64_ty, env_param);
     _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
 
-    // Creation + call site: env = buildEnvRecord({40}); fv = (fn_addr, env);
-    // call_ptr fv(x). The callee address arrives as a parameter (there is no
-    // fn-address op yet).
-    const make = try builder.addFunction("make", i64_ty, 2);
+    // Creation + call site: env = buildEnvRecord({40}); fv = (func_addr,
+    // env); call_ptr fv(x). The callee address comes from func_addr pairing
+    // the lifted body with the fn value.
+    const make = try builder.addFunction("make", i64_ty, 1);
     builder.setCurrentFunction(make);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const fn_addr_param = @as(Value, @enumFromInt(0));
-    const x2 = @as(Value, @enumFromInt(1));
+    const x2 = @as(Value, @enumFromInt(0));
 
+    const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
     const forty = try builder.buildIntConst(i64_ty, 40);
     const env = try builder.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
-    const fv = try builder.buildFnValue(fv_ty, fn_addr_param, env);
+    const fv = try builder.buildFnValue(fv_ty, fn_addr, env);
     _ = try builder.buildCallPtr(i64_ty, fv, &.{x2});
 
-    // iconst, env alloca + store, then buildFnValue's five instructions,
-    // then the indirect call.
-    try std.testing.expectEqual(@as(usize, 9), module.functions.items[1].instructions.items.len);
+    // func_addr, iconst, env alloca + store, then buildFnValue's five
+    // instructions, then the indirect call.
+    try std.testing.expectEqual(@as(usize, 10), module.functions.items[1].instructions.items.len);
 
     // Empty capture set: no record, null env (R8b).
     const none_env = try builder.buildEnvRecord(&.{});
@@ -1254,5 +1267,6 @@ test "call through fn value with captured env record" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%0)") != null);
 }

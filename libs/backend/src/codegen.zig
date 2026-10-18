@@ -444,6 +444,13 @@ pub const CodeGen = struct {
                 try self.emit("    lea     rax, [rel __g{d}]\n", .{ops[0]});
                 try self.emit("    mov     [rbp{d}], rax\n", .{r});
             },
+            .func_addr => {
+                const r = self.value_offsets.get(@enumFromInt(value_idx)).?;
+                const target_func = &self.module.functions.items[ops[0]];
+                const target_name = self.module.strings.get(target_func.name);
+                try self.emit("    lea     rax, [rel _{s}]\n", .{target_name});
+                try self.emit("    mov     [rbp{d}], rax\n", .{r});
+            },
 
             .call => {
                 const target_func = &self.module.functions.items[ops[0]];
@@ -465,12 +472,66 @@ pub const CodeGen = struct {
             },
 
             .call_ptr => {
-                const arg_count: u32 = @intCast(ops.len - 1);
-
-                const extra_stack = try self.emitCallSetup(ops, arg_count);
-
+                // Fn-value record at ops[0]: { fn_ptr (0), env_ptr (8) }.
+                // The record's address is loaded first, then `env_ptr` is
+                // marshaled as hidden argument 0 and the visible args shift
+                // one slot (docs/semantics.md §6.2, §6.4 R16c).
                 const callee_off = self.value_offsets.get(@enumFromInt(ops[0])).?;
-                try self.emit("    mov     rax, [rbp{d}]\n", .{callee_off});
+                const visible_arg_count: u32 = if (ops.len > 1) @intCast(ops.len - 1) else 0;
+                const total_arg_count: u32 = visible_arg_count + 1; // + hidden env
+
+                const reg_args = [_][]const u8{ "rcx", "rdx", "r8", "r9" };
+                const num_stack_args_total: u32 = if (total_arg_count > 4) total_arg_count - 4 else 0;
+
+                var extra_stack: u32 = 32;
+                if (num_stack_args_total > 0) {
+                    extra_stack += num_stack_args_total * 8;
+                    if (extra_stack % 16 != 0) {
+                        extra_stack += 8;
+                    }
+                }
+
+                if (extra_stack > 0) {
+                    try self.emit("    sub     rsp, {d}\n", .{extra_stack});
+                }
+
+                // Record pointer; r10 is not an argument register, so it
+                // survives the marshaling below (incl. rax-clobbering stack
+                // stores).
+                try self.emit("    mov     r10, [rbp{d}]\n", .{callee_off});
+
+                // Stack args first: their stores use rax as scratch, and the
+                // callee address is still needed in rax for the call.
+                {
+                    var i: u32 = 0;
+                    while (i < visible_arg_count) : (i += 1) {
+                        const arg_slot = i + 1; // slot 0 is the hidden env
+                        if (arg_slot >= 4) {
+                            const stack_pos: i32 = 32 + @as(i32, @intCast(arg_slot - 4)) * 8;
+                            const arg_off = self.value_offsets.get(@enumFromInt(ops[1 + i])).?;
+                            try self.emit("    mov     rax, [rbp{d}]\n", .{arg_off});
+                            try self.emit("    mov     [rsp{d}], rax\n", .{stack_pos});
+                        }
+                    }
+                }
+
+                // Hidden env as argument 0.
+                try self.emitStr("    mov     rcx, qword [r10+8]\n");
+
+                // Visible args in the remaining register slots.
+                {
+                    var i: u32 = 0;
+                    while (i < visible_arg_count) : (i += 1) {
+                        const arg_slot = i + 1;
+                        if (arg_slot < 4) {
+                            const arg_off = self.value_offsets.get(@enumFromInt(ops[1 + i])).?;
+                            try self.emit("    mov     {s}, [rbp{d}]\n", .{ reg_args[arg_slot], arg_off });
+                        }
+                    }
+                }
+
+                // Callee address last (stack stores clobber rax), then call.
+                try self.emitStr("    mov     rax, qword [r10+0]\n");
                 try self.emitStr("    call    rax\n");
 
                 if (extra_stack > 0) {
@@ -577,3 +638,101 @@ pub const CodeGen = struct {
         }
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "fn value round-trip: func_addr, env record, call_ptr with hidden env" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    const sig = try builder.addFunctionType(i64_ty, &.{i64_ty});
+    const fv_ty = try builder.addFunctionValueType(sig);
+
+    // Lifted closure body: fn __closure_0(env: ptr, x: i64) -> i64.
+    const lifted = try builder.addFunction("__closure_0", i64_ty, 2);
+    builder.setCurrentFunction(lifted);
+    const l_entry = try builder.appendBlock();
+    builder.setCurrentBlock(l_entry);
+    const env_param = @as(ir.Value, @enumFromInt(0));
+    const x_param = @as(ir.Value, @enumFromInt(1));
+    const captured = try builder.buildLoad(i64_ty, env_param);
+    _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
+
+    // Call site: pair the lifted callee's address (func_addr) with a stack
+    // env capturing 40, then call through the fn value with one visible arg.
+    const caller = try builder.addFunction("caller", i64_ty, 1);
+    builder.setCurrentFunction(caller);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const x_arg = @as(ir.Value, @enumFromInt(0));
+
+    const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
+    const forty = try builder.buildIntConst(i64_ty, 40);
+    const env = try builder.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
+    const fv = try builder.buildFnValue(fv_ty, fn_addr, env);
+    const result = try builder.buildCallPtr(i64_ty, fv, &.{x_arg});
+    _ = try builder.buildRet(result);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    try cg.emitModule();
+    const text = cg.buf.items;
+
+    // func_addr materializes the lifted callee's address for pairing with
+    // the fn value record.
+    try std.testing.expect(std.mem.indexOf(u8, text, "lea     rax, [rel ___closure_0]") != null);
+    // The fn-value record is stored into its frame slot: word 0 = fn_ptr,
+    // word 1 (record+8) = env_ptr (R16b).
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     [rax], rdx") != null);
+    // The indirect call loads fn_ptr from record+0 and env_ptr from
+    // record+8, marshals env as hidden argument 0, and calls through the
+    // register (R16c).
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     rcx, qword [r10+8]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     rax, qword [r10+0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call    rax") != null);
+    // The visible argument shifts one slot: it lands in rdx, not rcx.
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     rdx, [rbp") != null);
+}
+
+test "fn value call_ptr marshals stack args after the hidden env" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    // Visible signature fn(i64, i64, i64, i64, i64) -> i64: with the hidden
+    // env the callee reads six args, so the last lands on the stack.
+    const sig = try builder.addFunctionType(i64_ty, &.{ i64_ty, i64_ty, i64_ty, i64_ty, i64_ty });
+    const fv_ty = try builder.addFunctionValueType(sig);
+
+    const caller = try builder.addFunction("caller", i64_ty, 5);
+    builder.setCurrentFunction(caller);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const f_addr = @as(ir.Value, @enumFromInt(0));
+    const args = [_]ir.Value{
+        @enumFromInt(1), @enumFromInt(2), @enumFromInt(3), @enumFromInt(4), @enumFromInt(0),
+    };
+
+    const null_env = try builder.buildIntConst(i64_ty, 0);
+    const fv = try builder.buildFnValue(fv_ty, f_addr, null_env);
+    const result = try builder.buildCallPtr(i64_ty, fv, &args);
+    _ = try builder.buildRet(result);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    try cg.emitModule();
+    const text = cg.buf.items;
+
+    // Four register slots: env in rcx, visible args in rdx/r8/r9. The fifth
+    // visible arg goes to stack slot 1 (offset 40 = 32 shadow + 8).
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     r9, [rbp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     [rsp40], rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call    rax") != null);
+}
