@@ -9,4 +9,5 @@ test {
     _ = @import("ir.zig");
     _ = @import("codegen.zig");
     _ = @import("api.zig");
+    _ = @import("closure_tests.zig");
 }

@@ -726,13 +726,14 @@ pub const Builder = struct {
             switch (self.module.getIrType(f.type_idx)) {
                 .function_value => {
                     // The field value is the source record's address; copy
-                    // both words (docs/semantics.md §6.4, R16d).
+                    // both words (docs/semantics.md §6.4, R16d). Source word 1
+                    // always sits at the record's own base + 8 — only the
+                    // destination depends on the field's slot offset.
                     const word0 = try self.buildLoad(i64_ty, f.value);
                     _ = try self.buildStore(i64_ty, slot, word0);
-                    const word1_off = try self.buildIntConst(i64_ty, offset + 8);
-                    const src1 = try self.buildPtrAdd(i64_ptr_ty, f.value, word1_off);
+                    const src1 = try self.buildPtrAdd(i64_ptr_ty, f.value, try self.buildIntConst(i64_ty, 8));
                     const word1 = try self.buildLoad(i64_ty, src1);
-                    const dst1 = try self.buildPtrAdd(i64_ptr_ty, env, word1_off);
+                    const dst1 = try self.buildPtrAdd(i64_ptr_ty, env, try self.buildIntConst(i64_ty, offset + 8));
                     _ = try self.buildStore(i64_ty, dst1, word1);
                 },
                 else => _ = try self.buildStore(f.type_idx, slot, f.value),
