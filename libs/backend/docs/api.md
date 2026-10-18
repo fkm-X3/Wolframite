@@ -202,6 +202,25 @@ const fn_ty = try ctx.funcType(i32_ty, &.{ i32_ty, i32_ty });
 // fn(i32, i32) -> i32
 ```
 
+### `fnValueType`
+
+```zig
+pub fn fnValueType(self: *Context, signature: TypeIdx) !TypeIdx
+```
+
+Create a fn-value type — the type of a first-class function value. The
+runtime representation is the `fn_value_size`-byte (16) record
+`{ fn_ptr: u64, env_ptr: u64 }` (see `docs/semantics.md` §3.3).
+
+- `signature` — a `funcType` describing the *visible* callee signature. The
+  hidden env parameter (see `buildCallPtr`) is **not** part of it.
+
+```zig
+const i64_ty = try ctx.intType(true, 64);
+const sig = try ctx.funcType(i64_ty, &.{i64_ty});  // fn(i64) -> i64
+const fv_ty = try ctx.fnValueType(sig);
+```
+
 ### `getType`
 
 ```zig
@@ -530,6 +549,97 @@ const callee = try ctx.addFunction("add", i32_ty, 2);
 const result = try ctx.buildCall(callee, i32_ty, &.{ a, b });
 ```
 
+#### `buildCallPtr`
+
+```zig
+pub fn buildCallPtr(self: *Context, type_idx: TypeIdx, callee: Value, args: []const Value) !Value
+```
+
+`%r = call_ptr %callee(args...)` — indirect call through a fn value.
+
+- `callee` — an SSA value of a `fnValueType` type: the **address of a
+  `{ fn_ptr, env_ptr }` record** (produced by `buildFnValue`).
+- `type_idx` — the return type of the call.
+- `args` — the *visible* arguments.
+
+At codegen, the callee's `fn_ptr` is loaded from record+0 and its `env_ptr`
+from record+8; `env_ptr` is passed as the callee's **hidden argument 0** (the
+uniform env-first ABI, see `docs/semantics.md` §6.2) and the call goes
+through `fn_ptr` with the visible args shifted by one slot.
+
+```zig
+const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
+const r = try ctx.buildCallPtr(i64_ty, fv, &.{ x });
+```
+
+#### `buildFnValue`
+
+```zig
+pub fn buildFnValue(self: *Context, type_idx: TypeIdx, fn_ptr: Value, env_ptr: Value) !Value
+```
+
+Materialize a fn value: allocate a `fn_value_size`-byte (16) record in the
+current frame, store `fn_ptr` at offset 0 and `env_ptr` at offset 8, and
+produce the record's address.
+
+- `type_idx` — a `fnValueType` type.
+- `fn_ptr` — an SSA value holding the lifted callee's address.
+- `env_ptr` — an SSA value holding the captured-env record's address (from
+  `buildEnvRecord`), or a null pointer for a plain fn reference
+  (`docs/semantics.md` R3a).
+
+```zig
+const null_env = try ctx.buildIntConst(i64_ty, 0);
+const fv = try ctx.buildFnValue(fv_ty, fn_addr, null_env);
+```
+
+### Closure Environments
+
+#### `EnvField`
+
+```zig
+pub const EnvField = struct {
+    type_idx: TypeIdx,
+    value: Value,
+};
+```
+
+One captured slot of a closure env record: the captured value's type and the
+SSA value to copy into the record at creation time. Captures are by value
+(`docs/semantics.md` §5.2, R8c).
+
+#### `envRecordSize`
+
+```zig
+pub fn envRecordSize(self: *Context, field_types: []const TypeIdx) u32
+```
+
+Byte size of a closure env record holding the given captured field types in
+declaration order (`docs/semantics.md` §5.2, R8a). Every capture occupies
+one 8-byte slot, except a `function_value` capture, which stores its 16-byte
+record inline.
+
+#### `buildEnvRecord`
+
+```zig
+pub fn buildEnvRecord(self: *Context, fields: []const EnvField) !Value
+```
+
+Build a closure env record in the current frame (the default stack
+placement, `docs/semantics.md` §5.4): allocate a stack block sized for the
+captured set and copy each capture by value at its slot offset. Returns the
+record's address, ready to pair with a lifted callee in `buildFnValue`.
+
+An empty capture set produces no record and returns `Value.none` — pair the
+fn value with a null env instead (`docs/semantics.md` R8b).
+
+```zig
+const captured = try ctx.buildIntConst(i64_ty, 40);
+const env = try ctx.buildEnvRecord(&.{ .{ .type_idx = i64_ty, .value = captured } });
+const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
+const r = try ctx.buildCallPtr(i64_ty, fv, &.{ x });
+```
+
 ### Memory
 
 #### `buildAlloca`
@@ -628,11 +738,16 @@ don't need to import `ir.zig` directly:
 | `BasicBlockIdx` | Basic block array index |
 | `Opcode` | Instruction opcode enum |
 | `FloatType` | Float type variants (`.f16`, `.f32`, `.f64`) |
-| `IrType` | Type union (`void`, `bool_type`, `int`, `float`, `pointer`, `function`) |
+| `IrType` | Type union (`void`, `bool_type`, `int`, `float`, `pointer`, `function`, `function_value`) |
 | `IntType` | Integer type struct (`signed`, `bits`) |
 | `PointerType` | Pointer type struct (`elem`) |
 | `FunctionType` | Function type struct (`return_type`, `param_types`) |
+| `FunctionValueType` | Fn-value type struct (`signature`) |
+| `EnvField` | Closure env capture slot (`type_idx`, `value`) |
 | `PhiIncoming` | Phi node incoming pair (`value`, `block`) |
+
+The byte size of a fn-value record is re-exported as the constant
+`fn_value_size` (16).
 
 For access to the full Module/Builder internals:
 

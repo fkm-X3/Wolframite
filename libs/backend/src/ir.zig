@@ -68,6 +68,12 @@ pub const Opcode = enum(u8) {
     ret,
     ret_void,
     call,
+    /// Indirect call through a fn value (docs/semantics.md §6.4, R16c).
+    /// Operand 0 is an SSA value of type `function_value`: the address of a
+    /// `fn_value_size`-byte `{ fn_ptr, env_ptr }` record. Codegen loads
+    /// `fn_ptr` from record+0 and `env_ptr` from record+8, passes `env_ptr`
+    /// as the callee's hidden argument 0 (docs/semantics.md §6.2), and calls
+    /// with the remaining operands as the visible arguments.
     call_ptr,
     /// Call an external C function (declared with `extern` in the emitted
     /// assembly). Operand 0 is an index into `Module.externs`.
@@ -252,6 +258,40 @@ pub const Function = struct {
         return self.extra_data.items[slice.start..][0..slice.len];
     }
 };
+
+// ============================================================================
+// Closure Environments
+// ============================================================================
+
+/// One captured slot of a closure env record: the captured value's type and
+/// the SSA value to copy into the record at creation time (by-value capture,
+/// docs/semantics.md §5.2, R8c).
+pub const EnvField = struct {
+    type_idx: TypeIdx,
+    value: Value,
+};
+
+/// Byte size of one env field slot.
+///
+/// Captures follow the backend's slot model: every type occupies one 8-byte
+/// slot, except a `function_value` capture, which stores its 16-byte
+/// `{ fn_ptr, env_ptr }` record inline (docs/semantics.md §6.4, R16d).
+pub fn envFieldSize(module: *const Module, type_idx: TypeIdx) u32 {
+    return switch (module.getIrType(type_idx)) {
+        .function_value => fn_value_size,
+        else => 8,
+    };
+}
+
+/// Byte size of a closure env record holding the given captured field types
+/// in declaration order (docs/semantics.md §5.2, R8a). Always a multiple of
+/// 8, so every slot — including an inline `function_value` record — is
+/// naturally aligned.
+pub fn envRecordSize(module: *const Module, field_types: []const TypeIdx) u32 {
+    var size: u32 = 0;
+    for (field_types) |ty| size += envFieldSize(module, ty);
+    return size;
+}
 
 // ============================================================================
 // Externals
@@ -612,7 +652,14 @@ pub const Builder = struct {
         });
     }
 
-    /// Call the function pointer `callee` (an SSA value) with the given args.
+    /// Indirect call through a fn value (docs/semantics.md §6.4, R16c).
+    ///
+    /// `callee` must be a `function_value`-typed SSA value — the address of
+    /// a `fn_value_size`-byte `{ fn_ptr, env_ptr }` record (see
+    /// `buildFnValue`). At codegen, `env_ptr` becomes the callee's hidden
+    /// argument 0 (the uniform env-first ABI, docs/semantics.md §6.2) and
+    /// `args` are the visible arguments. `type_idx` is the call's return
+    /// type.
     pub fn buildCallPtr(self: *Builder, type_idx: TypeIdx, callee: Value, args: []const Value) !Value {
         var ops = std.ArrayList(u32).empty;
         defer ops.deinit(self.gpa);
@@ -645,6 +692,51 @@ pub const Builder = struct {
         const env_slot = try self.buildPtrAdd(i64_ptr_ty, record, env_offset);
         _ = try self.buildStore(i64_ty, env_slot, env_ptr);
         return record;
+    }
+
+    /// Build a closure env record in the current frame (stack placement,
+    /// docs/semantics.md §5.4, R10a): allocate a stack block sized for the
+    /// captured set (`envRecordSize`) and copy each capture by value at its
+    /// slot offset (docs/semantics.md §5.2, R8c). Returns the record's
+    /// address, ready to pair with a lifted callee in `buildFnValue`.
+    ///
+    /// An empty capture set produces no record and returns `Value.none` —
+    /// pair the fn value with a null env instead (docs/semantics.md §5.2,
+    /// R8b). A `function_value` field is copied inline as its two words,
+    /// so a captured closure shares nothing with the source record.
+    pub fn buildEnvRecord(self: *Builder, fields: []const EnvField) !Value {
+        if (fields.len == 0) return .none;
+
+        const i64_ty = try self.module.addType(self.gpa, .{ .int = .{ .signed = true, .bits = 64 } });
+        const i64_ptr_ty = try self.module.addType(self.gpa, .{ .pointer = .{ .elem = i64_ty } });
+
+        var size: u32 = 0;
+        for (fields) |f| size += envFieldSize(self.module, f.type_idx);
+        const env = try self.buildAllocaBytes(i64_ptr_ty, size);
+
+        var offset: u32 = 0;
+        for (fields) |f| {
+            const slot = if (offset == 0)
+                env
+            else
+                try self.buildPtrAdd(i64_ptr_ty, env, try self.buildIntConst(i64_ty, offset));
+            switch (self.module.getIrType(f.type_idx)) {
+                .function_value => {
+                    // The field value is the source record's address; copy
+                    // both words (docs/semantics.md §6.4, R16d).
+                    const word0 = try self.buildLoad(i64_ty, f.value);
+                    _ = try self.buildStore(i64_ty, slot, word0);
+                    const word1_off = try self.buildIntConst(i64_ty, offset + 8);
+                    const src1 = try self.buildPtrAdd(i64_ptr_ty, f.value, word1_off);
+                    const word1 = try self.buildLoad(i64_ty, src1);
+                    const dst1 = try self.buildPtrAdd(i64_ptr_ty, env, word1_off);
+                    _ = try self.buildStore(i64_ty, dst1, word1);
+                },
+                else => _ = try self.buildStore(f.type_idx, slot, f.value),
+            }
+            offset += envFieldSize(self.module, f.type_idx);
+        }
+        return env;
     }
 
     /// Declare an external C function (deduplicated by name) and return its
@@ -987,13 +1079,14 @@ test "extended opcodes and globals" {
     const str_global = try builder.addStringGlobal("greeting", "hello");
     _ = try builder.addFnArrayGlobal("vtable", &.{helper});
 
-    const main = try builder.addFunction("main", i64_ty, 2);
+    const main = try builder.addFunction("main", i64_ty, 3);
     builder.setCurrentFunction(main);
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
 
     const a = @as(Value, @enumFromInt(0));
     const b = @as(Value, @enumFromInt(1));
+    const callee_addr = @as(Value, @enumFromInt(2));
 
     _ = try builder.buildIntConst(i64_ty, 10);
     _ = try builder.buildFloatConst(f64_ty, 1.5);
@@ -1007,8 +1100,14 @@ test "extended opcodes and globals" {
     _ = try builder.buildFCmp(.fcmp_oge, f64_ty, a, b);
     _ = try builder.buildPtrAdd(ptr_ty, a, b);
     _ = try builder.buildMalloc(ptr_ty, a);
-    const sptr = try builder.buildGlobalAddr(ptr_ty, str_global);
-    _ = try builder.buildCallPtr(i64_ty, sptr, &.{ a, b });
+    _ = try builder.buildGlobalAddr(ptr_ty, str_global);
+    // Indirect call through a fn value (R16c): pair the callee address with
+    // a null env, then call through the record.
+    const sig = try builder.addFunctionType(i64_ty, &.{ i64_ty, i64_ty });
+    const fv_ty = try builder.addFunctionValueType(sig);
+    const null_env = try builder.buildIntConst(i64_ty, 0);
+    const fv = try builder.buildFnValue(fv_ty, callee_addr, null_env);
+    _ = try builder.buildCallPtr(i64_ty, fv, &.{ a, b });
     _ = try builder.buildExternCall("puts", void_ty, &.{a});
     _ = try builder.buildRet(a);
 
@@ -1033,7 +1132,7 @@ test "extended opcodes and globals" {
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add %0, %1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "malloc %0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "global_addr @greeting") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %14(%0, %1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %17(%0, %1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern puts") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern_call puts(%0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret %0") != null);
@@ -1094,4 +1193,66 @@ test "function value type and record materialization" {
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret %4") != null);
+}
+
+test "call through fn value with captured env record" {
+    var module = Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    const sig = try builder.addFunctionType(i64_ty, &.{i64_ty});
+    const fv_ty = try builder.addFunctionValueType(sig);
+
+    // Env layout (R8a): one 8-byte slot per scalar capture, 16 bytes for an
+    // inline fn-value capture.
+    try std.testing.expectEqual(@as(u32, 8), envFieldSize(&module, i64_ty));
+    try std.testing.expectEqual(@as(u32, 16), envFieldSize(&module, fv_ty));
+    try std.testing.expectEqual(
+        @as(u32, 32),
+        envRecordSize(&module, &.{ i64_ty, i64_ty, fv_ty }),
+    );
+
+    // Lifted closure: fn __closure_main_0(env, x) { load(env) + x }
+    const lifted = try builder.addFunction("__closure_main_0", i64_ty, 2);
+    builder.setCurrentFunction(lifted);
+    const l_entry = try builder.appendBlock();
+    builder.setCurrentBlock(l_entry);
+    const env_param = @as(Value, @enumFromInt(0));
+    const x_param = @as(Value, @enumFromInt(1));
+    const captured = try builder.buildLoad(i64_ty, env_param);
+    _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
+
+    // Creation + call site: env = buildEnvRecord({40}); fv = (fn_addr, env);
+    // call_ptr fv(x). The callee address arrives as a parameter (there is no
+    // fn-address op yet).
+    const make = try builder.addFunction("make", i64_ty, 2);
+    builder.setCurrentFunction(make);
+    const m_entry = try builder.appendBlock();
+    builder.setCurrentBlock(m_entry);
+    const fn_addr_param = @as(Value, @enumFromInt(0));
+    const x2 = @as(Value, @enumFromInt(1));
+
+    const forty = try builder.buildIntConst(i64_ty, 40);
+    const env = try builder.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
+    const fv = try builder.buildFnValue(fv_ty, fn_addr_param, env);
+    _ = try builder.buildCallPtr(i64_ty, fv, &.{x2});
+
+    // iconst, env alloca + store, then buildFnValue's five instructions,
+    // then the indirect call.
+    try std.testing.expectEqual(@as(usize, 9), module.functions.items[1].instructions.items.len);
+
+    // Empty capture set: no record, null env (R8b).
+    const none_env = try builder.buildEnvRecord(&.{});
+    try std.testing.expectEqual(Value.none, none_env);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printModule(&module, &w);
+    const text = buf[0..w.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%1)") != null);
 }
