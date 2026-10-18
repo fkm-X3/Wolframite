@@ -49,8 +49,12 @@ pub const IrType = ir.IrType;
 pub const IntType = ir.IntType;
 pub const PointerType = ir.PointerType;
 pub const FunctionType = ir.FunctionType;
+pub const FunctionValueType = ir.FunctionValueType;
 pub const PhiIncoming = ir.PhiIncoming;
 pub const GlobalIdx = ir.GlobalIdx;
+
+/// Byte size of a fn-value record: `{ fn_ptr: u64, env_ptr: u64 }`.
+pub const fn_value_size = ir.fn_value_size;
 
 // ============================================================================
 // Context
@@ -125,6 +129,13 @@ pub const Context = struct {
     /// Create a function type with the given return type and parameter types.
     pub fn funcType(self: *Context, ret: TypeIdx, param_types: []const TypeIdx) !TypeIdx {
         return self.builder.addFunctionType(ret, param_types);
+    }
+
+    /// Create a fn-value type whose visible callee signature is `signature`
+    /// (a `function` type). The runtime record is `fn_value_size` bytes:
+    /// `{ fn_ptr, env_ptr }` (docs/semantics.md §3.3).
+    pub fn fnValueType(self: *Context, signature: TypeIdx) !TypeIdx {
+        return self.builder.addFunctionValueType(signature);
     }
 
     /// Look up a type by its index.
@@ -369,6 +380,15 @@ pub const Context = struct {
     /// Build an indirect call through the function pointer `callee`.
     pub fn buildCallPtr(self: *Context, type_idx: TypeIdx, callee: Value, args: []const Value) !Value {
         return self.builder.buildCallPtr(type_idx, callee, args);
+    }
+
+    /// Materialize a fn value: the `fn_value_size`-byte `{ fn_ptr, env_ptr }`
+    /// record, placed in the current frame. The produced value is the
+    /// record's address. `type_idx` must be a `fnValueType` type; `fn_ptr`
+    /// holds the callee's address and `env_ptr` the captured-env record's
+    /// address (or null for a plain fn reference).
+    pub fn buildFnValue(self: *Context, type_idx: TypeIdx, fn_ptr: Value, env_ptr: Value) !Value {
+        return self.builder.buildFnValue(type_idx, fn_ptr, env_ptr);
     }
 
     /// Build a call to an external C function by name (e.g. `puts`).
@@ -737,4 +757,44 @@ test "function type creation" {
     _ = fty2;
 
     try std.testing.expectEqual(@as(usize, 4), ctx.getTypeCount());
+}
+
+test "function value model" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const i64_ty = try ctx.intType(true, 64);
+    const sig = try ctx.funcType(i64_ty, &.{i64_ty});
+    const fv_ty = try ctx.fnValueType(sig);
+
+    try std.testing.expectEqual(
+        IrType{ .function_value = .{ .signature = sig } },
+        ctx.getType(fv_ty),
+    );
+
+    // Closure creation site: the env record holds the by-value capture, and
+    // the fn value pairs the lifted callee's address with the env's address.
+    const make = try ctx.addFunction("make_closure", fv_ty, 1);
+    ctx.setCurrentFunction(make);
+    const entry = try ctx.appendBlock();
+    ctx.setCurrentBlock(entry);
+
+    const fn_ptr = ctx.getParam(0); // callee address (opaque here)
+    const env = try ctx.buildAllocaBytes(i64_ty, 8);
+    const capture = try ctx.buildIntConst(i64_ty, 7);
+    _ = try ctx.buildStore(i64_ty, env, capture);
+    const fv = try ctx.buildFnValue(fv_ty, fn_ptr, env);
+    _ = try ctx.buildRet(fv);
+
+    // env alloca + capture store, then buildFnValue's alloca/store/iconst/
+    // ptr_add/store, then ret.
+    try std.testing.expectEqual(@as(usize, 9), ctx.getInstructionCountIn(make));
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try ctx.print(&w);
+    const text = buf[0..w.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
 }

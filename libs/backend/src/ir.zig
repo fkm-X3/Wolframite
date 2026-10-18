@@ -127,6 +127,9 @@ pub const IrType = union(enum) {
     float: FloatType,
     pointer: PointerType,
     function: FunctionType,
+    /// A first-class fn value: a 16-byte `{ fn_ptr, env_ptr }` record
+    /// (docs/semantics.md §3.3).
+    function_value: FunctionValueType,
 };
 
 pub const IntType = struct {
@@ -148,6 +151,20 @@ pub const FunctionType = struct {
     return_type: TypeIdx,
     param_types: []const TypeIdx,
 };
+
+/// The type of a first-class fn value (docs/semantics.md §3.3, R16a).
+///
+/// The runtime record is `fn_value_size` bytes: `fn_ptr` at offset 0 and
+/// `env_ptr` at offset 8. `signature` is the *visible* callee signature — a
+/// `function` type without the hidden env parameter (docs/semantics.md §6.2).
+/// The captured env schema is per-instance lowering metadata and is
+/// deliberately not part of the type identity (docs/semantics.md §4.1).
+pub const FunctionValueType = struct {
+    signature: TypeIdx,
+};
+
+/// Byte size of a fn-value record: `{ fn_ptr: u64, env_ptr: u64 }`.
+pub const fn_value_size: u32 = 16;
 
 // ============================================================================
 // String Pool
@@ -365,6 +382,12 @@ pub const Builder = struct {
             .return_type = ret,
             .param_types = owned,
         } });
+    }
+
+    /// Create a fn-value type whose visible callee signature is `signature`
+    /// (a `function` type). The runtime record is `fn_value_size` bytes.
+    pub fn addFunctionValueType(self: *Builder, signature: TypeIdx) !TypeIdx {
+        return self.module.addType(self.gpa, .{ .function_value = .{ .signature = signature } });
     }
 
     // -- Function --
@@ -602,6 +625,26 @@ pub const Builder = struct {
             .type_idx = type_idx,
             .operands = try self.appendOperands(ops.items),
         });
+    }
+
+    /// Materialize a fn value: the `fn_value_size`-byte `{ fn_ptr, env_ptr }`
+    /// record (docs/semantics.md §3.3, R16b).
+    ///
+    /// The record is placed in the current frame (the default stack env
+    /// placement); the produced value is the record's address. `type_idx`
+    /// must be a `function_value` type. `fn_ptr` is an SSA value holding the
+    /// callee's address; `env_ptr` is an SSA value holding the address of the
+    /// captured-env record, or a null pointer for a plain fn reference
+    /// (docs/semantics.md R3a).
+    pub fn buildFnValue(self: *Builder, type_idx: TypeIdx, fn_ptr: Value, env_ptr: Value) !Value {
+        const i64_ty = try self.module.addType(self.gpa, .{ .int = .{ .signed = true, .bits = 64 } });
+        const i64_ptr_ty = try self.module.addType(self.gpa, .{ .pointer = .{ .elem = i64_ty } });
+        const record = try self.buildAllocaBytes(type_idx, fn_value_size);
+        _ = try self.buildStore(i64_ty, record, fn_ptr);
+        const env_offset = try self.buildIntConst(i64_ty, 8);
+        const env_slot = try self.buildPtrAdd(i64_ptr_ty, record, env_offset);
+        _ = try self.buildStore(i64_ty, env_slot, env_ptr);
+        return record;
     }
 
     /// Declare an external C function (deduplicated by name) and return its
@@ -994,4 +1037,61 @@ test "extended opcodes and globals" {
     try std.testing.expect(std.mem.indexOf(u8, text, "extern puts") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern_call puts(%0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret %0") != null);
+}
+
+test "function value type and record materialization" {
+    var module = Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    // Visible signature of the callee: fn(i64) -> i64.
+    const sig = try builder.addFunctionType(i64_ty, &.{i64_ty});
+    const fv_ty = try builder.addFunctionValueType(sig);
+
+    try std.testing.expectEqual(@as(u32, 16), fn_value_size);
+    try std.testing.expectEqual(
+        IrType{ .function_value = .{ .signature = sig } },
+        module.getIrType(fv_ty),
+    );
+
+    // Lifted closure body reading its capture through env + 0:
+    //   fn __closure_main_0(env: ptr, x: i64) -> i64 { load(env) + x }
+    const lifted = try builder.addFunction("__closure_main_0", i64_ty, 2);
+    builder.setCurrentFunction(lifted);
+    const l_entry = try builder.appendBlock();
+    builder.setCurrentBlock(l_entry);
+    const env_param = @as(Value, @enumFromInt(0));
+    const x_param = @as(Value, @enumFromInt(1));
+    const captured = try builder.buildLoad(i64_ty, env_param);
+    _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
+
+    // Creation site: the env record holds the by-value capture, then the fn
+    // value pairs the lifted callee's address with the env record's address.
+    const make = try builder.addFunction("make_closure", fv_ty, 1);
+    builder.setCurrentFunction(make);
+    const m_entry = try builder.appendBlock();
+    builder.setCurrentBlock(m_entry);
+    const fn_ptr_param = @as(Value, @enumFromInt(0)); // callee address
+
+    const env = try builder.buildAllocaBytes(i64_ty, 8);
+    const capture_val = try builder.buildIntConst(i64_ty, 42);
+    _ = try builder.buildStore(i64_ty, env, capture_val);
+    const fv = try builder.buildFnValue(fv_ty, fn_ptr_param, env);
+    _ = try builder.buildRet(fv);
+
+    // Creation site: env alloca + capture store, then the five instructions
+    // buildFnValue expands to (alloca 16, store fn_ptr, iconst 8, ptr_add,
+    // store env_ptr), then ret.
+    try std.testing.expectEqual(@as(usize, 9), module.functions.items[1].instructions.items.len);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try printModule(&module, &w);
+    const text = buf[0..w.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %4") != null);
 }
