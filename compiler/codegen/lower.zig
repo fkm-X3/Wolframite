@@ -2,18 +2,17 @@
 //!
 //! Walks a type-checked module and drives the Tungsten `api.Context` to build
 //! IR: one function per `fn`, a deduplicated string literal pool, and
-//! alloca/malloc/field-offset lowering for structs.
+//! alloca/field-offset lowering for aggregates.
 //!
 //! Value convention: every W value occupies one 8-byte slot (matching the
 //! backend's slot-based codegen). A `String` value is a pointer to a
 //! 16-byte `[len][ptr]` block (see `string.zig`); a struct value is a
-//! pointer to its stack-allocated block (see `class.zig`); a class value is
-//! a pointer to its heap allocation.
+//! pointer to its stack-allocated block; an enum value is a pointer to its
+//! tag-plus-payload block.
 //!
 //! Known simplifications:
 //! - All integer math runs in 64-bit slots; narrow types are not truncated.
 //! - Struct copies share the underlying block (no deep copy).
-//! - Classes leak: no `free` is emitted for the ref-counted header.
 //! - Expression-position `if`/`match` are not lowered (the type checker
 //!   currently types them as `void`).
 
@@ -26,7 +25,6 @@ const typecheck_mod = @import("../semantic/typecheck.zig");
 const scope_mod = @import("../semantic/scope.zig");
 const prelude = @import("../prelude.zig");
 const string_mod = @import("string.zig");
-const class_mod = @import("class.zig");
 
 const Allocator = std.mem.Allocator;
 const AstArena = ast.AstArena;
@@ -73,8 +71,6 @@ pub const Lowerer = struct {
 
     /// fn_decl node -> created FunctionIdx.
     fn_by_node: std.AutoHashMapUnmanaged(NodeIdx, api.FunctionIdx),
-    /// class decl node -> vtable global.
-    vtable_by_class: std.AutoHashMapUnmanaged(NodeIdx, api.GlobalIdx),
     /// (fn_decl node, FunctionIdx) pairs in creation order, for body lowering.
     all_functions: std.ArrayListUnmanaged(struct { node: NodeIdx, idx: api.FunctionIdx }),
 
@@ -121,7 +117,6 @@ pub const Lowerer = struct {
             .f64_ty = try ctx.floatType(.f64),
             .ptr_ty = undefined,
             .fn_by_node = .empty,
-            .vtable_by_class = .empty,
             .all_functions = .empty,
             .params = .empty,
             .locals = .empty,
@@ -135,7 +130,6 @@ pub const Lowerer = struct {
 
     pub fn deinit(self: *Lowerer) void {
         self.fn_by_node.deinit(self.gpa);
-        self.vtable_by_class.deinit(self.gpa);
         self.all_functions.deinit(self.gpa);
         self.params.deinit(self.gpa);
         self.locals.deinit(self.gpa);
@@ -305,7 +299,7 @@ pub const Lowerer = struct {
 
     fn allocVarSlot(self: *Lowerer, ty: TypeIdx) !api.Value {
         const size: u32 = switch (self.type_pool.get(ty)) {
-            .struct_type => |decl_node| class_mod.structSize(self.arena, decl_node),
+            .struct_type => |decl_node| structSize(self.arena, decl_node),
             else => 8,
         };
         return self.ctx.buildAllocaBytes(self.ptr_ty, size);
@@ -659,7 +653,7 @@ pub const Lowerer = struct {
                 for (pattern.call.args.indices, 0..) |arg_idx, j| {
                     const arg = self.arena.get(arg_idx);
                     if (arg.* != .identifier) continue;
-                    const payload_addr = try self.ctx.buildPtrAdd(self.ptr_ty, scrutinee, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(j))));
+                    const payload_addr = try self.ctx.buildPtrAdd(self.ptr_ty, scrutinee, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(j))));
                     const payload = try self.ctx.buildLoad(self.i64_ty, payload_addr);
                     const slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
                     _ = try self.ctx.buildStore(self.i64_ty, slot, payload);
@@ -830,12 +824,12 @@ pub const Lowerer = struct {
         // and return it. The operand and the enclosing function share the enum
         // declaration (R27a), so the variant's index and payload layout match.
         self.setBlock(propagate_b);
-        const err_value = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.enumSizeFor(shape.error_field_count));
+        const err_value = try self.ctx.buildAllocaBytes(self.ptr_ty, enumSizeFor(shape.error_field_count));
         _ = try self.ctx.buildStore(self.i64_ty, err_value, try self.ctx.buildIntConst(self.i64_ty, @intCast(shape.error_index)));
         if (shape.error_field_count == 1) {
-            const src_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+            const src_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(0))));
             const payload = try self.ctx.buildLoad(self.i64_ty, src_addr);
-            const dst_addr = try self.ctx.buildPtrAdd(self.ptr_ty, err_value, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+            const dst_addr = try self.ctx.buildPtrAdd(self.ptr_ty, err_value, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(0))));
             _ = try self.ctx.buildStore(self.i64_ty, dst_addr, payload);
         }
         try self.emitDefersFrom(0);
@@ -844,7 +838,7 @@ pub const Lowerer = struct {
 
         // Success path: the payload is the value of `x?`.
         self.setBlock(ok_b);
-        const payload_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(0))));
+        const payload_addr = try self.ctx.buildPtrAdd(self.ptr_ty, operand, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(0))));
         return self.ctx.buildLoad(self.i64_ty, payload_addr);
     }
 
@@ -1109,11 +1103,11 @@ pub const Lowerer = struct {
     fn lowerVariantInit(self: *Lowerer, vi: ast.EnumVariantInfo, c: anytype) !api.Value {
         const variant = self.arena.get(vi.variant_node);
         const payload_count = variant.enum_variant.fields.indices.len;
-        const block = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.enumSizeFor(payload_count));
+        const block = try self.ctx.buildAllocaBytes(self.ptr_ty, enumSizeFor(payload_count));
         _ = try self.ctx.buildStore(self.i64_ty, block, try self.ctx.buildIntConst(self.i64_ty, @intCast(vi.index)));
         for (c.args.indices, 0..) |arg_idx, i| {
             const val = try self.lowerExpr(arg_idx);
-            const addr = try self.ctx.buildPtrAdd(self.ptr_ty, block, try self.ctx.buildIntConst(self.i64_ty, @intCast(class_mod.enumPayloadOffset(i))));
+            const addr = try self.ctx.buildPtrAdd(self.ptr_ty, block, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(i))));
             _ = try self.ctx.buildStore(self.i64_ty, addr, val);
         }
         return block;
@@ -1139,7 +1133,7 @@ pub const Lowerer = struct {
             },
         };
 
-        const base = try self.ctx.buildAllocaBytes(self.ptr_ty, class_mod.structSize(self.arena, decl_node));
+        const base = try self.ctx.buildAllocaBytes(self.ptr_ty, structSize(self.arena, decl_node));
 
         const decl = self.arena.get(decl_node);
         const fields: []const NodeIdx = switch (decl.*) {
@@ -1189,7 +1183,7 @@ pub const Lowerer = struct {
             return null;
         };
 
-        const offset = class_mod.structFieldOffset(self.arena, self.source, target, field_name);
+        const offset = structFieldOffset(self.arena, self.source, target, field_name);
         const off = offset orelse {
             self.codegenError(node_idx, "no such field '{s}'", .{field_name});
             return null;
@@ -1247,7 +1241,7 @@ pub const Lowerer = struct {
                 .f64 => self.f64_ty,
                 .f16 => self.f64_ty,
             },
-            // Pointers, strings, structs and classes all live in one slot.
+            // Pointers, strings, structs and enums all live in one slot.
             else => self.ptr_ty,
         };
     }
@@ -1325,6 +1319,69 @@ pub fn lowerAll(
     var lowerer = try Lowerer.init(gpa, arena, source, type_pool, diagnostics, checker, ctx);
     defer lowerer.deinit();
     try lowerer.run();
+}
+
+// ============================================================================
+// Aggregate layout
+// ============================================================================
+//
+// Structs are plain aggregates: fields packed in declaration order with no
+// header preamble, each occupying one 8-byte slot to match the backend's
+// slot-based codegen. A struct lives on the stack in one `allocaBytes`
+// region.
+//
+// An enum value is a pointer to a stack block laid out as:
+//
+// ```text
+// [ tag: i64 ][ payload 0 ][ payload 1 ] ...
+// ```
+//
+// The tag is the variant's index in declaration order. Payload slots are
+// 8 bytes each; the block is sized by the constructing variant's own
+// payload count.
+
+/// Number of fields in a struct declaration.
+fn fieldCount(arena: *const AstArena, decl_idx: NodeIdx) u64 {
+    const decl = arena.get(decl_idx);
+    return switch (decl.*) {
+        .struct_decl => |s| @intCast(s.fields.indices.len),
+        else => 0,
+    };
+}
+
+/// Total byte size of a stack-allocated struct.
+fn structSize(arena: *const AstArena, decl_idx: NodeIdx) u32 {
+    return @intCast(8 * fieldCount(arena, decl_idx));
+}
+
+/// Byte offset of a named field inside a struct.
+fn structFieldOffset(arena: *const AstArena, source: []const u8, decl_idx: NodeIdx, field_name: []const u8) ?u64 {
+    const decl = arena.get(decl_idx);
+    const fields: []const NodeIdx = switch (decl.*) {
+        .struct_decl => |s| s.fields.indices,
+        else => return null,
+    };
+    for (fields, 0..) |field_idx, i| {
+        const field = arena.get(field_idx);
+        const name = switch (field.*) {
+            .field => |f| f.name,
+            else => continue,
+        };
+        if (std.mem.eql(u8, name.slice(source), field_name)) {
+            return 8 * @as(u64, @intCast(i));
+        }
+    }
+    return null;
+}
+
+/// Byte offset of enum payload slot `index`, after the 8-byte tag.
+fn enumPayloadOffset(index: u64) u64 {
+    return 8 * (index + 1);
+}
+
+/// Total byte size of an enum block holding `payload_count` payload slots.
+fn enumSizeFor(payload_count: u64) u32 {
+    return @intCast(8 * (payload_count + 1));
 }
 
 // ============================================================================
@@ -1545,6 +1602,15 @@ test "lower: struct init and field access" {
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "fconst 1") != null);
+}
+
+test "lower: aggregate layout has no header preamble" {
+    // Structs are plain aggregates (8-byte slots, no header preamble) and
+    // enums are tag + payload slots at fixed offsets.
+    try std.testing.expectEqual(@as(u64, 8), enumPayloadOffset(0));
+    try std.testing.expectEqual(@as(u64, 16), enumPayloadOffset(1));
+    try std.testing.expectEqual(@as(u32, 16), enumSizeFor(1));
+    try std.testing.expectEqual(@as(u32, 24), enumSizeFor(2));
 }
 
 test "lower: string literal pool" {

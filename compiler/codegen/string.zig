@@ -12,7 +12,8 @@
 //! NUL-terminated in the `.data` section by the backend.
 //!
 //! Known simplifications:
-//! - No ref counting / freeing (matches the class strategy in `class.zig`).
+//! - No ref counting / freeing: the lowerer never emits a deallocation for
+//!   the block.
 //! - `len` is a `u64`; the low 32 bits are what the type system exposes.
 
 const std = @import("std");
