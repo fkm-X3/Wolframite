@@ -13,8 +13,9 @@
 //! Known simplifications:
 //! - All integer math runs in 64-bit slots; narrow types are not truncated.
 //! - Struct copies share the underlying block (no deep copy).
-//! - Expression-position `if`/`match` are not lowered (the type checker
-//!   currently types them as `void`).
+//! - A returned struct/enum/String value is the address of the callee's
+//!   stack block; the caller must consume it before the frame is reused, so
+//!   aggregates do not yet survive their producing frame.
 
 const std = @import("std");
 const api = @import("Tungsten").api;
@@ -725,6 +726,10 @@ pub const Lowerer = struct {
             .null_literal => return self.ctx.buildIntConst(self.i64_ty, 0),
             .char_literal => |ref| return self.lowerChar(ref),
             .string_literal => |ref| return self.lowerString(ref),
+            .fn_ref => {
+                self.codegenError(node_idx, "a fn value is not lowered yet", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
             .identifier => |id| {
                 const name = self.nameSlice(id);
                 if (ast.findEnumVariant(self.arena, self.source, self.checker.module_node, name)) |vi| {
@@ -1028,11 +1033,36 @@ pub const Lowerer = struct {
                 self.ctx.buildSub(ir_ty, try self.ctx.buildIntConst(ir_ty, 0), operand),
             .not => self.ctx.buildXor(self.bool_ty, operand, try self.ctx.buildIntConst(self.bool_ty, 1)),
             .bit_not => self.ctx.buildXor(ir_ty, operand, try self.ctx.buildIntConst(ir_ty, -1)),
-            .ref, .mut_ref => blk: {
-                self.codegenError(node_idx, "explicit reference is not lowered yet", .{});
-                break :blk try self.ctx.buildIntConst(self.i64_ty, 0);
-            },
+            .ref, .mut_ref => self.lowerRef(node_idx, u.operand),
         };
+    }
+
+    /// `&x` / `&mut x`. An aggregate value (`struct`, `enum`, `String`, pointer)
+    /// is already a pointer to its block under this lowering's value
+    /// convention, so its reference is the value itself; this is what makes
+    /// the free-function mutation model work — `scale(&mut v, 2.0)` passes the
+    /// struct's block straight to `fn scale(v: &mut Vec2)`, and the callee's
+    /// `&mut T` parameter arrives as that same pointer. A scalar local's
+    /// reference is its stack slot; a scalar parameter (an SSA value with no
+    /// address) is spilled to a fresh slot first.
+    fn lowerRef(self: *Lowerer, node_idx: NodeIdx, operand_idx: NodeIdx) !api.Value {
+        switch (self.type_pool.get(self.exprType(operand_idx))) {
+            .struct_type, .enum_type, .string_type, .array, .pointer => return self.lowerExpr(operand_idx),
+            else => {},
+        }
+
+        const node = self.arena.get(operand_idx);
+        if (node.* == .identifier) {
+            const name = self.nameSlice(node.identifier);
+            if (self.locals.get(name)) |binding| return binding.value;
+            if (self.params.get(name)) |param| {
+                const slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
+                _ = try self.ctx.buildStore(self.i64_ty, slot, param.value);
+                return slot;
+            }
+        }
+        self.codegenError(node_idx, "cannot take a reference of this expression", .{});
+        return self.ctx.buildIntConst(self.i64_ty, 0);
     }
 
     fn lowerCall(self: *Lowerer, node_idx: NodeIdx, c: anytype) !api.Value {
@@ -1271,8 +1301,7 @@ pub const Lowerer = struct {
     }
 
     /// Type of an expression node, falling back to the binding map for
-    /// identifiers that the type checker never visited (e.g. method-call
-    /// receivers, which its `.call` rule does not traverse).
+    /// identifiers the checker did not directly cache a type for.
     fn exprType(self: *Lowerer, node_idx: NodeIdx) TypeIdx {
         const node = self.arena.get(node_idx);
         if (node.* == .identifier) {
@@ -1611,6 +1640,81 @@ test "lower: aggregate layout has no header preamble" {
     try std.testing.expectEqual(@as(u64, 16), enumPayloadOffset(1));
     try std.testing.expectEqual(@as(u32, 16), enumSizeFor(1));
     try std.testing.expectEqual(@as(u32, 24), enumSizeFor(2));
+}
+
+test "lower: free function over a struct is a named call over gep fields" {
+    var res = try checkLower(std.testing.allocator,
+        \\struct Vec2 {
+        \\    x: f64
+        \\    y: f64
+        \\}
+        \\fn sum(v: Vec2) -> f64 {
+        \\    return v.x + v.y
+        \\}
+        \\fn main() -> f64 {
+        \\    let v: Vec2 = Vec2{ .x = 1.0, .y = 2.0 }
+        \\    return sum(v)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The declaration keeps its name and the call is a direct call — there is
+    // no receiver argument and no dispatch through a table.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @sum()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @fn") != null);
+    // Field reads are static byte-offset geps on the aggregate parameter.
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fadd") != null);
+}
+
+test "lower: a free function mutates a struct through a `&mut` parameter" {
+    var res = try checkLower(std.testing.allocator,
+        \\struct Vec2 {
+        \\    x: f64
+        \\    y: f64
+        \\}
+        \\fn scale(v: &mut Vec2, factor: f64) {
+        \\    v.x = v.x * factor
+        \\    v.y = v.y * factor
+        \\}
+        \\fn main() -> f64 {
+        \\    mut v: Vec2 = Vec2{ .x = 3.0, .y = 4.0 }
+        \\    scale(&mut v, 2.0)
+        \\    return v.x
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The `&mut T` parameter arrives as the aggregate's block pointer, so the
+    // mutation is a store through a static field offset of that pointer.
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fmul") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "store") != null);
+    // `scale(&mut v, 2.0)` is a plain direct call with the block and the factor.
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @fn") != null);
+}
+
+test "lower: dot-call on a struct value is not method dispatch" {
+    var res = try runLower(std.testing.allocator,
+        \\struct Vec2 {
+        \\    x: f64
+        \\    y: f64
+        \\}
+        \\fn add(a: Vec2, b: Vec2) -> Vec2 {
+        \\    return Vec2{ .x = a.x + b.x, .y = a.y + b.y }
+        \\}
+        \\fn main() -> f64 {
+        \\    let u: Vec2 = Vec2{ .x = 1.0, .y = 2.0 }
+        \\    let w = u.add(u)
+        \\    return w.x
+        \\}
+    );
+    defer res.deinit();
+    try std.testing.expect(res.diagnostics.hasErrors());
 }
 
 test "lower: string literal pool" {
