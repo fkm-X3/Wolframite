@@ -4,9 +4,6 @@
 
 Wolframite, the lang built on top of Tungsten
 
-> [!IMPORTANT]
-> This project is not abandoned (I'm am balancing working on cube combat and this project) and the syntax is locked to Zig 0.16.
-
 ## Quick Install
 
 ### Linux
