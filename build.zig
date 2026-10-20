@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -72,6 +73,12 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+
+    // Progress messages: every artifact's compile step depends on
+    // `build_start`, so this is guaranteed to print before any compilation
+    // begins.
+    const build_start = addPrintStep(b, "print build start", "building Wolframite toolchain ...", &.{});
+
     const exe = b.addExecutable(.{
         .name = "Wolframite",
         .root_module = b.createModule(.{
@@ -137,6 +144,12 @@ pub fn build(b: *std.Build) void {
         .root_module = wfr_std_mod,
     });
     b.installArtifact(wfr_std_lib);
+
+    // Gate every artifact's compile step on the build-start message so the
+    // message is guaranteed to print before any compilation begins.
+    exe.step.dependOn(build_start);
+    ore_exe.step.dependOn(build_start);
+    wfr_std_lib.step.dependOn(build_start);
 
     const run_ore_cmd = b.addRunArtifact(ore_exe);
     run_ore_cmd.step.dependOn(b.getInstallStep());
@@ -210,6 +223,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_ore_tests = b.addRunArtifact(ore_tests);
 
+    // Printed once, before any suite starts: every test run step below
+    // depends on it.
+    const tests_start = addPrintStep(b, "print tests start", "running tests ...", &.{});
+    for ([_]*std.Build.Step{
+        &run_mod_tests.step,
+        &run_exe_tests.step,
+        &run_compiler_tests.step,
+        &run_backend_tests.step,
+        &run_ore_tests.step,
+    }) |suite_run| suite_run.dependOn(tests_start);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -220,18 +244,49 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_ore_tests.step);
 
+    // "Compiler tests passed" is printed only after the compiler suite has
+    // succeeded.
+    const compiler_tests_done = addPrintStep(b, "print compiler tests done", "compiler tests passed", &.{&run_compiler_tests.step});
     const test_compiler_step = b.step("test-compiler", "Run compiler tests");
-    test_compiler_step.dependOn(&run_compiler_tests.step);
+    test_compiler_step.dependOn(compiler_tests_done);
 
     // Wolframite runtime tests
     const std_tests = b.addTest(.{
         .root_module = wfr_std_mod,
     });
     const run_std_tests = b.addRunArtifact(std_tests);
+    run_std_tests.step.dependOn(tests_start);
     test_step.dependOn(&run_std_tests.step);
 
+    const std_tests_done = addPrintStep(b, "print std tests done", "runtime tests passed", &.{&run_std_tests.step});
     const test_std_step = b.step("test-std", "Run Wolframite runtime tests");
-    test_std_step.dependOn(&run_std_tests.step);
+    test_std_step.dependOn(std_tests_done);
+
+    // "All tests passed" is printed only once every suite has succeeded.
+    const all_tests_done = addPrintStep(b, "print tests done", "all tests passed", &.{
+        &run_mod_tests.step,
+        &run_exe_tests.step,
+        &run_compiler_tests.step,
+        &run_backend_tests.step,
+        &run_ore_tests.step,
+        &run_std_tests.step,
+    });
+    test_step.dependOn(all_tests_done);
+
+    // `zig build` (no arguments) runs this wrapper: it installs everything and
+    // then prints a success message that can only appear if the whole chain
+    // succeeded.
+    const build_done = addPrintStep(b, "print build done", "build succeeded (artifacts in zig-out)", &.{});
+    build_done.dependOn(b.getInstallStep());
+    const build_step = b.step("build", "Build everything (default)");
+    build_step.dependOn(build_done);
+    b.default_step = build_step;
+
+    // Compiles the toolchain and installs it to the system bin directory:
+    // `%USERPROFILE%\.local\bin` on Windows, `/usr/local/bin` on Linux with a
+    // `$HOME/.local/bin` fallback when that location is not writable.
+    const install_compiler_step = b.step("install-compiler", "Install Wolframite and ore to the system bin directory");
+    install_compiler_step.dependOn(addInstallCompilerStep(b, &.{ exe, ore_exe }));
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
@@ -245,3 +300,132 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 }
+
+/// Creates a step that prints a one-line progress message when it runs. If
+/// `suites` is non-empty, the message additionally reports the combined number
+/// of tests that passed, and the step only runs after all of them succeeded.
+fn addPrintStep(
+    b: *std.Build,
+    name: []const u8,
+    text: []const u8,
+    suites: []const *std.Build.Step,
+) *std.Build.Step {
+    const print_step = b.allocator.create(PrintStep) catch @panic("OOM");
+    print_step.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = name,
+            .owner = b,
+            .makeFn = PrintStep.make,
+        }),
+        .text = text,
+        .suites = b.allocator.dupe(*std.Build.Step, suites) catch @panic("OOM"),
+    };
+    for (print_step.suites) |suite| print_step.step.dependOn(suite);
+    return &print_step.step;
+}
+
+const PrintStep = struct {
+    step: std.Build.Step,
+    text: []const u8,
+    suites: []const *std.Build.Step,
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *PrintStep = @fieldParentPtr("step", step);
+        if (self.suites.len == 0) {
+            std.debug.print("[wolframite] {s}\n", .{self.text});
+            return;
+        }
+        var passed: u32 = 0;
+        for (self.suites) |suite| passed += suite.test_results.passCount();
+        std.debug.print("[wolframite] {s} ({d} tests passed)\n", .{ self.text, passed });
+    }
+};
+
+/// Compiles `artifacts` and installs the emitted binaries into the platform's
+/// bin directory:
+/// * Windows: `%USERPROFILE%\.local\bin` (`%HOME%` is used when set)
+/// * Linux: `/usr/local/bin`, falling back to `$HOME/.local/bin` when that
+///   location cannot be written to (e.g. running unprivileged)
+///
+/// Returns the step performing the installation; wire it up with
+/// `step.dependOn(...)`.
+fn addInstallCompilerStep(b: *std.Build, artifacts: []const *std.Build.Step.Compile) *std.Build.Step {
+    const install = b.allocator.create(InstallCompilerStep) catch @panic("OOM");
+    install.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "install toolchain to system bin directory",
+            .owner = b,
+            .makeFn = InstallCompilerStep.make,
+        }),
+        .artifacts = b.allocator.dupe(*std.Build.Step.Compile, artifacts) catch @panic("OOM"),
+    };
+    // Requesting the emitted binaries is what pulls the compilation of each
+    // artifact into the graph.
+    for (install.artifacts) |artifact| {
+        artifact.getEmittedBin().addStepDependencies(&install.step);
+    }
+    return &install.step;
+}
+
+const InstallCompilerStep = struct {
+    step: std.Build.Step,
+    artifacts: []const *std.Build.Step.Compile,
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *InstallCompilerStep = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const sep = std.fs.path.sep;
+        // HOME is usually not set on Windows, where USERPROFILE is the
+        // equivalent.
+        const home = b.graph.environ_map.get("HOME") orelse b.graph.environ_map.get("USERPROFILE");
+
+        if (builtin.os.tag == .windows) {
+            const home_dir = home orelse return step.fail(
+                "cannot determine the home directory: neither HOME nor USERPROFILE is set",
+                .{},
+            );
+            const dest_dir = try std.fmt.allocPrint(b.allocator, "{s}{c}.local{c}bin", .{ home_dir, sep, sep });
+            self.installAll(step, dest_dir) catch |err|
+                return step.fail("unable to install to '{s}': {t}", .{ dest_dir, err });
+            std.debug.print("[wolframite] toolchain installed to {s}\n", .{dest_dir});
+            return;
+        }
+
+        // Prefer the system-wide location and fall back to the user's own bin
+        // directory when it is not writable. A partially failed first attempt
+        // is harmless: re-running the step overwrites any duplicates.
+        const fallback: ?[]const u8 = if (home) |home_dir|
+            try std.fmt.allocPrint(b.allocator, "{s}{c}.local{c}bin", .{ home_dir, sep, sep })
+        else null;
+        const system_dir = "/usr/local/bin";
+        if (self.installAll(step, system_dir)) {
+            std.debug.print("[wolframite] toolchain installed to {s}\n", .{system_dir});
+        } else |err| {
+            const dest_dir = fallback orelse return step.fail(
+                "unable to write to '{s}' ({t}) and no home directory is available for the fallback",
+                .{ system_dir, err },
+            );
+            std.debug.print("[wolframite] unable to write to {s} ({t}); falling back to {s}\n", .{
+                system_dir, err, dest_dir,
+            });
+            self.installAll(step, dest_dir) catch |fallback_err|
+                return step.fail("unable to install to '{s}': {t}", .{ dest_dir, fallback_err });
+            std.debug.print("[wolframite] toolchain installed to {s}\n", .{dest_dir});
+        }
+    }
+
+    fn installAll(self: *InstallCompilerStep, step: *std.Build.Step, dest_dir: []const u8) anyerror!void {
+        const b = step.owner;
+        const io = b.graph.io;
+        for (self.artifacts) |artifact| {
+            const src = artifact.getEmittedBin().getPath3(b, step);
+            const dest = try std.fmt.allocPrint(b.allocator, "{s}{c}{s}", .{
+                dest_dir, std.fs.path.sep, artifact.out_filename,
+            });
+            _ = try std.Io.Dir.updateFile(src.root_dir.handle, io, src.sub_path, .cwd(), dest, .{});
+            std.debug.print("[wolframite] installed {s} -> {s}\n", .{ artifact.name, dest });
+        }
+    }
+};
