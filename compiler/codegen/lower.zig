@@ -73,7 +73,14 @@ pub const Lowerer = struct {
     /// fn_decl node -> created FunctionIdx.
     fn_by_node: std.AutoHashMapUnmanaged(NodeIdx, api.FunctionIdx),
     /// (fn_decl node, FunctionIdx) pairs in creation order, for body lowering.
+    /// Closure lifting appends entries during body lowering, so this list is
+    /// walked by index and lifted bodies are lowered in the same pass.
     all_functions: std.ArrayListUnmanaged(struct { node: NodeIdx, idx: api.FunctionIdx }),
+    /// Lifted closure bodies: the lifted FunctionIdx -> its closure-literal
+    /// node (captures come from the closure's inferred env list).
+    lifted: std.AutoHashMapUnmanaged(api.FunctionIdx, NodeIdx),
+    /// Source-order counter for unique lifted-closure function names.
+    closure_counter: u32 = 0,
 
     /// Function parameters of the current function: name -> binding.
     params: std.StringHashMapUnmanaged(Binding),
@@ -119,6 +126,7 @@ pub const Lowerer = struct {
             .ptr_ty = undefined,
             .fn_by_node = .empty,
             .all_functions = .empty,
+            .lifted = .empty,
             .params = .empty,
             .locals = .empty,
             .shadows = .empty,
@@ -132,6 +140,7 @@ pub const Lowerer = struct {
     pub fn deinit(self: *Lowerer) void {
         self.fn_by_node.deinit(self.gpa);
         self.all_functions.deinit(self.gpa);
+        self.lifted.deinit(self.gpa);
         self.params.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.shadows.deinit(self.gpa);
@@ -158,8 +167,11 @@ pub const Lowerer = struct {
             }
         }
 
-        // Pass 2: function bodies.
-        for (self.all_functions.items) |f| {
+        // Pass 2: function bodies. Closure lifting appends new functions
+        // during this walk, so it is index-based to pick those up too.
+        var i: usize = 0;
+        while (i < self.all_functions.items.len) : (i += 1) {
+            const f = self.all_functions.items[i];
             try self.lowerFunctionBody(f.node, f.idx);
         }
     }
@@ -171,7 +183,11 @@ pub const Lowerer = struct {
     fn createFunction(self: *Lowerer, decl_idx: NodeIdx, name: []const u8) !api.FunctionIdx {
         const f = self.arena.get(decl_idx).fn_decl;
         const ret_ir = self.irTypeFor(self.checker.nodeType(decl_idx));
-        const fidx = try self.ctx.addFunction(name, ret_ir, @intCast(f.params.indices.len));
+        // R14: every lowered function carries a leading hidden env parameter so
+        // it can also be called through a fn value with no thunk; `main` is
+        // exempt (R15).
+        const env_hole: u32 = if (std.mem.eql(u8, name, "main")) 0 else 1;
+        const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(f.params.indices.len)) + env_hole);
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
         try self.all_functions.append(self.gpa, .{ .node = decl_idx, .idx = fidx });
         return fidx;
@@ -185,29 +201,114 @@ pub const Lowerer = struct {
         self.pending_defers.clearRetainingCapacity();
         self.block_terminated = false;
 
+        const entry = try self.ctx.appendBlock();
+        self.setBlock(entry);
+
+        // A lifted closure body reads its visible parameters from hidden
+        // argument slots 1..n and its captures from the env record in
+        // parameter 0; it is not built from an fn_decl.
+        if (self.lifted.get(fidx)) |closure_node| {
+            try self.lowerLiftedBody(closure_node);
+            return;
+        }
+
         const f = self.arena.get(decl_idx).fn_decl;
+        // R14: visible parameters sit after the hidden env parameter (`main`
+        // is exempt and keeps parameter 0 as its first visible parameter).
+        const env_hole: u32 = if (std.mem.eql(u8, self.nameSlice(f.name), "main")) 0 else 1;
         for (f.params.indices, 0..) |param_idx, i| {
             const param = self.arena.get(param_idx);
             try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
-                .value = @enumFromInt(i),
+                .value = @enumFromInt(env_hole + i),
                 .ty = try self.paramType(param.param.ty),
             });
         }
-
-        const entry = try self.ctx.appendBlock();
-        self.setBlock(entry);
 
         if (f.body != NodeIdx.none) {
             try self.lowerStmt(f.body);
         }
 
         if (!self.block_terminated) {
-            const ret_ty = self.checker.nodeType(decl_idx);
-            if (self.type_pool.get(ret_ty) == .void) {
-                _ = try self.ctx.buildRetVoid();
+            try self.defaultRet(self.checker.nodeType(decl_idx));
+        }
+    }
+
+    /// Emit the fallthrough return for a body that did not terminate: a void
+    /// function returns nothing, anything else returns a zero value (aggregates
+    /// are pointer-shaped, so a null block pointer is a valid zero).
+    fn defaultRet(self: *Lowerer, ret_ty: TypeIdx) !void {
+        if (self.block_terminated) return;
+        if (self.type_pool.get(ret_ty) == .void) {
+            _ = try self.ctx.buildRetVoid();
+        } else {
+            _ = try self.ctx.buildRet(try self.ctx.buildIntConst(self.i64_ty, 0));
+        }
+    }
+
+    /// Lower a lifted closure body (docs/semantics.md §6.2: the uniform
+    /// env-first ABI). Visible parameters arrive as hidden argument slots
+    /// 1..n; the env record address is argument 0. Each capture is copied out
+    /// of the record into a stack slot, so the body sees ordinary locals — a
+    /// captured `mut` binding is mutable inside its copy and never aliases
+    /// the outer binding (R8d). A fn-value capture is stored inline as two
+    /// words, so it is copied back out into a fresh 16-byte record.
+    fn lowerLiftedBody(self: *Lowerer, closure_node: NodeIdx) !void {
+        const cl = self.arena.get(closure_node).closure;
+
+        for (cl.params.indices, 0..) |param_idx, i| {
+            const param = self.arena.get(param_idx);
+            try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
+                .value = self.ctx.getParam(@intCast(i + 1)),
+                .ty = self.checker.nodeType(param_idx),
+            });
+        }
+
+        const env_ptr = self.ctx.getParam(0);
+        var offset: u64 = 0;
+        for (cl.env.indices) |decl_idx| {
+            const cap_ty = try self.captureType(decl_idx);
+            const name = self.captureName(decl_idx);
+            const slot_addr = try self.ctx.buildPtrAdd(
+                self.ptr_ty,
+                env_ptr,
+                try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+            );
+            if (self.type_pool.get(cap_ty) == .function) {
+                const record = try self.ctx.buildAllocaBytes(self.ptr_ty, api.fn_value_size);
+                const word0 = try self.ctx.buildLoad(self.i64_ty, slot_addr);
+                _ = try self.ctx.buildStore(self.i64_ty, record, word0);
+                const src1 = try self.ctx.buildPtrAdd(self.ptr_ty, slot_addr, try self.ctx.buildIntConst(self.i64_ty, 8));
+                const word1 = try self.ctx.buildLoad(self.i64_ty, src1);
+                const dst1 = try self.ctx.buildPtrAdd(self.ptr_ty, record, try self.ctx.buildIntConst(self.i64_ty, 8));
+                _ = try self.ctx.buildStore(self.i64_ty, dst1, word1);
+                try self.bindLocal(name, record, cap_ty);
             } else {
-                _ = try self.ctx.buildRet(try self.ctx.buildIntConst(self.i64_ty, 0));
+                const captured = try self.ctx.buildLoad(self.i64_ty, slot_addr);
+                const slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
+                _ = try self.ctx.buildStore(self.i64_ty, slot, captured);
+                try self.bindLocal(name, slot, cap_ty);
             }
+            offset += self.envFieldSize(cap_ty);
+        }
+
+        const body = cl.body;
+        const ret_ty = self.type_pool.get(self.exprType(closure_node)).function.return_type;
+        if (self.arena.get(body).* == .block) {
+            try self.lowerStmt(body);
+        } else {
+            // Expression-body shorthand: the body's value is the return value.
+            const val = try self.lowerExpr(body);
+            if (!self.block_terminated) {
+                if (self.type_pool.get(ret_ty) == .void) {
+                    _ = try self.ctx.buildRetVoid();
+                } else {
+                    _ = try self.ctx.buildRet(val);
+                }
+                self.terminated();
+            }
+        }
+        if (!self.block_terminated) {
+            try self.defaultRet(ret_ty);
         }
     }
 
@@ -726,10 +827,7 @@ pub const Lowerer = struct {
             .null_literal => return self.ctx.buildIntConst(self.i64_ty, 0),
             .char_literal => |ref| return self.lowerChar(ref),
             .string_literal => |ref| return self.lowerString(ref),
-            .fn_ref => {
-                self.codegenError(node_idx, "a fn value is not lowered yet", .{});
-                return self.ctx.buildIntConst(self.i64_ty, 0);
-            },
+            .fn_ref => |id| return self.lowerFnRef(node_idx, id),
             .identifier => |id| {
                 const name = self.nameSlice(id);
                 if (ast.findEnumVariant(self.arena, self.source, self.checker.module_node, name)) |vi| {
@@ -752,6 +850,8 @@ pub const Lowerer = struct {
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
             .paren_expr => |p| return self.lowerExpr(p),
+            .closure => |cl| return self.lowerClosure(node_idx, cl),
+            .pipeline => |p| return self.lowerPipeline(node_idx, p),
             .struct_init => |si| return self.lowerStructInit(node_idx, si),
             .range_expr => {
                 self.codegenError(node_idx, "range expression outside of a for loop", .{});
@@ -1066,19 +1166,39 @@ pub const Lowerer = struct {
     }
 
     fn lowerCall(self: *Lowerer, node_idx: NodeIdx, c: anytype) !api.Value {
-        const callee = self.arena.get(c.func);
+        return self.lowerCallPiped(node_idx, c.func, c.args.indices, null, null);
+    }
+
+    /// Lower a call, optionally with a piped value (R30): `piped` replaces the
+    /// `_` hole at `hole`, or is prepended as argument 0 when there is no hole.
+    fn lowerCallPiped(
+        self: *Lowerer,
+        node_idx: NodeIdx,
+        func: NodeIdx,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !api.Value {
+        const callee = self.arena.get(func);
         switch (callee.*) {
             .identifier => |id| {
                 const name = self.nameSlice(id);
                 if (ast.findEnumVariant(self.arena, self.source, self.checker.module_node, name)) |vi| {
-                    return self.lowerVariantInit(vi, c);
+                    var vals = try self.lowerArgs(args, piped, hole);
+                    defer vals.deinit(self.gpa);
+                    return self.lowerVariantInitValues(vi, vals.items);
+                }
+                // A local or parameter shadows any module-level name; it holds
+                // a fn value, so the call goes through the record.
+                if (self.locals.get(name) != null or self.params.get(name) != null) {
+                    return self.lowerCallIndirect(node_idx, func, args, piped, hole);
                 }
                 const sym = self.checker.scopes.scopes.items[0].symbols.get(name) orelse {
                     self.codegenError(node_idx, "unknown function '{s}'", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
                 };
                 if (sym.kind == .prelude_fn) {
-                    return self.lowerPreludeCall(node_idx, sym, c);
+                    return self.lowerPreludeCall(node_idx, sym, args, piped, hole);
                 }
                 if (sym.kind != .function) {
                     self.codegenError(node_idx, "'{s}' is not a function", .{name});
@@ -1089,21 +1209,148 @@ pub const Lowerer = struct {
                     return self.ctx.buildIntConst(self.i64_ty, 0);
                 };
                 const ret_ir = self.irTypeFor(self.checker.nodeType(sym.decl_node));
-                var args = try self.lowerArgs(c.args);
-                defer args.deinit(self.gpa);
-                return self.ctx.buildCall(fidx, ret_ir, args.items);
+                var vals = try self.lowerArgs(args, piped, hole);
+                defer vals.deinit(self.gpa);
+                // R14a: the callee carries a hidden env parameter; a direct
+                // named call passes a null env. `main` is exempt (R15).
+                if (!std.mem.eql(u8, name, "main")) {
+                    const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+                    try vals.insert(self.gpa, 0, null_env);
+                }
+                return self.ctx.buildCall(fidx, ret_ir, vals.items);
             },
-            .field_access => |fa| {
+            .field_access => {
+                // A struct field of fn type is an ordinary fn value; anything
+                // else that reached here as a callee is old method syntax.
+                const sem = self.type_pool.get(self.exprType(func));
+                if (sem == .function) return self.lowerCallIndirect(node_idx, func, args, piped, hole);
+                const fa = self.arena.get(func).field_access;
                 self.codegenError(node_idx, "there are no methods; call the free function, or the fn value held in '{s}'", .{
                     self.nameSlice(fa.field),
                 });
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
-            else => {
-                self.codegenError(node_idx, "unsupported callee", .{});
-                return self.ctx.buildIntConst(self.i64_ty, 0);
-            },
+            else => return self.lowerCallIndirect(node_idx, func, args, piped, hole),
         }
+    }
+
+    /// Lower a call through a fn value: the callee expression is a `{ fn_ptr,
+    /// env_ptr }` record and the call goes through `call_ptr`, which marshals
+    /// the record's env as the callee's hidden argument 0 (R14b/R16c). This
+    /// covers a local holding a closure, a curried `f(x)(y)`, a fn value in a
+    /// struct field, and a pipeline into a bare fn value.
+    fn lowerCallIndirect(
+        self: *Lowerer,
+        node_idx: NodeIdx,
+        func: NodeIdx,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !api.Value {
+        const callee_ty = self.exprType(func);
+        const sem = self.type_pool.get(callee_ty);
+        if (sem != .function) {
+            self.codegenError(node_idx, "callee is not a function value", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const callee = try self.lowerExpr(func);
+        var vals = try self.lowerArgs(args, piped, hole);
+        defer vals.deinit(self.gpa);
+        const ret_ir = self.irTypeFor(sem.function.return_type);
+        return self.ctx.buildCallPtr(ret_ir, callee, vals.items);
+    }
+
+    /// Lower a bare function name in value position (the resolver rewrote it
+    /// to `fn_ref`): pair the function's address with a null env into a fn
+    /// value (R3a — non-capturing callees ignore the env slot, R14).
+    fn lowerFnRef(self: *Lowerer, node_idx: NodeIdx, id: StringRef) !api.Value {
+        const name = self.nameSlice(id);
+        const sym = self.checker.scopes.scopes.items[0].symbols.get(name) orelse {
+            self.codegenError(node_idx, "unknown function '{s}'", .{name});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        };
+        if (sym.kind != .function) {
+            self.codegenError(node_idx, "'{s}' is not a function", .{name});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const fidx = self.fn_by_node.get(sym.decl_node) orelse {
+            self.codegenError(node_idx, "function '{s}' has no lowering", .{name});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        };
+        const fv_ty = try self.fnValueTypeForDecl(sym.decl_node);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, fidx);
+        const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+        return self.ctx.buildFnValue(fv_ty, fn_addr, null_env);
+    }
+
+    /// Lower a closure literal: lift its body into a module-level IR function
+    /// with the uniform env-first ABI (visible params at slots 1..n, env at
+    /// slot 0), copy the captured set by value into a stack env record at the
+    /// literal's site, and pair the lifted callee's address with the record
+    /// (docs/semantics.md §5.2, §6.2). An empty capture set produces no record
+    /// and pairs with a null env (R8b).
+    fn lowerClosure(self: *Lowerer, node_idx: NodeIdx, cl: anytype) !api.Value {
+        const fn_sem = self.type_pool.get(self.exprType(node_idx));
+        if (fn_sem != .function) {
+            self.codegenError(node_idx, "closure without a function type", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const fv_ty = try self.fnValueTypeForFn(fn_sem);
+        const ret_ir = self.irTypeFor(fn_sem.function.return_type);
+
+        // Lift the body into its own function; pass 2 lowers it after the
+        // current body (the all_functions list is walked by index).
+        const name = try std.fmt.allocPrint(self.gpa, "closure_{d}", .{self.closure_counter});
+        defer self.gpa.free(name);
+        self.closure_counter += 1;
+        const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(cl.params.indices.len)) + 1);
+        try self.lifted.put(self.gpa, fidx, node_idx);
+        try self.all_functions.append(self.gpa, .{ .node = node_idx, .idx = fidx });
+
+        // Env record: one slot per capture, each copied by value at the site
+        // (R8c). A fn-value capture stores its two words inline (R16d).
+        var fields = std.ArrayList(api.EnvField).empty;
+        defer fields.deinit(self.gpa);
+        for (cl.env.indices) |decl_idx| {
+            const cap_ty = try self.captureType(decl_idx);
+            try fields.append(self.gpa, .{
+                .type_idx = try self.fieldIrType(cap_ty),
+                .value = try self.captureValue(decl_idx),
+            });
+        }
+        const env = try self.ctx.buildEnvRecord(fields.items);
+        const env_ptr = if (env == .none) try self.ctx.buildIntConst(self.i64_ty, 0) else env;
+
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, fidx);
+        return self.ctx.buildFnValue(fv_ty, fn_addr, env_ptr);
+    }
+
+    /// Lower `lhs |> rhs` (R30): the piped value is the callee's argument 0
+    /// (or replaces the single `_` hole). A bare-fn rhs is an ordinary call
+    /// with one argument, so named fns stay direct calls and fn values go
+    /// through `call_ptr`.
+    fn lowerPipeline(self: *Lowerer, node_idx: NodeIdx, p: anytype) !api.Value {
+        const rhs = self.arena.get(p.rhs);
+        if (rhs.* == .call) {
+            const c = rhs.call;
+            var hole: ?usize = null;
+            for (c.args.indices, 0..) |arg_idx, i| {
+                if (self.isHole(arg_idx)) {
+                    hole = i;
+                    break;
+                }
+            }
+            return self.lowerCallPiped(node_idx, c.func, c.args.indices, p.lhs, hole);
+        }
+        // Bare callee (named fn, fn value, closure, or enum variant): the
+        // piped value is its single argument.
+        return self.lowerCallPiped(node_idx, p.rhs, &.{}, p.lhs, null);
+    }
+
+    /// `_` in a piped call's argument list (R30a).
+    fn isHole(self: *Lowerer, node_idx: NodeIdx) bool {
+        const node = self.arena.get(node_idx);
+        return node.* == .identifier and std.mem.eql(u8, self.nameSlice(node.identifier), "_");
     }
 
     /// Lower a prelude call to a direct extern call into the runtime.
@@ -1113,8 +1360,16 @@ pub const Lowerer = struct {
     /// the linker resolves it against `libs/std`. Arguments are already IR
     /// values in the platform ABI, so a `String` argument arrives as the
     /// pointer `lowerString` built — exactly what the runtime's `*const String`
-    /// parameter expects, with no marshalling in between.
-    fn lowerPreludeCall(self: *Lowerer, node_idx: NodeIdx, sym: scope_mod.Symbol, c: anytype) !api.Value {
+    /// parameter expects, with no marshalling in between. Extern C calls keep
+    /// the plain C ABI: no hidden env parameter (R17).
+    fn lowerPreludeCall(
+        self: *Lowerer,
+        node_idx: NodeIdx,
+        sym: scope_mod.Symbol,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !api.Value {
         if (sym.prelude.index >= prelude.roster.len) {
             self.codegenError(node_idx, "prelude function '{s}' is not in the roster", .{
                 sym.displayName(self.source),
@@ -1123,33 +1378,60 @@ pub const Lowerer = struct {
         }
         const entry = prelude.roster[sym.prelude.index];
 
-        var args = try self.lowerArgs(c.args);
-        defer args.deinit(self.gpa);
-        return self.ctx.buildExternCall(entry.symbol, self.void_ty, args.items);
+        var vals = try self.lowerArgs(args, piped, hole);
+        defer vals.deinit(self.gpa);
+        return self.ctx.buildExternCall(entry.symbol, self.void_ty, vals.items);
     }
 
     /// Lower an enum variant constructor (`Some(x)`): stack block with the
     /// variant index in slot 0 and payloads after it.
     fn lowerVariantInit(self: *Lowerer, vi: ast.EnumVariantInfo, c: anytype) !api.Value {
+        var vals = try self.lowerArgs(c.args.indices, null, null);
+        defer vals.deinit(self.gpa);
+        return self.lowerVariantInitValues(vi, vals.items);
+    }
+
+    /// Lower an enum variant constructor from already-lowered payload values.
+    fn lowerVariantInitValues(self: *Lowerer, vi: ast.EnumVariantInfo, values: []const api.Value) !api.Value {
         const variant = self.arena.get(vi.variant_node);
         const payload_count = variant.enum_variant.fields.indices.len;
         const block = try self.ctx.buildAllocaBytes(self.ptr_ty, enumSizeFor(payload_count));
         _ = try self.ctx.buildStore(self.i64_ty, block, try self.ctx.buildIntConst(self.i64_ty, @intCast(vi.index)));
-        for (c.args.indices, 0..) |arg_idx, i| {
-            const val = try self.lowerExpr(arg_idx);
+        for (values, 0..) |val, i| {
             const addr = try self.ctx.buildPtrAdd(self.ptr_ty, block, try self.ctx.buildIntConst(self.i64_ty, @intCast(enumPayloadOffset(i))));
             _ = try self.ctx.buildStore(self.i64_ty, addr, val);
         }
         return block;
     }
 
-    fn lowerArgs(self: *Lowerer, list: NodeList) !std.ArrayList(api.Value) {
-        var args = std.ArrayList(api.Value).empty;
-        errdefer args.deinit(self.gpa);
-        for (list.indices) |arg_idx| {
-            try args.append(self.gpa, try self.lowerExpr(arg_idx));
+    /// Lower an argument list, threading a piped value through it (R30):
+    /// `piped` replaces the `_` hole at index `hole`, or is prepended as
+    /// argument 0 when there is no hole.
+    fn lowerArgs(
+        self: *Lowerer,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !std.ArrayList(api.Value) {
+        var vals = std.ArrayList(api.Value).empty;
+        errdefer vals.deinit(self.gpa);
+        if (piped) |p| {
+            if (hole) |h| {
+                for (args, 0..) |arg_idx, i| {
+                    try vals.append(self.gpa, if (i == h) try self.lowerExpr(p) else try self.lowerExpr(arg_idx));
+                }
+            } else {
+                try vals.append(self.gpa, try self.lowerExpr(p));
+                for (args) |arg_idx| {
+                    try vals.append(self.gpa, try self.lowerExpr(arg_idx));
+                }
+            }
+        } else {
+            for (args) |arg_idx| {
+                try vals.append(self.gpa, try self.lowerExpr(arg_idx));
+            }
         }
-        return args;
+        return vals;
     }
 
     fn lowerStructInit(self: *Lowerer, node_idx: NodeIdx, si: anytype) !api.Value {
@@ -1291,6 +1573,87 @@ pub const Lowerer = struct {
             }
         }
         return self.checker.nodeType(ty_node);
+    }
+
+    /// Semantic type of a captured binding. Capture lists hold the *binder*
+    /// declaration nodes (a `param` or a `let_stmt`), and the checker records
+    /// each binder's type on its own node (R7/R8).
+    fn captureType(self: *Lowerer, decl_idx: NodeIdx) !TypeIdx {
+        const node = self.arena.get(decl_idx);
+        switch (node.*) {
+            .param, .let_stmt => {},
+            else => {
+                self.codegenError(decl_idx, "captured binding is not a parameter or local", .{});
+                return self.checker.void_ty;
+            },
+        }
+        return self.checker.nodeType(decl_idx);
+    }
+
+    /// Name of a captured binding, from its binder declaration node.
+    fn captureName(self: *Lowerer, decl_idx: NodeIdx) []const u8 {
+        const node = self.arena.get(decl_idx);
+        return switch (node.*) {
+            .param => |p| self.nameSlice(p.name),
+            .let_stmt => |l| self.nameSlice(l.name),
+            else => "_",
+        };
+    }
+
+    /// Current value of a captured binding at a closure literal's site: a
+    /// local's slot is loaded (capture by value, R8c), a parameter is already
+    /// an SSA value. A fn-value binding is itself a `{ fn_ptr, env_ptr }`
+    /// record address; `buildEnvRecord` copies its two words inline (R16d).
+    fn captureValue(self: *Lowerer, decl_idx: NodeIdx) !api.Value {
+        const name = self.captureName(decl_idx);
+        if (self.locals.get(name)) |binding| {
+            return self.ctx.buildLoad(self.i64_ty, binding.value);
+        }
+        if (self.params.get(name)) |param| {
+            return param.value;
+        }
+        self.codegenError(decl_idx, "captured binding '{s}' has no slot in this frame", .{name});
+        return self.ctx.buildIntConst(self.i64_ty, 0);
+    }
+
+    /// IR type for one slot of a closure env record: fn values are their
+    /// 16-byte record type, everything else the ordinary one-slot type.
+    fn fieldIrType(self: *Lowerer, ty: TypeIdx) !api.TypeIdx {
+        const sem = self.type_pool.get(ty);
+        if (sem == .function) return self.fnValueTypeForFn(sem);
+        return self.irTypeForSem(sem);
+    }
+
+    /// Byte size of one capture slot in an env record: one 8-byte slot per
+    /// value, or the inline 16-byte `{ fn_ptr, env_ptr }` record for a fn
+    /// value (docs/semantics.md §5.2 R8a, §6.4 R16d).
+    fn envFieldSize(self: *Lowerer, ty: TypeIdx) u64 {
+        return if (self.type_pool.get(ty) == .function) api.fn_value_size else 8;
+    }
+
+    /// IR `function_value` type for a semantic `function` type.
+    fn fnValueTypeForFn(self: *Lowerer, sem: SemType) !api.TypeIdx {
+        const f = sem.function;
+        var params = std.ArrayList(api.TypeIdx).empty;
+        defer params.deinit(self.gpa);
+        for (f.param_types) |pt| {
+            try params.append(self.gpa, self.irTypeFor(pt));
+        }
+        const sig = try self.ctx.funcType(self.irTypeFor(f.return_type), params.items);
+        return self.ctx.fnValueType(sig);
+    }
+
+    /// IR `function_value` type for a declared function: its visible
+    /// signature (params + return), without the hidden env parameter (R14).
+    fn fnValueTypeForDecl(self: *Lowerer, decl_idx: NodeIdx) !api.TypeIdx {
+        const f = self.arena.get(decl_idx).fn_decl;
+        var params = std.ArrayList(api.TypeIdx).empty;
+        defer params.deinit(self.gpa);
+        for (f.params.indices) |param_idx| {
+            try params.append(self.gpa, self.irTypeFor(try self.paramType(self.arena.get(param_idx).param.ty)));
+        }
+        const sig = try self.ctx.funcType(self.irTypeFor(self.checker.nodeType(decl_idx)), params.items);
+        return self.ctx.fnValueType(sig);
     }
 
     /// Semantic type of a local/param binding by name, if any.
@@ -1502,7 +1865,10 @@ test "lower: arithmetic and calls" {
 
     var buf: [8192]u8 = undefined;
     const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "add %0, %1") != null);
+    // R14: `add` takes a hidden env parameter first, so its visible params
+    // occupy slots 1 and 2.
+    try std.testing.expect(std.mem.indexOf(u8, text, "add %1, %2") != null);
+    // The call site primes the hidden env argument with a null env.
     try std.testing.expect(std.mem.indexOf(u8, text, "call @fn0(%") != null);
 }
 
@@ -1534,8 +1900,8 @@ test "lower: expression-body fn shorthand returns its value" {
 
     var buf: [8192]u8 = undefined;
     const text = res.text(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "mul %0, %1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ret %2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mul %1, %2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "call @fn0(%") != null);
 }
 
@@ -1899,8 +2265,8 @@ test "lower: interface method call no longer parses" {
     try std.testing.expect(res.diagnostics.hasErrors());
 }
 
-test "lower: a fn value is not lowered yet" {
-    var res = try runLower(std.testing.allocator,
+test "lower: a named fn used as a value becomes a fn value" {
+    var res = try checkLower(std.testing.allocator,
         \\fn inc(x: i32) -> i32 {
         \\    return x + 1
         \\}
@@ -1910,16 +2276,176 @@ test "lower: a fn value is not lowered yet" {
         \\}
     );
     defer res.deinit();
-    try std.testing.expect(res.diagnostics.hasErrors());
-    var reported_unlowered = false;
-    for (res.diagnostics.items.items) |item| {
-        if (item.phase == .codegen and
-            std.mem.indexOf(u8, item.message, "not lowered") != null)
-        {
-            reported_unlowered = true;
-        }
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // A named fn lowered as a value pairs its address with a null env (R14).
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "iconst 0") != null);
+    // Calling through the local is indirect: no direct `call @fn0` remains.
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
+}
+
+test "lower: closure literal lifts to a function and is called indirectly" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let inc = |x| x + 1
+        \\    return inc(5)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The literal lifts to a module-level `closure_0` with an env-first ABI
+    // (R14): its visible param is slot 1.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "add %1,") != null);
+    // The fn value pairs the address with a null env; the call goes indirect.
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %") != null);
+    // No capture set: the env slot is still primed with a null env (there is
+    // no second `alloca` for an env record).
+    try std.testing.expect(std.mem.indexOf(u8, text, "iconst 0") != null);
+}
+
+test "lower: a lifted closure body has exactly one return terminator" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let inc = |x| x + 1
+        \\    return inc(5)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // Isolate the lifted function and count its return terminators: an
+    // expression-body closure must not emit its own `ret` and then fall
+    // through to the default `ret` in the same block.
+    const start = std.mem.indexOf(u8, text, "fn @closure_0()").?;
+    const rest = text[start..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n").?;
+    const body = rest[0..end];
+    var rets: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "ret ")) |pos| {
+        rets += 1;
+        idx = pos + 4;
     }
-    try std.testing.expect(reported_unlowered);
+    try std.testing.expectEqual(@as(usize, 1), rets);
+}
+
+test "lower: closure capturing a local copies it into an env record" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let n = 10
+        \\    let add = |x| x + n
+        \\    return add(5)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // One 8-byte capture => an 8-byte env record whose bytes are copied from
+    // the captured local, then stored into the fn value's env slot (R16).
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    // The lifted body reads its capture back out of the env (slot 0) and
+    // binds it to a fresh slot.
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %") != null);
+}
+
+test "lower: closure capturing a parameter works in a non-main function" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn outer(n: i32) -> i32 {
+        \\    let inner = |x| x * n
+        \\    return inner(3)
+        \\}
+        \\fn main() -> i32 {
+        \\    return outer(4)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @outer()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    // The capture is copied out of a stack slot (`n` at slot 1) into the env.
+    try std.testing.expect(std.mem.indexOf(u8, text, "store %3, %1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mul %1,") != null);
+    // `main` calls `outer` directly with a null env followed by the argument.
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @fn0(%1, %0)") != null);
+}
+
+test "lower: a closure nested inside a closure lifts to its own function" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let mk = || |x| x + 1
+        \\    let f = mk()
+        \\    return f(5)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // Both literals become module-level functions; the outer returns the inner
+    // as a 16-byte fn value (R16d).
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_1()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %") != null);
+}
+
+test "lower: pipeline feeds a value into a closure" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let f = |x| x + 1
+        \\    return 2 |> f
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The piped value is prepended as argument 0 to the indirect call.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %9(%10)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "iconst 2") != null);
+}
+
+test "lower: `?` inside a closure body branches out of the lifted function" {
+    var res = try checkLower(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(i32)
+        \\}
+        \\fn get() -> Res {
+        \\    return Ok(1)
+        \\}
+        \\fn main() -> Res {
+        \\    let unwrap = |r: Res| {
+        \\        let v = r?
+        \\        return Ok(v)
+        \\    }
+        \\    return unwrap(get())
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The closure lifts; its `?` lowers to a compare + conditional branch +
+    // `ret` on the taken path, all inside `closure_0`.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "icmp eq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cond_br") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %") != null);
 }
 
 test "lower: `?` branches to an early return on the error variant" {
