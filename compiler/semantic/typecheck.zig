@@ -1042,7 +1042,15 @@ pub const TypeChecker = struct {
                     self.typeName(body_ty), self.typeName(ret_ty),
                 });
             }
-        } else if (!body_is_block and !self.typesEqual(ret_ty, body_ty)) {
+        } else if (!body_is_block and !self.typesEqual(ret_ty, body_ty) and
+            !self.tailPropagatesTo(ret_ty, cl.body))
+        {
+            // The return type here was fixed before the body was typed (a
+            // `let` annotation or a contextual fn type). A tail `?` on that
+            // very enum is exempt from the body/return equality: its error
+            // path already returns the enum and its success payload is the
+            // implicit return value, re-wrapped into the enum when lowered
+            // (R27a/R28) — the closure does not drop the propagated enum.
             self.errorAt(expr_idx, "closure body has type '{s}' but is expected to return '{s}'", .{
                 self.typeName(body_ty), self.typeName(ret_ty),
             });
@@ -1065,6 +1073,24 @@ pub const TypeChecker = struct {
 
         self.arena.set(expr_idx, .{ .closure = .{ .params = cl.params, .body = cl.body, .env = env } });
         return self.functionType(param_types, ret_ty);
+    }
+
+    /// Whether `body` is a tail `x?` propagating the same enum declaration
+    /// `ret_ty` returns. The propagate expression has the success payload's
+    /// type while the closure returns the enum itself, so when the return
+    /// type was already fixed before the body was typed the usual body/return
+    /// equality does not apply: the error path of `?` returns the enum and
+    /// the success payload is re-wrapped into it when lowered (R27a/R28).
+    fn tailPropagatesTo(self: *TypeChecker, ret_ty: TypeIdx, body: NodeIdx) bool {
+        const node = self.arena.get(body);
+        if (node.* != .try_propagate) return false;
+        const sem = self.type_pool.get(self.getNodeType(node.try_propagate));
+        const enum_node = switch (sem) {
+            .enum_type => |n| n,
+            .applied_enum => |a| a.decl,
+            else => return false,
+        };
+        return self.isEnumDecl(ret_ty, enum_node);
     }
 
     /// Walk a closure body and return the env `NodeList` of captured binding
@@ -2862,6 +2888,74 @@ test "typecheck: an expression-bodied closure cannot drop the propagated enum" {
         \\}
         \\fn main() -> i32 {
         \\    let f = |r: Result[i32, String]| r?
+        \\    return 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "closure body has type"));
+}
+
+test "typecheck: a tail `?` in an expression-bodied closure with a fixed return type" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(String)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f: fn(Res) -> Res = |r| r?
+        \\    return 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: a tail `?` with an annotated parameter under a fixed return type" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(String)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f: fn(Res) -> Res = |r: Res| r?
+        \\    return 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: a contextual closure accepts a tail `?`" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(String)
+        \\}
+        \\fn apply(g: fn(Res) -> Res) -> i32 {
+        \\    return 1
+        \\}
+        \\fn main() -> i32 {
+        \\    let a = apply(|r: Res| r?)
+        \\    return a
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: a tail `?` against a different return enum still errors" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(String)
+        \\}
+        \\enum Other {
+        \\    Ok(i32)
+        \\    Err(String)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f: fn(Res) -> Other = |r| r?
         \\    return 1
         \\}
     );

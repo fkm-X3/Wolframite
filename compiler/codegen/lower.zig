@@ -301,6 +301,15 @@ pub const Lowerer = struct {
             if (!self.block_terminated) {
                 if (self.type_pool.get(ret_ty) == .void) {
                     _ = try self.ctx.buildRetVoid();
+                } else if (self.tailPropagateVariant(body, ret_ty)) |svi| {
+                    // A tail `?` whose propagated enum is the closure's
+                    // return type (the checker accepts this only then): the
+                    // propagate expression's value is the success payload,
+                    // so the implicit return re-wraps it into the return
+                    // enum's success variant. The error path of `?` already
+                    // returned the rebuilt enum itself.
+                    const wrapped = try self.lowerVariantInitValues(svi, &.{val});
+                    _ = try self.ctx.buildRet(wrapped);
                 } else {
                     _ = try self.ctx.buildRet(val);
                 }
@@ -310,6 +319,29 @@ pub const Lowerer = struct {
         if (!self.block_terminated) {
             try self.defaultRet(ret_ty);
         }
+    }
+
+    /// The success variant of `ret_ty` when `body` is a tail `x?` propagating
+    /// that very enum, else null. The checker pairs a tail propagate
+    /// expression with the closure's return type at type time (R27a), so the
+    /// success payload is re-wrapped into this variant to form the implicit
+    /// return of an expression-bodied closure.
+    fn tailPropagateVariant(self: *Lowerer, body: NodeIdx, ret_ty: TypeIdx) ?ast.EnumVariantInfo {
+        const node = self.arena.get(body);
+        if (node.* != .try_propagate) return null;
+        const sem = self.type_pool.get(ret_ty);
+        const enum_node = switch (sem) {
+            .enum_type => |n| n,
+            .applied_enum => |a| a.decl,
+            else => return null,
+        };
+        const shape = self.checker.propagateShape(enum_node) orelse return null;
+        const variants = self.arena.get(enum_node).enum_decl.variants.indices;
+        return .{
+            .enum_decl = enum_node,
+            .variant_node = variants[shape.success_index],
+            .index = shape.success_index,
+        };
     }
 
     // ========================================================================
@@ -2496,4 +2528,44 @@ test "lower: `?` rebuilds the error variant from its payload" {
     try std.testing.expect(std.mem.indexOf(u8, text, "icmp eq") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+}
+
+test "lower: a tail `?` closure re-wraps the payload into the return enum" {
+    var res = try checkLower(std.testing.allocator,
+        \\enum Res {
+        \\    Ok(i32)
+        \\    Err(i32)
+        \\}
+        \\fn main() -> i32 {
+        \\    let f: fn(Res) -> Res = |r| r?
+        \\    return 1
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // Isolate the lifted function. Its error path rebuilds the enum and
+    // returns it; its success path re-wraps the payload — two 16-byte
+    // enum blocks and exactly two `ret` terminators, one per path, with no
+    // fallthrough to the default return.
+    const start = std.mem.indexOf(u8, text, "fn @closure_0()").?;
+    const rest = text[start..];
+    const end = std.mem.indexOf(u8, rest, "\n}\n").?;
+    const body = rest[0..end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "icmp eq") != null);
+    var allocas: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "alloca 16")) |pos| {
+        allocas += 1;
+        idx = pos + 9;
+    }
+    try std.testing.expectEqual(@as(usize, 2), allocas);
+    var rets: usize = 0;
+    idx = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "ret ")) |pos| {
+        rets += 1;
+        idx = pos + 4;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rets);
 }
