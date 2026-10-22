@@ -2660,9 +2660,10 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// Type a prelude call against its roster signature. A prelude entry has no
-    /// AST declaration, so arity and argument types are read off the roster row.
-    /// `piped`/`hole` carry pipeline desugaring (R30) for `x |> print(...)`.
+    /// Type a prelude call. An IO entry is checked against its roster
+    /// signature; a composition entry is generic, so its result type is
+    /// derived from the operands (R31). `piped`/`hole` carry pipeline
+    /// desugaring (R30) for `x |> print(...)` and `x |> id`.
     fn checkPreludeCall(
         self: *TypeChecker,
         node_idx: NodeIdx,
@@ -2678,6 +2679,23 @@ pub const TypeChecker = struct {
             return self.void_ty;
         }
         const entry = prelude.roster[sym.prelude.index];
+        return switch (entry.kind) {
+            .io => self.checkIoPreludeCall(node_idx, entry, args, piped, hole),
+            .composition => self.checkCompositionCall(node_idx, entry, args, piped, hole),
+        };
+    }
+
+    /// Type a prelude call against its roster signature. A prelude entry has no
+    /// AST declaration, so arity and argument types are read off the roster row.
+    /// `piped`/`hole` carry pipeline desugaring (R30) for `x |> print(...)`.
+    fn checkIoPreludeCall(
+        self: *TypeChecker,
+        node_idx: NodeIdx,
+        entry: prelude.PreludeFn,
+        args: NodeList,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) TypeIdx {
         const name = entry.name;
 
         const effective = args.indices.len + (if (piped != null and hole == null) @as(usize, 1) else 0);
@@ -2741,6 +2759,191 @@ pub const TypeChecker = struct {
     }
 
     // ========================================================================
+    // Composition prelude (R31)
+    // ========================================================================
+
+    /// Type a composition prelude call (R31).
+    ///
+    /// The five composition entries are generic: their result type is derived
+    /// from the operand types rather than read off the roster, and their
+    /// bodies are source expansions the lowerer materializes.
+    ///
+    /// | call | expansion |
+    /// |---|---|
+    /// | `id(x)` | `x` |
+    /// | `pipe(x, f)` | `f(x)` |
+    /// | `compose(f, g)(x)` | `f(g(x))` |
+    /// | `curry(f)(a)(b)` | `f(a, b)` |
+    /// | `uncurry(h)(a, b)` | `h(a)(b)` |
+    fn checkCompositionCall(
+        self: *TypeChecker,
+        node_idx: NodeIdx,
+        entry: prelude.PreludeFn,
+        args: NodeList,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) TypeIdx {
+        const shape = entry.shape orelse return self.void_ty;
+        const name = entry.name;
+
+        // The effective argument list: the piped value replaces the `_` hole
+        // (R30a) or is prepended as argument 0 (R30b).
+        const total = args.indices.len + (if (piped != null and hole == null) @as(usize, 1) else 0);
+        var buf: [8]NodeIdx = undefined;
+        if (total > buf.len) {
+            // Every composition entry is at most 2-ary; reject before filling
+            // the buffer so an oversized call cannot overflow it.
+            self.errorAt(node_idx, "'{s}' takes at most 2 arguments, got {d}", .{ name, total });
+            for (args.indices) |arg| _ = self.inferExprType(arg);
+            if (piped) |p| _ = self.inferExprType(p);
+            return self.void_ty;
+        }
+        var n: usize = 0;
+        if (piped) |p| {
+            if (hole) |h| {
+                for (args.indices, 0..) |arg, i| {
+                    buf[n] = if (i == h) p else arg;
+                    n += 1;
+                }
+            } else {
+                buf[n] = p;
+                n += 1;
+                for (args.indices) |arg| {
+                    buf[n] = arg;
+                    n += 1;
+                }
+            }
+        } else {
+            for (args.indices) |arg| {
+                buf[n] = arg;
+                n += 1;
+            }
+        }
+        const effective = buf[0..n];
+
+        const arity: usize = switch (shape) {
+            .id => 1,
+            .pipe => 2,
+            .compose => 2,
+            .curry => 1,
+            .uncurry => 1,
+        };
+        if (n != arity) {
+            self.errorAt(node_idx, "'{s}' takes {d} argument(s), got {d}", .{ name, arity, n });
+            for (effective) |arg| _ = self.inferExprType(arg);
+            return self.void_ty;
+        }
+
+        return switch (shape) {
+            .id => self.inferExprType(effective[0]),
+            .pipe => self.checkPipeComposition(node_idx, name, effective[0], effective[1]),
+            .compose => self.checkComposeComposition(node_idx, name, effective[0], effective[1]),
+            .curry => self.checkCurryComposition(node_idx, name, effective[0]),
+            .uncurry => self.checkUncurryComposition(node_idx, name, effective[0]),
+        };
+    }
+
+    /// `pipe(x, f)` ≡ `f(x)` (R31a): `f` takes one argument and `x` has that
+    /// argument's type. The result is `f`'s return type.
+    fn checkPipeComposition(self: *TypeChecker, node_idx: NodeIdx, name: []const u8, x: NodeIdx, f: NodeIdx) TypeIdx {
+        const f_ty = self.inferExprType(f);
+        const f_sem = self.type_pool.get(f_ty);
+        if (f_sem != .function) {
+            self.errorAt(node_idx, "'{s}' expects a function, got '{s}'", .{ name, self.typeName(f_ty) });
+            _ = self.inferExprType(x);
+            return self.void_ty;
+        }
+        if (f_sem.function.param_types.len != 1) {
+            self.errorAt(node_idx, "'{s}' expects a function of one argument", .{name});
+            _ = self.inferExprType(x);
+            return self.void_ty;
+        }
+        const want = f_sem.function.param_types[0];
+        const got = self.inferExprType(x);
+        if (!self.typesEqual(want, got)) {
+            self.errorAt(node_idx, "argument 1 expects '{s}' but got '{s}'", .{
+                self.typeName(want), self.typeName(got),
+            });
+        }
+        return f_sem.function.return_type;
+    }
+
+    /// `compose(f, g)` ≡ `|x| f(g(x))` (R31a): right-to-left and exactly
+    /// 2-ary. `g` takes one argument and `f` takes `g`'s result. The result
+    /// type is `fn(A) -> C`.
+    fn checkComposeComposition(self: *TypeChecker, node_idx: NodeIdx, name: []const u8, f: NodeIdx, g: NodeIdx) TypeIdx {
+        const f_ty = self.inferExprType(f);
+        const f_sem = self.type_pool.get(f_ty);
+        const g_ty = self.inferExprType(g);
+        const g_sem = self.type_pool.get(g_ty);
+        if (f_sem != .function or g_sem != .function) {
+            self.errorAt(node_idx, "'{s}' expects two functions", .{name});
+            return self.void_ty;
+        }
+        if (f_sem.function.param_types.len != 1 or g_sem.function.param_types.len != 1) {
+            self.errorAt(node_idx, "'{s}' expects functions of one argument", .{name});
+            return self.void_ty;
+        }
+        const a = g_sem.function.param_types[0];
+        const b = g_sem.function.return_type;
+        const c = f_sem.function.return_type;
+        const want = f_sem.function.param_types[0];
+        if (!self.typesEqual(want, b)) {
+            self.errorAt(node_idx, "argument 1 expects '{s}' but got '{s}'", .{
+                self.typeName(want), self.typeName(b),
+            });
+        }
+        return self.functionType(&.{a}, c);
+    }
+
+    /// `curry(f)` ≡ `|a| |b| f(a, b)` (R31a): front-to-left and exactly
+    /// 2-ary. `f` takes two arguments. The result type is
+    /// `fn(A) -> fn(B) -> R`.
+    fn checkCurryComposition(self: *TypeChecker, node_idx: NodeIdx, name: []const u8, f: NodeIdx) TypeIdx {
+        const f_ty = self.inferExprType(f);
+        const f_sem = self.type_pool.get(f_ty);
+        if (f_sem != .function) {
+            self.errorAt(node_idx, "'{s}' expects a function, got '{s}'", .{ name, self.typeName(f_ty) });
+            return self.void_ty;
+        }
+        if (f_sem.function.param_types.len != 2) {
+            self.errorAt(node_idx, "'{s}' expects a function of two arguments", .{name});
+            return self.void_ty;
+        }
+        const a = f_sem.function.param_types[0];
+        const b = f_sem.function.param_types[1];
+        const r = f_sem.function.return_type;
+        return self.functionType(&.{a}, self.functionType(&.{b}, r));
+    }
+
+    /// `uncurry(h)` ≡ `|a, b| h(a)(b)` (R31a): exactly 2-ary. `h` takes one
+    /// argument and returns a function. The result type is `fn(A, B) -> R`.
+    fn checkUncurryComposition(self: *TypeChecker, node_idx: NodeIdx, name: []const u8, h: NodeIdx) TypeIdx {
+        const h_ty = self.inferExprType(h);
+        const h_sem = self.type_pool.get(h_ty);
+        if (h_sem != .function) {
+            self.errorAt(node_idx, "'{s}' expects a function, got '{s}'", .{ name, self.typeName(h_ty) });
+            return self.void_ty;
+        }
+        if (h_sem.function.param_types.len != 1) {
+            self.errorAt(node_idx, "'{s}' expects a function of one argument", .{name});
+            return self.void_ty;
+        }
+        const inner_ty = h_sem.function.return_type;
+        const inner_sem = self.type_pool.get(inner_ty);
+        if (inner_sem != .function) {
+            self.errorAt(node_idx, "'{s}' expects a function returning a function, got '{s}'", .{
+                name, self.typeName(inner_ty),
+            });
+            return self.void_ty;
+        }
+        const a = h_sem.function.param_types[0];
+        const b = inner_sem.function.param_types[0];
+        const r = inner_sem.function.return_type;
+        return self.functionType(&.{ a, b }, r);
+    }
+
+    // ========================================================================
     // Pipelines
     // ========================================================================
 
@@ -2768,6 +2971,17 @@ pub const TypeChecker = struct {
                 self.errorAt(expr_idx, "a piped call may have at most one '_' hole", .{});
             }
             return self.checkPipedCall(expr_idx, c, p.lhs, hole);
+        }
+        // A prelude name in the pipeline's head is a call, not a value:
+        // `x |> id` is `id(x)` (R30c). A prelude entry has no fn value to
+        // take a reference to, so it stays a plain identifier.
+        if (rhs.* == .identifier) {
+            const name = self.nameSlice(rhs.identifier);
+            if (self.scopes.lookup(name, self.scopes.currentScope())) |sym| {
+                if (sym.kind == .prelude_fn) {
+                    return self.checkPreludeCall(expr_idx, sym, .{ .indices = &.{} }, p.lhs, null);
+                }
+            }
         }
         return self.checkPipedValue(expr_idx, p.rhs, p.lhs);
     }
@@ -4401,6 +4615,87 @@ test "typecheck: `?` in a match arm body" {
         \\        Ok(v) => Ok(v),
         \\        Err(_) => Ok(o?),
         \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: prelude id/pipe/compose types" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn inc(x: i32) -> i32 { return x + 1 }
+        \\fn double(x: i32) -> i32 { return x * 2 }
+        \\fn main() -> i32 {
+        \\    let a: i32 = id(5)
+        \\    let b: i32 = pipe(3, inc)
+        \\    let c: fn(i32) -> i32 = compose(double, inc)
+        \\    let d: fn(i32) -> fn(i32) -> i32 = curry(add)
+        \\    let e: fn(i32, i32) -> i32 = uncurry(d)
+        \\    return a + b + c(1) + e(1, 2)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: prelude curry/uncurry arity errors" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let x = curry(add, 1)
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'curry' takes 1 argument(s)"));
+
+    var res2 = try runCheck(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let x = uncurry(add, 1)
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res2);
+    try std.testing.expect(res2.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res2.diagnostics, "'uncurry' takes 1 argument(s)"));
+}
+
+test "typecheck: prelude composition expects function of two arguments" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn inc(x: i32) -> i32 { return x + 1 }
+        \\fn main() -> i32 {
+        \\    let x = curry(inc)
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'curry' expects a function of two arguments"));
+}
+
+test "typecheck: an oversized composition call is rejected without overflowing" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let x = curry(add, 1, 2, 3, 4, 5, 6, 7, 8)
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'curry' takes at most 2 arguments"));
+}
+
+test "typecheck: pipe with prelude identifier" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn inc(x: i32) -> i32 { return x + 1 }
+        \\fn main() -> i32 {
+        \\    let x = 3 |> inc
+        \\    let y = 3 |> id
+        \\    return x + y
         \\}
     );
     defer deinitCheck(&res);

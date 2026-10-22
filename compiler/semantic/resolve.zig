@@ -430,6 +430,15 @@ pub const Resolver = struct {
         self.arena.set(expr_idx, .{ .fn_ref = sym.name });
     }
 
+    /// Whether `expr_idx` names a prelude entry.
+    fn isPreludeIdentifier(self: *Resolver, expr_idx: NodeIdx) bool {
+        const expr = self.arena.get(expr_idx);
+        if (expr.* != .identifier) return false;
+        const name = self.nameSlice(expr.identifier);
+        const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return false;
+        return sym.kind == .prelude_fn;
+    }
+
     /// A bare name in head position names the entity being applied or indexed,
     /// not a function value: `add(1, 2)`, `fns[0]` and `first[[i32]]` all keep
     /// the name. Anything else in head position (a field or element holding a
@@ -529,7 +538,14 @@ pub const Resolver = struct {
             },
             .pipeline => |p| {
                 try self.resolveAt(.value, p.lhs);
-                try self.resolveAt(.value, p.rhs);
+                // The pipeline's right-hand side is applied to the piped value
+                // (R30c), so a prelude name there is a call, not a value:
+                // `x |> id` is `id(x)`. A prelude entry has no body and so no
+                // fn value to take a reference to; it stays a plain
+                // identifier for the typechecker and the lowerer.
+                if (!self.isPreludeIdentifier(p.rhs)) {
+                    try self.resolveAt(.value, p.rhs);
+                }
             },
             .try_propagate => |inner| try self.resolveAt(.value, inner),
             .move_expr => |inner| try self.resolveAt(.value, inner),

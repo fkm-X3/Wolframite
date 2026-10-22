@@ -46,6 +46,154 @@ const GenericInstance = generics_mod.GenericInstance;
 const Binding = struct {
     value: api.Value,
     ty: TypeIdx,
+    /// The materialized composition this binding holds, if any (R31b).
+    materialized: ?Materialized = null,
+};
+
+/// A statically known module-level `fn` a composition calls directly.
+const DirectFn = struct {
+    /// The callee's IR function index.
+    fidx: api.FunctionIdx,
+    /// The IR type of the callee's result.
+    ret: api.TypeIdx,
+    /// The IR `function_value` type of the callee — the type of the fn
+    /// value a call to it produces.
+    fv_ty: api.TypeIdx,
+};
+
+/// One operand of a composition (R31): the function the expansion applies.
+const Operand = union(enum) {
+    /// A statically known module-level `fn`: the expansion calls it
+    /// directly, with a null env (R31b).
+    direct: DirectFn,
+    /// A fn value: the expansion calls it through `call_ptr` (R16c).
+    fn_value: struct {
+        /// The operand's value: the address of its `{ fn_ptr, env_ptr }`
+        /// record.
+        value: api.Value,
+        /// The IR `function_value` type of the value.
+        fv_ty: api.TypeIdx,
+        /// The IR type of the callee's result.
+        ret: api.TypeIdx,
+    },
+};
+
+/// One capture of a lifted composition closure (R31): how the lifted body
+/// reads it back out of the env record.
+const Capture = union(enum) {
+    /// A statically known module-level `fn`: the lifted body calls it
+    /// directly and it takes no env space (R31b).
+    direct: DirectFn,
+    /// A fn value captured by value: 16 bytes inline in the env record, and
+    /// the body calls it through `call_ptr`.
+    fn_value: struct {
+        /// The IR `function_value` type of the captured fn.
+        fv_ty: api.TypeIdx,
+        /// The IR type of the captured fn's result.
+        ret: api.TypeIdx,
+    },
+    /// A plain value: 8 bytes inline in the env record. The payload is the
+    /// IR type of the captured value.
+    value: api.TypeIdx,
+};
+
+/// Byte size of one capture in an env record: a fn value stores its 16-byte
+/// record inline, a plain value one 8-byte slot, and a statically known fn
+/// nothing at all — it is called directly and needs no env slot (R31b).
+fn captureSize(cap: Capture) u64 {
+    return switch (cap) {
+        .direct => 0,
+        .fn_value => api.fn_value_size,
+        .value => 8,
+    };
+}
+
+/// One capture at its creation site: the layout the lifted body expects and
+/// the value the env record copies into it.
+const EnvSlot = struct {
+    capture: Capture,
+    value: api.Value,
+};
+
+/// The body of a lifted composition closure (R31): the source expansion the
+/// closure stands for, together with the capture layout its env record uses.
+const CompositionBody = union(enum) {
+    /// `compose(f, g)`: `|x| f(g(x))`.
+    compose: struct { f: Capture, g: Capture },
+    /// `curry(f)`: `|a| |b| f(a, b)`. The outer lifted function takes `a`
+    /// and returns the inner closure.
+    curry_outer: struct {
+        f: Capture,
+        /// The partially applied argument `a`, captured by the inner
+        /// closure.
+        a: Capture,
+        /// The lifted function that takes `b` and calls `f(a, b)`.
+        inner: api.FunctionIdx,
+        /// The IR `function_value` type of the inner closure.
+        inner_fv_ty: api.TypeIdx,
+    },
+    /// `curry(f)(a)`: `|b| f(a, b)`.
+    curry_inner: struct { f: Capture, a: Capture },
+    /// `uncurry(h)`: `|a, b| h(a)(b)`.
+    uncurry: struct {
+        h: Capture,
+        /// The IR type of `h(a)(b)`'s result.
+        ret: api.TypeIdx,
+    },
+};
+
+/// A composition chain in the AST (R31): a prelude composition call
+/// together with the arguments its result is applied to.
+const CompositionChain = struct {
+    /// The expansion shape of the root call.
+    shape: prelude.Shape,
+    /// The root call's own operands (`compose(f, g)` → `[f, g]`).
+    operands: []const NodeIdx,
+    /// The arguments the chain applies to the root's result, in evaluation
+    /// order (`curry(f)(a)(b)` → `[a, b]`).
+    applied: []const NodeIdx,
+    /// The root call's node, whose type is the composition's result type.
+    root: NodeIdx,
+};
+
+/// A composition a local holds, known statically to the lowerer (R31b).
+///
+/// A materialized composition is a closure whose body the lowerer wrote, so
+/// applying it lowers to the expansion's own calls instead of a call through
+/// the fn value — and the expansion's env record is built in the frame that
+/// applies it, where it stays alive.
+const Materialized = union(enum) {
+    /// `curry(f)`: the value awaits its first argument. Applying it
+    /// materializes the inner closure `|b| f(a, b)` at the application site.
+    curry_outer: struct {
+        /// The operand the expansion calls.
+        f: Operand,
+        /// The chain the composition came from: its root node carries the
+        /// composition's result type.
+        chain: CompositionChain,
+    },
+    /// `curry(f)(a)`: the value awaits its second argument. Applying it is a
+    /// direct call to the lifted inner function with its env record.
+    curry_inner: struct {
+        /// The lifted inner function.
+        fidx: api.FunctionIdx,
+        /// The IR type of the call's result.
+        ret: api.TypeIdx,
+        /// The inner closure's env record.
+        env: api.Value,
+    },
+};
+
+/// What a lowered function's body is. Pass 2 walks `all_functions` and emits
+/// the body each entry names.
+const FunctionBody = union(enum) {
+    /// A declared `fn` (or a monomorphized instance): the declaration node.
+    decl: NodeIdx,
+    /// A lifted closure literal: the closure node. Its captures come from
+    /// the closure's inferred env list.
+    closure: NodeIdx,
+    /// A lifted composition expansion (R31).
+    composition: CompositionBody,
 };
 
 pub const Lowerer = struct {
@@ -74,15 +222,14 @@ pub const Lowerer = struct {
 
     /// fn_decl node -> created FunctionIdx.
     fn_by_node: std.AutoHashMapUnmanaged(NodeIdx, api.FunctionIdx),
-    /// (fn_decl node, FunctionIdx) pairs in creation order, for body lowering.
-    /// Closure lifting appends entries during body lowering, so this list is
-    /// walked by index and lifted bodies are lowered in the same pass.
-    all_functions: std.ArrayListUnmanaged(struct { node: NodeIdx, idx: api.FunctionIdx }),
-    /// Lifted closure bodies: the lifted FunctionIdx -> its closure-literal
-    /// node (captures come from the closure's inferred env list).
-    lifted: std.AutoHashMapUnmanaged(api.FunctionIdx, NodeIdx),
+    /// The lowered functions in creation order, for body lowering. Closure and
+    /// composition lifting appends entries during body lowering, so this list
+    /// is walked by index and the lifted bodies are lowered in the same pass.
+    all_functions: std.ArrayListUnmanaged(struct { body: FunctionBody, idx: api.FunctionIdx }),
     /// Source-order counter for unique lifted-closure function names.
     closure_counter: u32 = 0,
+    /// Source-order counter for unique lifted-composition function names.
+    composition_counter: u32 = 0,
 
     /// Function parameters of the current function: name -> binding.
     params: std.StringHashMapUnmanaged(Binding),
@@ -92,6 +239,9 @@ pub const Lowerer = struct {
     shadows: std.ArrayListUnmanaged(struct { name: []const u8, prev: ?Binding }),
     /// Deferred expressions, innermost scope last.
     pending_defers: std.ArrayListUnmanaged(NodeIdx),
+    /// The composition the expression being lowered materialized, if any
+    /// (R31b). The binding that holds it picks it up.
+    pending_materialized: ?Materialized = null,
 
     block_terminated: bool = false,
 
@@ -128,7 +278,6 @@ pub const Lowerer = struct {
             .ptr_ty = undefined,
             .fn_by_node = .empty,
             .all_functions = .empty,
-            .lifted = .empty,
             .params = .empty,
             .locals = .empty,
             .shadows = .empty,
@@ -142,7 +291,6 @@ pub const Lowerer = struct {
     pub fn deinit(self: *Lowerer) void {
         self.fn_by_node.deinit(self.gpa);
         self.all_functions.deinit(self.gpa);
-        self.lifted.deinit(self.gpa);
         self.params.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.shadows.deinit(self.gpa);
@@ -179,12 +327,13 @@ pub const Lowerer = struct {
             _ = try self.createInstanceFunction(inst);
         }
 
-        // Pass 2: function bodies. Closure lifting appends new functions
-        // during this walk, so it is index-based to pick those up too.
+        // Pass 2: function bodies. Closure and composition lifting append new
+        // functions during this walk, so it is index-based to pick those up
+        // too.
         var i: usize = 0;
         while (i < self.all_functions.items.len) : (i += 1) {
             const f = self.all_functions.items[i];
-            try self.lowerFunctionBody(f.node, f.idx);
+            try self.lowerFunctionBody(f.body, f.idx);
         }
     }
 
@@ -201,7 +350,7 @@ pub const Lowerer = struct {
         const env_hole: u32 = if (std.mem.eql(u8, name, "main")) 0 else 1;
         const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(f.params.indices.len)) + env_hole);
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
-        try self.all_functions.append(self.gpa, .{ .node = decl_idx, .idx = fidx });
+        try self.all_functions.append(self.gpa, .{ .body = .{ .decl = decl_idx }, .idx = fidx });
         return fidx;
     }
 
@@ -220,47 +369,50 @@ pub const Lowerer = struct {
             @as(u32, @intCast(clone.params.indices.len)) + 1,
         );
         try self.fn_by_node.put(self.gpa, inst.clone, fidx);
-        try self.all_functions.append(self.gpa, .{ .node = inst.clone, .idx = fidx });
+        try self.all_functions.append(self.gpa, .{ .body = .{ .decl = inst.clone }, .idx = fidx });
         return fidx;
     }
 
-    fn lowerFunctionBody(self: *Lowerer, decl_idx: NodeIdx, fidx: api.FunctionIdx) !void {
+    fn lowerFunctionBody(self: *Lowerer, body: FunctionBody, fidx: api.FunctionIdx) !void {
         self.ctx.setCurrentFunction(fidx);
         self.params.clearRetainingCapacity();
         self.locals.clearRetainingCapacity();
         self.shadows.clearRetainingCapacity();
         self.pending_defers.clearRetainingCapacity();
+        self.pending_materialized = null;
         self.block_terminated = false;
 
         const entry = try self.ctx.appendBlock();
         self.setBlock(entry);
 
-        // A lifted closure body reads its visible parameters from hidden
-        // argument slots 1..n and its captures from the env record in
-        // parameter 0; it is not built from an fn_decl.
-        if (self.lifted.get(fidx)) |closure_node| {
-            try self.lowerLiftedBody(closure_node);
-            return;
-        }
+        switch (body) {
+            .decl => |decl_idx| {
+                const f = self.arena.get(decl_idx).fn_decl;
+                // R14: visible parameters sit after the hidden env parameter
+                // (`main` is exempt and keeps parameter 0 as its first
+                // visible parameter).
+                const env_hole: u32 = if (std.mem.eql(u8, self.nameSlice(f.name), "main")) 0 else 1;
+                for (f.params.indices, 0..) |param_idx, i| {
+                    const param = self.arena.get(param_idx);
+                    try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
+                        .value = @enumFromInt(env_hole + i),
+                        .ty = try self.paramType(param.param.ty),
+                    });
+                }
 
-        const f = self.arena.get(decl_idx).fn_decl;
-        // R14: visible parameters sit after the hidden env parameter (`main`
-        // is exempt and keeps parameter 0 as its first visible parameter).
-        const env_hole: u32 = if (std.mem.eql(u8, self.nameSlice(f.name), "main")) 0 else 1;
-        for (f.params.indices, 0..) |param_idx, i| {
-            const param = self.arena.get(param_idx);
-            try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
-                .value = @enumFromInt(env_hole + i),
-                .ty = try self.paramType(param.param.ty),
-            });
-        }
+                if (f.body != NodeIdx.none) {
+                    try self.lowerStmt(f.body);
+                }
 
-        if (f.body != NodeIdx.none) {
-            try self.lowerStmt(f.body);
-        }
-
-        if (!self.block_terminated) {
-            try self.defaultRet(self.checker.nodeType(decl_idx));
+                if (!self.block_terminated) {
+                    try self.defaultRet(self.checker.nodeType(decl_idx));
+                }
+            },
+            // A lifted closure body reads its visible parameters from hidden
+            // argument slots 1..n and its captures from the env record in
+            // parameter 0; it is not built from an fn_decl.
+            .closure => |closure_node| try self.lowerLiftedBody(closure_node),
+            .composition => |comp| try self.lowerCompositionBody(comp),
         }
     }
 
@@ -476,20 +628,36 @@ pub const Lowerer = struct {
     }
 
     fn bindLocal(self: *Lowerer, name: []const u8, slot: api.Value, ty: TypeIdx) !void {
+        try self.bindLocalMaterialized(name, slot, ty, null);
+    }
+
+    /// Bind a local, recording the materialized composition it holds, if any
+    /// (R31b).
+    fn bindLocalMaterialized(
+        self: *Lowerer,
+        name: []const u8,
+        slot: api.Value,
+        ty: TypeIdx,
+        materialized: ?Materialized,
+    ) !void {
         try self.shadows.append(self.gpa, .{ .name = name, .prev = self.locals.get(name) });
-        try self.locals.put(self.gpa, name, .{ .value = slot, .ty = ty });
+        try self.locals.put(self.gpa, name, .{ .value = slot, .ty = ty, .materialized = materialized });
     }
 
     fn lowerLet(self: *Lowerer, node_idx: NodeIdx) !void {
         const l = self.arena.get(node_idx).let_stmt;
         const slot = try self.allocVarSlot(self.checker.nodeType(node_idx));
+        var materialized: ?Materialized = null;
         if (l.init_expr) |init_idx| {
+            self.pending_materialized = null;
             const val = try self.lowerExpr(init_idx);
+            materialized = self.pending_materialized;
+            self.pending_materialized = null;
             _ = try self.ctx.buildStore(self.i64_ty, slot, val);
         } else {
             _ = try self.ctx.buildStore(self.i64_ty, slot, try self.ctx.buildIntConst(self.i64_ty, 0));
         }
-        try self.bindLocal(self.nameSlice(l.name), slot, self.checker.nodeType(node_idx));
+        try self.bindLocalMaterialized(self.nameSlice(l.name), slot, self.checker.nodeType(node_idx), materialized);
     }
 
     fn allocVarSlot(self: *Lowerer, ty: TypeIdx) !api.Value {
@@ -1273,8 +1441,13 @@ pub const Lowerer = struct {
     /// address) is spilled to a fresh slot first.
     fn lowerRef(self: *Lowerer, node_idx: NodeIdx, operand_idx: NodeIdx) !api.Value {
         switch (self.type_pool.get(self.exprType(operand_idx))) {
-            .struct_type, .enum_type, .string_type, .array, .pointer,
-            .applied_struct, .applied_enum,
+            .struct_type,
+            .enum_type,
+            .string_type,
+            .array,
+            .pointer,
+            .applied_struct,
+            .applied_enum,
             => return self.lowerExpr(operand_idx),
             else => {},
         }
@@ -1294,6 +1467,14 @@ pub const Lowerer = struct {
     }
 
     fn lowerCall(self: *Lowerer, node_idx: NodeIdx, c: anytype) !api.Value {
+        // A composition chain: the result of a prelude composition call is
+        // applied (`compose(f, g)(x)`, `curry(f)(a)(b)`, `uncurry(h)(a, b)`).
+        // The chain is flattened so a statically known operand lowers to a
+        // direct call (R31b).
+        var applied_buf: [8]NodeIdx = undefined;
+        if (self.matchCompositionChain(node_idx, &applied_buf)) |chain| {
+            return self.lowerCompositionChain(chain);
+        }
         return self.lowerCallPiped(node_idx, c.func, c.args.indices, null, null);
     }
 
@@ -1317,8 +1498,17 @@ pub const Lowerer = struct {
                     return self.lowerVariantInitValues(vi, vals.items);
                 }
                 // A local or parameter shadows any module-level name; it holds
-                // a fn value, so the call goes through the record.
-                if (self.locals.get(name) != null or self.params.get(name) != null) {
+                // a fn value, so the call goes through the record. A local
+                // that holds a materialized composition is known statically,
+                // so its application lowers to the expansion's own call
+                // (R31b).
+                if (self.locals.get(name)) |binding| {
+                    if (binding.materialized) |desc| {
+                        return self.lowerMaterializedCall(node_idx, desc, args, piped, hole);
+                    }
+                    return self.lowerCallIndirect(node_idx, func, args, piped, hole);
+                }
+                if (self.params.get(name) != null) {
                     return self.lowerCallIndirect(node_idx, func, args, piped, hole);
                 }
                 const sym = self.checker.scopes.scopes.items[0].symbols.get(name) orelse {
@@ -1470,8 +1660,7 @@ pub const Lowerer = struct {
         defer self.gpa.free(name);
         self.closure_counter += 1;
         const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(cl.params.indices.len)) + 1);
-        try self.lifted.put(self.gpa, fidx, node_idx);
-        try self.all_functions.append(self.gpa, .{ .node = node_idx, .idx = fidx });
+        try self.all_functions.append(self.gpa, .{ .body = .{ .closure = node_idx }, .idx = fidx });
 
         // Env record: one slot per capture, each copied by value at the site
         // (R8c). A fn-value capture stores its two words inline (R16d).
@@ -1519,15 +1708,19 @@ pub const Lowerer = struct {
         return node.* == .identifier and std.mem.eql(u8, self.nameSlice(node.identifier), "_");
     }
 
-    /// Lower a prelude call to a direct extern call into the runtime.
+    /// Lower a prelude call.
     ///
-    /// This is the whole reason prelude names live in a table: there is no
-    /// `fn` to call, so the call becomes a named symbol in the object file and
-    /// the linker resolves it against `libs/std`. Arguments are already IR
-    /// values in the platform ABI, so a `String` argument arrives as the
-    /// pointer `lowerString` built — exactly what the runtime's `*const String`
-    /// parameter expects, with no marshalling in between. Extern C calls keep
-    /// the plain C ABI: no hidden env parameter (R17).
+    /// An IO entry (`print`) names a runtime symbol, so the call becomes a
+    /// named symbol in the object file and the linker resolves it against
+    /// `libs/std`. Arguments are already IR values in the platform ABI, so a
+    /// `String` argument arrives as the pointer `lowerString` built — exactly
+    /// what the runtime's `*const String` parameter expects, with no
+    /// marshalling in between. Extern C calls keep the plain C ABI: no
+    /// hidden env parameter (R17).
+    ///
+    /// A composition entry has no runtime identity (R31c): it is a source
+    /// expansion over ordinary functions, so the lowerer materializes it as
+    /// direct calls and stack env records.
     fn lowerPreludeCall(
         self: *Lowerer,
         node_idx: NodeIdx,
@@ -1544,9 +1737,808 @@ pub const Lowerer = struct {
         }
         const entry = prelude.roster[sym.prelude.index];
 
-        var vals = try self.lowerArgs(args, piped, hole);
+        switch (entry.kind) {
+            .io => {
+                var vals = try self.lowerArgs(args, piped, hole);
+                defer vals.deinit(self.gpa);
+                return self.ctx.buildExternCall(entry.symbol.?, self.void_ty, vals.items);
+            },
+            .composition => {
+                const shape = entry.shape.?;
+                var buf: [8]NodeIdx = undefined;
+                const operands = effectiveArgNodes(args, piped, hole, &buf) orelse {
+                    self.codegenError(node_idx, "too many arguments to prelude function '{s}'", .{entry.name});
+                    return self.ctx.buildIntConst(self.i64_ty, 0);
+                };
+                const chain = CompositionChain{
+                    .shape = shape,
+                    .operands = operands,
+                    .applied = &.{},
+                    .root = node_idx,
+                };
+                return self.lowerCompositionChain(chain);
+            },
+        }
+    }
+
+    // ========================================================================
+    // Composition prelude (R31)
+    // ========================================================================
+
+    /// The number of applications a shape's expansion takes after its own
+    /// operands: `compose(f, g)` takes one (`x`), `curry(f)` takes two
+    /// (`a`, `b`), `uncurry(h)` takes two, `id`/`pipe` take none.
+    fn shapeApplications(shape: prelude.Shape) usize {
+        return switch (shape) {
+            .id, .pipe => 0,
+            .compose => 1,
+            .curry, .uncurry => 2,
+        };
+    }
+
+    /// The prelude roster entry named `name`, when the name is one.
+    fn preludeEntry(self: *Lowerer, name: []const u8) ?prelude.PreludeFn {
+        const sym = self.checker.scopes.scopes.items[0].symbols.get(name) orelse return null;
+        if (sym.kind != .prelude_fn) return null;
+        if (sym.prelude.index >= prelude.roster.len) return null;
+        return prelude.roster[sym.prelude.index];
+    }
+
+    /// Match a composition chain (R31).
+    ///
+    /// A composition's result is applied: `compose(f, g)(x)`,
+    /// `curry(f)(a)(b)`, `uncurry(h)(a, b)`. The chain is walked from the
+    /// outermost call down to the prelude call at its root; every level above
+    /// the root contributes one application, and the applications are
+    /// collected in evaluation order — the innermost level first.
+    fn matchCompositionChain(self: *Lowerer, node_idx: NodeIdx, applied_buf: *[8]NodeIdx) ?CompositionChain {
+        var levels: [8]NodeList = undefined;
+        var n_levels: usize = 0;
+        var cur = node_idx;
+        while (true) {
+            const node = self.arena.get(cur);
+            if (node.* != .call) return null;
+            const c = node.call;
+            const callee = self.arena.get(c.func);
+            if (callee.* == .identifier) {
+                const entry = self.preludeEntry(self.nameSlice(callee.identifier)) orelse return null;
+                if (entry.kind != .composition) return null;
+                // The root is the prelude call; the levels above it apply its
+                // result. Evaluation order runs from the innermost level out.
+                var n: usize = 0;
+                var i = n_levels;
+                while (i > 0) {
+                    i -= 1;
+                    for (levels[i].indices) |arg| {
+                        if (n >= applied_buf.len) return null;
+                        applied_buf[n] = arg;
+                        n += 1;
+                    }
+                }
+                return .{
+                    .shape = entry.shape.?,
+                    .operands = c.args.indices,
+                    .applied = applied_buf[0..n],
+                    .root = cur,
+                };
+            }
+            if (n_levels >= levels.len) return null;
+            levels[n_levels] = c.args;
+            n_levels += 1;
+            cur = c.func;
+        }
+    }
+
+    /// The effective argument list of a prelude call: the piped value
+    /// replaces the `_` hole (R30a) or is prepended as argument 0 (R30b).
+    fn effectiveArgNodes(
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+        buf: *[8]NodeIdx,
+    ) ?[]const NodeIdx {
+        var n: usize = 0;
+        if (piped) |p| {
+            if (hole) |h| {
+                for (args, 0..) |arg, i| {
+                    if (n >= buf.len) return null;
+                    buf[n] = if (i == h) p else arg;
+                    n += 1;
+                }
+            } else {
+                if (n >= buf.len) return null;
+                buf[n] = p;
+                n += 1;
+                for (args) |arg| {
+                    if (n >= buf.len) return null;
+                    buf[n] = arg;
+                    n += 1;
+                }
+            }
+        } else {
+            for (args) |arg| {
+                if (n >= buf.len) return null;
+                buf[n] = arg;
+                n += 1;
+            }
+        }
+        return buf[0..n];
+    }
+
+    /// Apply a materialized composition (R31b).
+    ///
+    /// The composition's expansion is known statically, so the application
+    /// lowers to the expansion's own call: `curry(f)` applied to `a`
+    /// materializes the inner closure `|b| f(a, b)` right here — its env
+    /// record lives in this frame, where it stays alive — and the inner
+    /// closure applied to `b` is a direct call to the lifted function.
+    fn lowerMaterializedCall(
+        self: *Lowerer,
+        node_idx: NodeIdx,
+        desc: Materialized,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !api.Value {
+        var buf: [8]NodeIdx = undefined;
+        const effective = effectiveArgNodes(args, piped, hole, &buf) orelse {
+            self.codegenError(node_idx, "too many arguments to a curried function", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        };
+        switch (desc) {
+            .curry_outer => |d| {
+                if (effective.len != 1) {
+                    self.codegenError(node_idx, "a curried function takes one argument, got {d}", .{effective.len});
+                    return self.ctx.buildIntConst(self.i64_ty, 0);
+                }
+                const a = try self.lowerExpr(effective[0]);
+                return self.materializeCurryInner(d.f, a, d.chain);
+            },
+            .curry_inner => |d| {
+                var vals = try self.lowerArgValues(effective);
+                defer vals.deinit(self.gpa);
+                var call_args = std.ArrayList(api.Value).empty;
+                defer call_args.deinit(self.gpa);
+                // The lifted function takes its env record as hidden
+                // argument 0 (R14a).
+                try call_args.append(self.gpa, d.env);
+                for (vals.items) |v| try call_args.append(self.gpa, v);
+                return self.ctx.buildCall(d.fidx, d.ret, call_args.items);
+            },
+        }
+    }
+
+    /// Lower a composition chain (R31).
+    ///
+    /// The expansion is flattened: a statically known operand lowers to a
+    /// direct call (R31b), so `curry(add)(1)(2)` is one `call @fn0(...)`
+    /// with no `call_ptr` at all. A composition whose result is *not* fully
+    /// applied is materialized as a closure — a lifted function plus a stack
+    /// env record (R31c).
+    fn lowerCompositionChain(self: *Lowerer, chain: CompositionChain) !api.Value {
+        const expected = shapeApplications(chain.shape);
+        if (chain.applied.len <= expected) {
+            return self.lowerCompositionExpanded(chain, chain.applied);
+        }
+        // The expansion's result is itself applied: `id(f)(x)` is `f(x)`.
+        const value = try self.lowerCompositionExpanded(chain, chain.applied[0..expected]);
+        var vals = try self.lowerArgValues(chain.applied[expected..]);
         defer vals.deinit(self.gpa);
-        return self.ctx.buildExternCall(entry.symbol, self.void_ty, vals.items);
+        const result = try self.applyFnValue(value, vals.items, self.compositionResultType(chain));
+        self.pending_materialized = null;
+        return result;
+    }
+
+    /// Lower a composition's expansion with the given applications.
+    fn lowerCompositionExpanded(self: *Lowerer, chain: CompositionChain, applied: []const NodeIdx) !api.Value {
+        switch (chain.shape) {
+            .id => {
+                if (applied.len == 0) return self.lowerExpr(chain.operands[0]);
+                // `id(f)(x)` is `f(x)`.
+                const f = try self.classifyCallee(chain.operands[0]);
+                var vals = try self.lowerArgValues(applied);
+                defer vals.deinit(self.gpa);
+                const result = try self.callOperand(f, vals.items);
+                self.pending_materialized = null;
+                return result;
+            },
+            .pipe => {
+                const x = try self.lowerExpr(chain.operands[0]);
+                const f = try self.classifyCallee(chain.operands[1]);
+                var vals = std.ArrayList(api.Value).empty;
+                defer vals.deinit(self.gpa);
+                try vals.append(self.gpa, x);
+                const result = try self.callOperand(f, vals.items);
+                self.pending_materialized = null;
+                return result;
+            },
+            .compose => {
+                const f = try self.classifyCallee(chain.operands[0]);
+                const g = try self.classifyCallee(chain.operands[1]);
+                if (applied.len == 0) return self.materializeCompose(f, g, chain);
+                const x = try self.lowerExpr(applied[0]);
+                const gx = try self.callOperand(g, &.{x});
+                const result = try self.callOperand(f, &.{gx});
+                self.pending_materialized = null;
+                return result;
+            },
+            .curry => {
+                const f = try self.classifyCallee(chain.operands[0]);
+                if (applied.len == 2) {
+                    const a = try self.lowerExpr(applied[0]);
+                    const b = try self.lowerExpr(applied[1]);
+                    const result = try self.callOperand(f, &.{ a, b });
+                    self.pending_materialized = null;
+                    return result;
+                }
+                if (applied.len == 1) {
+                    const a = try self.lowerExpr(applied[0]);
+                    return self.materializeCurryInner(f, a, chain);
+                }
+                return self.materializeCurryOuter(f, chain);
+            },
+            .uncurry => {
+                // `uncurry(curry(f))` is `f` (R31a): the pair list applies
+                // `f`'s own argument list, and the unapplied form is `f`'s fn
+                // value. Fusing the pair also keeps the intermediate inner
+                // closure out of the expansion — its env record would be
+                // built in the `curry_outer` frame and die with it.
+                if (try self.curryOperand(chain.operands[0])) |f| {
+                    switch (applied.len) {
+                        2 => {
+                            const a = try self.lowerExpr(applied[0]);
+                            const b = try self.lowerExpr(applied[1]);
+                            self.pending_materialized = null;
+                            return self.callOperand(f, &.{ a, b });
+                        },
+                        1 => {
+                            const a = try self.lowerExpr(applied[0]);
+                            // The node passed to `uncurry` has type
+                            // `fn(A) -> fn(B) -> R`, which is exactly the
+                            // type shape `curry`'s inner closure is derived
+                            // from.
+                            const sub_chain = CompositionChain{
+                                .shape = .curry,
+                                .operands = chain.operands,
+                                .applied = &.{},
+                                .root = chain.operands[0],
+                            };
+                            return self.materializeCurryInner(f, a, sub_chain);
+                        },
+                        else => {
+                            self.pending_materialized = null;
+                            return self.fnValueOf(f);
+                        },
+                    }
+                }
+                const h = try self.classifyCallee(chain.operands[0]);
+                if (applied.len == 2) {
+                    const a = try self.lowerExpr(applied[0]);
+                    const b = try self.lowerExpr(applied[1]);
+                    const inner = try self.callOperand(h, &.{a});
+                    // `h(a)` is the inner closure; `b` is applied to it.
+                    const result = try self.applyFnValue(inner, &.{b}, self.calleeReturnType(chain.operands[0]));
+                    self.pending_materialized = null;
+                    return result;
+                }
+                return self.materializeUncurry(h, chain);
+            },
+        }
+    }
+
+    /// The semantic type of the value a composition's expansion produces.
+    fn compositionResultType(self: *Lowerer, chain: CompositionChain) TypeIdx {
+        return switch (chain.shape) {
+            .id => self.exprType(chain.operands[0]),
+            .pipe => self.calleeReturnType(chain.operands[1]),
+            .compose, .curry => self.calleeReturnType(chain.operands[0]),
+            .uncurry => blk: {
+                const inner = self.type_pool.get(self.calleeReturnType(chain.operands[0]));
+                if (inner != .function) break :blk self.checker.void_ty;
+                break :blk inner.function.return_type;
+            },
+        };
+    }
+
+    /// The semantic type of a callee's result.
+    fn calleeReturnType(self: *Lowerer, node_idx: NodeIdx) TypeIdx {
+        const sem = self.type_pool.get(self.exprType(node_idx));
+        switch (sem) {
+            .function => |f| return f.return_type,
+            .applied_fn => |a| {
+                const sig = self.type_pool.get(a.sig);
+                if (sig == .function) return sig.function.return_type;
+            },
+            else => {},
+        }
+        return self.checker.void_ty;
+    }
+
+    /// Apply a fn value to already-lowered arguments (R16c): the callee's
+    /// visible signature drives the call's result type.
+    fn applyFnValue(self: *Lowerer, callee: api.Value, args: []const api.Value, fn_ty: TypeIdx) !api.Value {
+        const sem = self.type_pool.get(fn_ty);
+        if (sem != .function) {
+            self.codegenError(NodeIdx.none, "a composition result is not a function", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        return self.ctx.buildCallPtr(self.irTypeFor(sem.function.return_type), callee, args);
+    }
+
+    /// Classify a composition operand that is applied to arguments.
+    ///
+    /// A statically known module-level `fn` is called directly (R31b); every
+    /// other operand is a fn value and goes through `call_ptr` (R16c).
+    fn classifyCallee(self: *Lowerer, node_idx: NodeIdx) !Operand {
+        const node = self.arena.get(node_idx);
+        if (node.* == .fn_ref) {
+            const name = self.nameSlice(node.fn_ref);
+            const sym = self.checker.scopes.scopes.items[0].symbols.get(name);
+            if (sym != null and sym.?.kind == .function) {
+                const decl = sym.?.decl_node;
+                if (self.fn_by_node.get(decl)) |fidx| {
+                    return .{ .direct = .{
+                        .fidx = fidx,
+                        .ret = self.irTypeFor(self.checker.nodeType(decl)),
+                        .fv_ty = try self.fnValueTypeForDecl(decl),
+                    } };
+                }
+            }
+        }
+        const sem = self.type_pool.get(self.exprType(node_idx));
+        if (sem != .function) {
+            self.codegenError(node_idx, "a composition operand is not a function", .{});
+            return .{ .fn_value = .{
+                .value = try self.ctx.buildIntConst(self.i64_ty, 0),
+                .fv_ty = self.i64_ty,
+                .ret = self.i64_ty,
+            } };
+        }
+        const value = try self.lowerExpr(node_idx);
+        return .{ .fn_value = .{
+            .value = value,
+            .fv_ty = try self.fnValueTypeForFn(sem),
+            .ret = self.irTypeFor(sem.function.return_type),
+        } };
+    }
+
+    /// Call a composition operand with already-lowered arguments.
+    fn callOperand(self: *Lowerer, op: Operand, args: []const api.Value) !api.Value {
+        switch (op) {
+            .direct => |d| {
+                var vals = std.ArrayList(api.Value).empty;
+                defer vals.deinit(self.gpa);
+                // R14a: the callee carries a hidden env parameter; a direct
+                // named call passes a null env.
+                try vals.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
+                for (args) |a| try vals.append(self.gpa, a);
+                return self.ctx.buildCall(d.fidx, d.ret, vals.items);
+            },
+            .fn_value => |fv| {
+                return self.ctx.buildCallPtr(fv.ret, fv.value, args);
+            },
+        }
+    }
+
+    /// The operand of a `curry(f)` the lowerer can see through (R31a): a
+    /// directly applied `curry` call, or a local known to hold one. Matching
+    /// the pair in `uncurry(curry(f))` lets the expansion produce `f` itself
+    /// instead of an intermediate inner closure.
+    fn curryOperand(self: *Lowerer, node_idx: NodeIdx) !?Operand {
+        var buf: [8]NodeIdx = undefined;
+        if (self.matchCompositionChain(node_idx, &buf)) |chain| {
+            if (chain.shape == .curry and chain.applied.len == 0) {
+                return try self.classifyCallee(chain.operands[0]);
+            }
+        }
+        const node = self.arena.get(node_idx);
+        if (node.* == .identifier) {
+            if (self.locals.get(self.nameSlice(node.identifier))) |binding| {
+                if (binding.materialized) |desc| {
+                    switch (desc) {
+                        .curry_outer => |d| return d.f,
+                        .curry_inner => {},
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The fn value of a composition operand. A statically known module-level
+    /// `fn` pairs its address with a null env (R3a/R14); a fn value is
+    /// already that record.
+    fn fnValueOf(self: *Lowerer, op: Operand) !api.Value {
+        switch (op) {
+            .direct => |d| {
+                const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, d.fidx);
+                const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+                return self.ctx.buildFnValue(d.fv_ty, fn_addr, null_env);
+            },
+            .fn_value => |fv| return fv.value,
+        }
+    }
+
+    /// Lower an argument list into IR values.
+    fn lowerArgValues(self: *Lowerer, args: []const NodeIdx) !std.ArrayList(api.Value) {
+        var vals = std.ArrayList(api.Value).empty;
+        errdefer vals.deinit(self.gpa);
+        for (args) |arg| {
+            try vals.append(self.gpa, try self.lowerExpr(arg));
+        }
+        return vals;
+    }
+
+    /// The env representation of a composition operand.
+    fn captureOf(op: Operand) Capture {
+        return switch (op) {
+            .direct => |d| .{ .direct = d },
+            .fn_value => |fv| .{ .fn_value = .{ .fv_ty = fv.fv_ty, .ret = fv.ret } },
+        };
+    }
+
+    /// The runtime value of a composition operand, when it has one.
+    fn operandValue(op: Operand) ?api.Value {
+        return switch (op) {
+            .direct => null,
+            .fn_value => |fv| fv.value,
+        };
+    }
+
+    /// The env representation of a captured value: a fn value is stored
+    /// inline as its 16-byte record, anything else as one 8-byte slot.
+    fn argumentCapture(self: *Lowerer, sem_ty: TypeIdx) !Capture {
+        const sem = self.type_pool.get(sem_ty);
+        switch (sem) {
+            .function => |f| {
+                return .{ .fn_value = .{
+                    .fv_ty = try self.fnValueTypeForFn(sem),
+                    .ret = self.irTypeFor(f.return_type),
+                } };
+            },
+            else => {},
+        }
+        return .{ .value = self.irTypeForSem(sem) };
+    }
+
+    /// The semantic type of a composition's root call.
+    fn chainType(self: *Lowerer, chain: CompositionChain) SemType {
+        return self.type_pool.get(self.checker.nodeType(chain.root));
+    }
+
+    /// The type of `curry`'s first argument — the type the inner closure
+    /// captures.
+    fn curryArgType(self: *Lowerer, chain: CompositionChain) TypeIdx {
+        const sem = self.chainType(chain);
+        if (sem != .function or sem.function.param_types.len == 0) return self.checker.void_ty;
+        return sem.function.param_types[0];
+    }
+
+    /// The `fn(B) -> R` type of `curry`'s inner closure.
+    fn curryInnerType(self: *Lowerer, chain: CompositionChain) TypeIdx {
+        const sem = self.chainType(chain);
+        if (sem != .function) return self.checker.void_ty;
+        return sem.function.return_type;
+    }
+
+    /// The IR `function_value` type of `curry`'s inner closure.
+    fn curryInnerFvType(self: *Lowerer, chain: CompositionChain) !api.TypeIdx {
+        const sem = self.type_pool.get(self.curryInnerType(chain));
+        if (sem != .function) return self.i64_ty;
+        return self.fnValueTypeForFn(sem);
+    }
+
+    /// The IR `function_value` type of the whole composition — the type of
+    /// the closure a materialization produces.
+    fn compositionFvType(self: *Lowerer, chain: CompositionChain) !api.TypeIdx {
+        const sem = self.chainType(chain);
+        if (sem != .function) return self.i64_ty;
+        return self.fnValueTypeForFn(sem);
+    }
+
+    /// A unique name for a lifted composition function.
+    fn compositionName(self: *Lowerer, prefix: []const u8) ![]const u8 {
+        const name = try std.fmt.allocPrint(self.gpa, "{s}_{d}", .{ prefix, self.composition_counter });
+        self.composition_counter += 1;
+        return name;
+    }
+
+    /// Build an env record for a composition's captures, copying each
+    /// capture by value into its slot (R8c).
+    fn buildCompositionEnv(self: *Lowerer, slots: []const EnvSlot) !api.Value {
+        var fields = std.ArrayList(api.EnvField).empty;
+        defer fields.deinit(self.gpa);
+        for (slots) |slot| {
+            switch (slot.capture) {
+                .direct => {},
+                .fn_value => |fv| {
+                    try fields.append(self.gpa, .{ .type_idx = fv.fv_ty, .value = slot.value });
+                },
+                .value => |ty| {
+                    try fields.append(self.gpa, .{ .type_idx = ty, .value = slot.value });
+                },
+            }
+        }
+        const env = try self.ctx.buildEnvRecord(fields.items);
+        if (env == .none) return try self.ctx.buildIntConst(self.i64_ty, 0);
+        return env;
+    }
+
+    /// Materialize `compose(f, g)` as a closure (R31c): the lifted function
+    /// takes `x` and computes `f(g(x))`, capturing `f` and `g`.
+    fn materializeCompose(self: *Lowerer, f: Operand, g: Operand, chain: CompositionChain) !api.Value {
+        const f_capture = captureOf(f);
+        const g_capture = captureOf(g);
+        const sem = self.chainType(chain);
+        const ret: api.TypeIdx = if (sem == .function) self.irTypeFor(sem.function.return_type) else self.i64_ty;
+
+        const name = try self.compositionName("compose");
+        defer self.gpa.free(name);
+        const fidx = try self.ctx.addFunction(name, ret, 2);
+        try self.all_functions.append(self.gpa, .{
+            .body = .{ .composition = .{ .compose = .{ .f = f_capture, .g = g_capture } } },
+            .idx = fidx,
+        });
+
+        var slots: [2]EnvSlot = undefined;
+        var n: usize = 0;
+        if (operandValue(f)) |v| {
+            slots[n] = .{ .capture = f_capture, .value = v };
+            n += 1;
+        }
+        if (operandValue(g)) |v| {
+            slots[n] = .{ .capture = g_capture, .value = v };
+            n += 1;
+        }
+        const env = try self.buildCompositionEnv(slots[0..n]);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, fidx);
+        self.pending_materialized = null;
+        return self.ctx.buildFnValue(try self.compositionFvType(chain), fn_addr, env);
+    }
+
+    /// Materialize `curry(f)` as a closure (R31c): the outer lifted function
+    /// takes `a` and returns the inner closure `|b| f(a, b)`, which captures
+    /// `f` and `a`.
+    fn materializeCurryOuter(self: *Lowerer, f: Operand, chain: CompositionChain) !api.Value {
+        const f_capture = captureOf(f);
+        const a_capture = try self.argumentCapture(self.curryArgType(chain));
+        const inner_fv_ty = try self.curryInnerFvType(chain);
+        const inner_sem = self.type_pool.get(self.curryInnerType(chain));
+        const inner_ret: api.TypeIdx = if (inner_sem == .function)
+            self.irTypeFor(inner_sem.function.return_type)
+        else
+            self.i64_ty;
+
+        // The inner closure `|b| f(a, b)`.
+        const inner_name = try self.compositionName("curry_inner");
+        defer self.gpa.free(inner_name);
+        const inner_fidx = try self.ctx.addFunction(inner_name, inner_ret, 2);
+        try self.all_functions.append(self.gpa, .{
+            .body = .{ .composition = .{ .curry_inner = .{ .f = f_capture, .a = a_capture } } },
+            .idx = inner_fidx,
+        });
+
+        // The outer closure `|a| |b| f(a, b)`.
+        const outer_name = try self.compositionName("curry_outer");
+        defer self.gpa.free(outer_name);
+        const outer_fidx = try self.ctx.addFunction(outer_name, inner_fv_ty, 2);
+        try self.all_functions.append(self.gpa, .{
+            .body = .{ .composition = .{ .curry_outer = .{
+                .f = f_capture,
+                .a = a_capture,
+                .inner = inner_fidx,
+                .inner_fv_ty = inner_fv_ty,
+            } } },
+            .idx = outer_fidx,
+        });
+
+        // The outer's env record holds `f`; `a` arrives as its argument.
+        var slots: [1]EnvSlot = undefined;
+        var n: usize = 0;
+        if (operandValue(f)) |v| {
+            slots[n] = .{ .capture = f_capture, .value = v };
+            n += 1;
+        }
+        const env = try self.buildCompositionEnv(slots[0..n]);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, outer_fidx);
+        // The binding that holds this value knows the composition, so an
+        // application of it materializes the inner closure at the
+        // application site (R31b).
+        self.pending_materialized = .{ .curry_outer = .{ .f = f, .chain = chain } };
+        return self.ctx.buildFnValue(try self.compositionFvType(chain), fn_addr, env);
+    }
+
+    /// Materialize `curry(f)(a)` as a closure (R31c): the lifted function
+    /// takes `b` and calls `f(a, b)`, capturing `f` and `a`.
+    fn materializeCurryInner(self: *Lowerer, f: Operand, a: api.Value, chain: CompositionChain) !api.Value {
+        const f_capture = captureOf(f);
+        const a_capture = try self.argumentCapture(self.curryArgType(chain));
+        const inner_fv_ty = try self.curryInnerFvType(chain);
+        const inner_sem = self.type_pool.get(self.curryInnerType(chain));
+        const inner_ret: api.TypeIdx = if (inner_sem == .function)
+            self.irTypeFor(inner_sem.function.return_type)
+        else
+            self.i64_ty;
+
+        const name = try self.compositionName("curry_inner");
+        defer self.gpa.free(name);
+        const fidx = try self.ctx.addFunction(name, inner_ret, 2);
+        try self.all_functions.append(self.gpa, .{
+            .body = .{ .composition = .{ .curry_inner = .{ .f = f_capture, .a = a_capture } } },
+            .idx = fidx,
+        });
+
+        var slots: [2]EnvSlot = undefined;
+        var n: usize = 0;
+        if (operandValue(f)) |v| {
+            slots[n] = .{ .capture = f_capture, .value = v };
+            n += 1;
+        }
+        slots[n] = .{ .capture = a_capture, .value = a };
+        n += 1;
+        const env = try self.buildCompositionEnv(slots[0..n]);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, fidx);
+        // The binding that holds this value knows the composition, so an
+        // application of it is a direct call to the lifted inner function
+        // (R31b).
+        self.pending_materialized = .{ .curry_inner = .{ .fidx = fidx, .ret = inner_ret, .env = env } };
+        return self.ctx.buildFnValue(inner_fv_ty, fn_addr, env);
+    }
+
+    /// Materialize `uncurry(h)` as a closure (R31c): the lifted function
+    /// takes `a` and `b` and computes `h(a)(b)`, capturing `h`.
+    fn materializeUncurry(self: *Lowerer, h: Operand, chain: CompositionChain) !api.Value {
+        const h_capture = captureOf(h);
+        const sem = self.chainType(chain);
+        const ret: api.TypeIdx = if (sem == .function) self.irTypeFor(sem.function.return_type) else self.i64_ty;
+
+        const name = try self.compositionName("uncurry");
+        defer self.gpa.free(name);
+        const fidx = try self.ctx.addFunction(name, ret, 3);
+        try self.all_functions.append(self.gpa, .{
+            .body = .{ .composition = .{ .uncurry = .{ .h = h_capture, .ret = ret } } },
+            .idx = fidx,
+        });
+
+        var slots: [1]EnvSlot = undefined;
+        var n: usize = 0;
+        if (operandValue(h)) |v| {
+            slots[n] = .{ .capture = h_capture, .value = v };
+            n += 1;
+        }
+        const env = try self.buildCompositionEnv(slots[0..n]);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, fidx);
+        self.pending_materialized = null;
+        return self.ctx.buildFnValue(try self.compositionFvType(chain), fn_addr, env);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifted composition bodies
+    // -----------------------------------------------------------------------
+
+    fn lowerCompositionBody(self: *Lowerer, comp: CompositionBody) !void {
+        switch (comp) {
+            .compose => |c| try self.lowerComposeBody(c),
+            .curry_outer => |c| try self.lowerCurryOuterBody(c),
+            .curry_inner => |c| try self.lowerCurryInnerBody(c),
+            .uncurry => |c| try self.lowerUncurryBody(c),
+        }
+    }
+
+    /// `compose(f, g)`: `|x| f(g(x))`. The env record holds `f` and `g`.
+    fn lowerComposeBody(self: *Lowerer, c: anytype) !void {
+        const env = self.ctx.getParam(0);
+        const x = self.ctx.getParam(1);
+        const gx = try self.callCapture(c.g, env, captureSize(c.f), &.{x});
+        const result = try self.callCapture(c.f, env, 0, &.{gx});
+        _ = try self.ctx.buildRet(result);
+        self.terminated();
+    }
+
+    /// `curry(f)`: `|a| |b| f(a, b)`. The env record holds `f`; the applied
+    /// argument `a` arrives as the parameter and is copied into the inner
+    /// closure's own env record.
+    fn lowerCurryOuterBody(self: *Lowerer, c: anytype) !void {
+        const env = self.ctx.getParam(0);
+        const a = self.ctx.getParam(1);
+
+        var slots: [2]EnvSlot = undefined;
+        var n: usize = 0;
+        switch (c.f) {
+            .direct => {},
+            .fn_value => {
+                const record = try self.loadCapture(env, 0, c.f);
+                slots[n] = .{ .capture = c.f, .value = record };
+                n += 1;
+            },
+            .value => {},
+        }
+        slots[n] = .{ .capture = c.a, .value = a };
+        n += 1;
+
+        const inner_env = try self.buildCompositionEnv(slots[0..n]);
+        const fn_addr = try self.ctx.buildFuncAddr(self.i64_ty, c.inner);
+        const value = try self.ctx.buildFnValue(c.inner_fv_ty, fn_addr, inner_env);
+        _ = try self.ctx.buildRet(value);
+        self.terminated();
+    }
+
+    /// `curry(f)(a)`: `|b| f(a, b)`. The env record holds `f` and `a`.
+    fn lowerCurryInnerBody(self: *Lowerer, c: anytype) !void {
+        const env = self.ctx.getParam(0);
+        const b = self.ctx.getParam(1);
+        const a = try self.loadCapture(env, captureSize(c.f), c.a);
+        const result = try self.callCapture(c.f, env, 0, &.{ a, b });
+        _ = try self.ctx.buildRet(result);
+        self.terminated();
+    }
+
+    /// `uncurry(h)`: `|a, b| h(a)(b)`. The env record holds `h`.
+    fn lowerUncurryBody(self: *Lowerer, c: anytype) !void {
+        const env = self.ctx.getParam(0);
+        const a = self.ctx.getParam(1);
+        const b = self.ctx.getParam(2);
+        const inner = try self.callCapture(c.h, env, 0, &.{a});
+        const result = try self.ctx.buildCallPtr(c.ret, inner, &.{b});
+        _ = try self.ctx.buildRet(result);
+        self.terminated();
+    }
+
+    /// Load a capture out of the env record (R8a): a fn value is copied into
+    /// a fresh 16-byte record, a plain value is loaded from its slot.
+    fn loadCapture(self: *Lowerer, env: api.Value, offset: u64, cap: Capture) !api.Value {
+        const slot = try self.ctx.buildPtrAdd(
+            self.ptr_ty,
+            env,
+            try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+        );
+        switch (cap) {
+            .direct => {
+                self.codegenError(NodeIdx.none, "a direct operand has no env slot", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
+            .fn_value => {
+                const record = try self.ctx.buildAllocaBytes(self.ptr_ty, api.fn_value_size);
+                const word0 = try self.ctx.buildLoad(self.i64_ty, slot);
+                _ = try self.ctx.buildStore(self.i64_ty, record, word0);
+                const src1 = try self.ctx.buildPtrAdd(self.ptr_ty, slot, try self.ctx.buildIntConst(self.i64_ty, 8));
+                const word1 = try self.ctx.buildLoad(self.i64_ty, src1);
+                const dst1 = try self.ctx.buildPtrAdd(self.ptr_ty, record, try self.ctx.buildIntConst(self.i64_ty, 8));
+                _ = try self.ctx.buildStore(self.i64_ty, dst1, word1);
+                return record;
+            },
+            .value => |ty| {
+                return self.ctx.buildLoad(ty, slot);
+            },
+        }
+    }
+
+    /// Call a captured operand from a lifted composition body: a statically
+    /// known fn is called directly, a captured fn value through `call_ptr`.
+    fn callCapture(
+        self: *Lowerer,
+        cap: Capture,
+        env: api.Value,
+        offset: u64,
+        args: []const api.Value,
+    ) !api.Value {
+        switch (cap) {
+            .direct => |d| {
+                var vals = std.ArrayList(api.Value).empty;
+                defer vals.deinit(self.gpa);
+                try vals.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
+                for (args) |a| try vals.append(self.gpa, a);
+                return self.ctx.buildCall(d.fidx, d.ret, vals.items);
+            },
+            .fn_value => |fv| {
+                const record = try self.loadCapture(env, offset, cap);
+                return self.ctx.buildCallPtr(fv.ret, record, args);
+            },
+            .value => {
+                self.codegenError(NodeIdx.none, "a plain value is not callable", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
+        }
     }
 
     /// Lower an enum variant constructor (`Some(x)`): stack block with the
@@ -2791,4 +3783,142 @@ test "lower: a tail `?` closure re-wraps the payload into the return enum" {
         idx = pos + 4;
     }
     try std.testing.expectEqual(@as(usize, 2), rets);
+}
+
+test "lower: prelude curry(add)(1)(2) expands to direct calls with no call_ptr" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    return curry(add)(1)(2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @") != null);
+}
+
+test "lower: prelude compose(f,g)(x) expands to two direct calls" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn inc(x: i32) -> i32 { return x + 1 }
+        \\fn double(x: i32) -> i32 { return x * 2 }
+        \\fn main() -> i32 {
+        \\    let f: fn(i32) -> i32 = compose(double, inc)
+        \\    return f(3)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // compose expands to direct calls in the expanded form
+    var call_count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, text, idx, "call @")) |pos| {
+        call_count += 1;
+        idx = pos + 6;
+    }
+    try std.testing.expect(call_count >= 2);
+}
+
+test "lower: prelude id and pipe expand directly" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn inc(x: i32) -> i32 { return x + 1 }
+        \\fn main() -> i32 {
+        \\    let a = id(5)
+        \\    let b = pipe(3, inc)
+        \\    return a + b
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") == null);
+}
+
+test "lower: uncurry(h)(a,b) expands to direct calls" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let h = curry(add)
+        \\    return uncurry(h)(1, 2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @") != null);
+}
+
+test "lower: uncurry(curry(f))(a,b) fuses to a direct call" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    return uncurry(curry(add))(1, 2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call @") != null);
+}
+
+test "lower: a stored uncurry(curry(f)) holds f without an intermediate closure" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let u = uncurry(curry(add))
+        \\    return u(1, 2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The fused pair holds `add`'s own fn value, so no closure of the pair
+    // (whose env would die with its frame) is lifted.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @curry_outer_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @curry_inner_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @uncurry_") == null);
+}
+
+test "lower: uncurrying a stored curry keeps the searchable operand" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let h = curry(add)
+        \\    let u = uncurry(h)
+        \\    return u(1, 2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // `u` holds `add`'s own fn value, not `curry(add)`'s, so the pair does
+    // not lift an `uncurry` function.
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @uncurry_") == null);
+}
+
+test "lower: materialized curry(f) produces a fn value with env record" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn add(a: i32, b: i32) -> i32 { return a + b }
+        \\fn main() -> i32 {
+        \\    let f = curry(add)
+        \\    let g = f(1)
+        \\    return g(2)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // Materialized forms use fn values/indirect calls
+    try std.testing.expect(std.mem.indexOf(u8, text, "func_addr") != null or std.mem.indexOf(u8, text, "call_ptr") != null);
 }
