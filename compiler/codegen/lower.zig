@@ -23,6 +23,7 @@ const ast = @import("../parser/ast.zig");
 const diag = @import("../diagnostics.zig");
 const types_mod = @import("../semantic/types.zig");
 const typecheck_mod = @import("../semantic/typecheck.zig");
+const generics_mod = @import("../semantic/generics.zig");
 const scope_mod = @import("../semantic/scope.zig");
 const prelude = @import("../prelude.zig");
 const string_mod = @import("string.zig");
@@ -37,6 +38,7 @@ const BinaryOp = ast.BinaryOp;
 const TypePool = types_mod.TypePool;
 const TypeIdx = types_mod.TypeIdx;
 const SemType = types_mod.SemType;
+const GenericInstance = generics_mod.GenericInstance;
 
 /// A name binding inside a function body.
 /// `value` is the SSA value (parameters) or slot pointer (locals);
@@ -158,13 +160,23 @@ pub const Lowerer = struct {
             switch (decl.*) {
                 .fn_decl => |f| {
                     if (f.generic_params.indices.len > 0) {
-                        self.codegenError(decl_idx, "generic functions are not lowered yet", .{});
+                        // A generic fn is a template, not a function: it has
+                        // no body of its own to lower. Each instance is
+                        // lowered as its own function, named after its type
+                        // arguments (R21 step 4, R22).
                         continue;
                     }
                     _ = try self.createFunction(decl_idx, self.nameSlice(f.name));
                 },
                 else => {},
             }
+        }
+
+        // Pass 1b: create one function per monomorphized instance. The
+        // instances are created lazily by the checker, so this is where the
+        // generic templates turn into real functions (R21 step 4).
+        for (self.checker.instances()) |inst| {
+            _ = try self.createInstanceFunction(inst);
         }
 
         // Pass 2: function bodies. Closure lifting appends new functions
@@ -190,6 +202,25 @@ pub const Lowerer = struct {
         const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(f.params.indices.len)) + env_hole);
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
         try self.all_functions.append(self.gpa, .{ .node = decl_idx, .idx = fidx });
+        return fidx;
+    }
+
+    /// Create the function of one monomorphized instance (R21 step 4).
+    ///
+    /// The instance's symbol is the mangled name `<base>__<args>` (R22) and
+    /// its body is the clone the checker type-checked with the type
+    /// arguments bound (R21 step 2). An instance is never `main`, so it
+    /// always carries the hidden env parameter.
+    fn createInstanceFunction(self: *Lowerer, inst: *GenericInstance) !api.FunctionIdx {
+        const clone = self.arena.get(inst.clone).fn_decl;
+        const ret_ir = self.irTypeFor(inst.return_type);
+        const fidx = try self.ctx.addFunction(
+            inst.mangled,
+            ret_ir,
+            @as(u32, @intCast(clone.params.indices.len)) + 1,
+        );
+        try self.fn_by_node.put(self.gpa, inst.clone, fidx);
+        try self.all_functions.append(self.gpa, .{ .node = inst.clone, .idx = fidx });
         return fidx;
     }
 
@@ -362,6 +393,36 @@ pub const Lowerer = struct {
             .for_each => |fe| try self.lowerForEach(node_idx, fe),
             .match_expr => try self.lowerMatch(node_idx),
             .fn_decl => {},
+            .comptime_block => {
+                const block = node.comptime_block;
+                const bnode = self.arena.get(block);
+                if (bnode.* == .block) {
+                    for (bnode.block.stmts.indices) |stmt| {
+                        _ = try self.lowerStmt(stmt);
+                    }
+                } else {
+                    _ = try self.lowerStmt(block);
+                }
+            },
+            .comptime_expr => |inner| {
+                const inner_node = self.arena.get(inner);
+                if (inner_node.* == .if_expr) {
+                    if (self.checker.comptimeBranch(inner)) |taken| {
+                        const branch = if (taken) inner_node.if_expr.then_body else (inner_node.if_expr.else_body orelse return);
+                        const bn = self.arena.get(branch);
+                        if (bn.* == .block) {
+                            try self.lowerBlock(bn.block.stmts);
+                        } else {
+                            _ = try self.lowerExpr(branch);
+                        }
+                        return;
+                    }
+                }
+                _ = try self.lowerExpr(node_idx);
+            },
+            .comptime_call => {
+                _ = try self.lowerComptimeCall(node_idx, node.comptime_call);
+            },
             else => _ = try self.lowerExpr(node_idx),
         }
     }
@@ -434,6 +495,8 @@ pub const Lowerer = struct {
     fn allocVarSlot(self: *Lowerer, ty: TypeIdx) !api.Value {
         const size: u32 = switch (self.type_pool.get(ty)) {
             .struct_type => |decl_node| structSize(self.arena, decl_node),
+            // An applied struct has the layout of its declaration (R20c).
+            .applied_struct => |a| structSize(self.arena, a.decl),
             else => 8,
         };
         return self.ctx.buildAllocaBytes(self.ptr_ty, size);
@@ -878,7 +941,7 @@ pub const Lowerer = struct {
             },
             .index_access => |ia| return self.lowerIndexAccess(node_idx, ia),
             .generic_app => {
-                self.codegenError(node_idx, "generic application is not lowered yet", .{});
+                self.codegenError(node_idx, "a type application is not a value", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
             .paren_expr => |p| return self.lowerExpr(p),
@@ -892,6 +955,31 @@ pub const Lowerer = struct {
             .if_expr => |i| return self.lowerIfExpr(node_idx, i),
             .match_expr => return self.lowerMatchExpr(node_idx),
             .try_propagate => |inner| return self.lowerPropagate(node_idx, inner),
+            .comptime_block => {
+                const block = node.comptime_block;
+                const bnode = self.arena.get(block);
+                if (bnode.* == .block) {
+                    for (bnode.block.stmts.indices) |stmt| {
+                        _ = try self.lowerStmt(stmt);
+                    }
+                } else {
+                    _ = try self.lowerStmt(block);
+                }
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
+            .comptime_expr => |inner| {
+                const inner_node = self.arena.get(inner);
+                if (inner_node.* == .if_expr) {
+                    if (self.checker.comptimeBranch(inner)) |taken| {
+                        const branch = if (taken) inner_node.if_expr.then_body else (inner_node.if_expr.else_body orelse return self.ctx.buildIntConst(self.i64_ty, 0));
+                        return self.lowerExpr(branch);
+                    }
+                }
+                const cv = self.checker.comptimeValue(node_idx);
+                if (cv != .none) return try self.lowerComptimeValue(cv);
+                return self.lowerExpr(inner);
+            },
+            .comptime_call => |cc| return self.lowerComptimeCall(node_idx, cc),
             .while_expr, .for_range, .for_each => {
                 self.codegenError(node_idx, "loops in expression position are not supported", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -940,11 +1028,17 @@ pub const Lowerer = struct {
         const operand = try self.lowerExpr(inner);
         const operand_ty = self.exprType(inner);
         const sem = self.type_pool.get(operand_ty);
-        if (sem != .enum_type) {
-            self.codegenError(node_idx, "cannot propagate a non-enum value", .{});
-            return self.ctx.buildIntConst(self.i64_ty, 0);
-        }
-        const shape = self.checker.propagateShape(sem.enum_type) orelse {
+        // An applied enum has the layout of the declaration it was
+        // instantiated from (R2a), so the shape comes from that declaration.
+        const enum_node = switch (sem) {
+            .enum_type => |n| n,
+            .applied_enum => |a| a.decl,
+            else => {
+                self.codegenError(node_idx, "cannot propagate a non-enum value", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
+        };
+        const shape = self.checker.propagateShape(enum_node) orelse {
             self.codegenError(node_idx, "cannot propagate this enum: no one-payload success variant and error variant", .{});
             return self.ctx.buildIntConst(self.i64_ty, 0);
         };
@@ -1179,7 +1273,9 @@ pub const Lowerer = struct {
     /// address) is spilled to a fresh slot first.
     fn lowerRef(self: *Lowerer, node_idx: NodeIdx, operand_idx: NodeIdx) !api.Value {
         switch (self.type_pool.get(self.exprType(operand_idx))) {
-            .struct_type, .enum_type, .string_type, .array, .pointer => return self.lowerExpr(operand_idx),
+            .struct_type, .enum_type, .string_type, .array, .pointer,
+            .applied_struct, .applied_enum,
+            => return self.lowerExpr(operand_idx),
             else => {},
         }
 
@@ -1236,6 +1332,12 @@ pub const Lowerer = struct {
                     self.codegenError(node_idx, "'{s}' is not a function", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
                 }
+                // A generic fn is a template: the call names an *instance*,
+                // which the checker resolved while type-checking the call
+                // site (R21).
+                if (self.checker.instanceForCallee(func)) |inst| {
+                    return self.lowerInstanceCall(node_idx, inst, args, piped, hole);
+                }
                 const fidx = self.fn_by_node.get(sym.decl_node) orelse {
                     self.codegenError(node_idx, "function '{s}' has no lowering", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -1262,8 +1364,40 @@ pub const Lowerer = struct {
                 });
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
+            .index_access, .generic_app => {
+                // A type application in callee position (`first[i32](...)`)
+                // names a generic fn: the call goes to the instance the
+                // checker resolved for those type arguments (R21).
+                if (self.checker.instanceForCallee(func)) |inst| {
+                    return self.lowerInstanceCall(node_idx, inst, args, piped, hole);
+                }
+                return self.lowerCallIndirect(node_idx, func, args, piped, hole);
+            },
             else => return self.lowerCallIndirect(node_idx, func, args, piped, hole),
         }
+    }
+
+    /// Lower a call to a monomorphized instance: a direct call to the
+    /// instance's function, with a null env in the hidden argument slot
+    /// (R14a — an instance never captures anything).
+    fn lowerInstanceCall(
+        self: *Lowerer,
+        node_idx: NodeIdx,
+        inst: *GenericInstance,
+        args: []const NodeIdx,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) !api.Value {
+        const fidx = self.fn_by_node.get(inst.clone) orelse {
+            self.codegenError(node_idx, "instance '{s}' has no lowering", .{inst.mangled});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        };
+        var vals = try self.lowerArgs(args, piped, hole);
+        defer vals.deinit(self.gpa);
+        const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+        try vals.insert(self.gpa, 0, null_env);
+        const ret_ir = self.irTypeFor(inst.return_type);
+        return self.ctx.buildCall(fidx, ret_ir, vals.items);
     }
 
     /// Lower a call through a fn value: the callee expression is a `{ fn_ptr,
@@ -1470,7 +1604,11 @@ pub const Lowerer = struct {
         const ty = self.checker.nodeType(si.ty);
         const sem = self.type_pool.get(ty);
         const decl_node = switch (sem) {
+            // An applied struct has the layout of the declaration it was
+            // instantiated from, with the type arguments substituted into
+            // the field types (R20c, R25).
             .struct_type => |n| n,
+            .applied_struct => |a| a.decl,
             else => {
                 self.codegenError(node_idx, "struct init on a non-struct type", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -1516,8 +1654,10 @@ pub const Lowerer = struct {
         var decl_node: ?NodeIdx = null;
         switch (sem) {
             .struct_type => |n| decl_node = n,
+            .applied_struct => |a| decl_node = a.decl,
             .pointer => |elem| switch (self.type_pool.get(elem)) {
                 .struct_type => |n| decl_node = n,
+                .applied_struct => |a| decl_node = a.decl,
                 else => {},
             },
             else => {},
@@ -1689,6 +1829,69 @@ pub const Lowerer = struct {
     }
 
     /// Semantic type of a local/param binding by name, if any.
+    /// Lower a comptime builtin call: `@assert` is a compile-time check with
+    /// no runtime code, `@field` does a field access, `@hasField`/`@sizeOf`/
+    /// `@alignOf`/`@typeOf` become their comptime values (R23a).
+    fn lowerComptimeCall(self: *Lowerer, node_idx: NodeIdx, cc: anytype) !api.Value {
+        const name = self.nameSlice(cc.name);
+        const cv = self.checker.comptimeValue(node_idx);
+        if (cv != .none) return try self.lowerComptimeValue(cv);
+        if (std.mem.eql(u8, name, "assert")) return self.ctx.buildIntConst(self.i64_ty, 0);
+        if (std.mem.eql(u8, name, "field")) {
+            if (cc.args.indices.len == 2) {
+                const field_lit = self.arena.get(cc.args.indices[1]);
+                if (field_lit.* == .string_literal) {
+                    const bare = field_lit.string_literal.slice(self.source);
+                    const s = if (bare.len >= 2 and bare[0] == '"' and bare[bare.len - 1] == '"') bare[1 .. bare.len - 1] else bare;
+                    const obj_ty = self.checker.nodeType(cc.args.indices[0]);
+                    const sem = self.type_pool.get(obj_ty);
+                    const decl_node: ?NodeIdx = switch (sem) {
+                        .struct_type => |n| n,
+                        .applied_struct => |a| a.decl,
+                        .pointer => |elem| switch (self.type_pool.get(elem)) {
+                            .struct_type => |n| n,
+                            .applied_struct => |a| a.decl,
+                            else => null,
+                        },
+                        else => null,
+                    };
+                    if (decl_node) |dn| {
+                        if (structFieldOffset(self.arena, self.source, dn, s)) |off| {
+                            const obj = try self.lowerExpr(cc.args.indices[0]);
+                            const off_val = try self.ctx.buildIntConst(self.i64_ty, @intCast(off));
+                            const addr = try self.ctx.buildPtrAdd(self.ptr_ty, obj, off_val);
+                            return self.ctx.buildLoad(self.i64_ty, addr);
+                        }
+                    }
+                }
+            }
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        return self.ctx.buildIntConst(self.i64_ty, 0);
+    }
+
+    /// Turn a comptime value into a runtime constant (R23a).
+    fn lowerComptimeValue(self: *Lowerer, cv: anytype) !api.Value {
+        return switch (cv) {
+            .none => self.ctx.buildIntConst(self.i64_ty, 0),
+            .bool => |v| self.ctx.buildIntConst(self.bool_ty, if (v) 1 else 0),
+            .int => |v| self.ctx.buildIntConst(self.i64_ty, v),
+            .float => |v| self.ctx.buildFloatConst(self.f64_ty, v),
+            .string => |s| blk: {
+                const bytes = try self.gpa.dupe(u8, s);
+                defer self.gpa.free(bytes);
+                const global = try self.strings.globalFor(bytes);
+                const repr = try self.ctx.buildAllocaBytes(self.ptr_ty, string_mod.total_size);
+                _ = try self.ctx.buildStore(self.i64_ty, repr, try self.ctx.buildIntConst(self.i64_ty, @intCast(bytes.len)));
+                const data = try self.ctx.buildGlobalAddr(self.ptr_ty, global);
+                const data_addr = try self.ctx.buildPtrAdd(self.ptr_ty, repr, try self.ctx.buildIntConst(self.i64_ty, @intCast(string_mod.data_offset)));
+                _ = try self.ctx.buildStore(self.i64_ty, data_addr, data);
+                break :blk repr;
+            },
+            .type_value => self.ctx.buildIntConst(self.i64_ty, 0),
+        };
+    }
+
     fn bindingType(self: *Lowerer, name: []const u8) ?TypeIdx {
         if (self.params.get(name)) |p| return p.ty;
         if (self.locals.get(name)) |l| return l.ty;
@@ -1919,6 +2122,26 @@ test "lower: print lowers to an extern call into the runtime" {
     try std.testing.expect(std.mem.indexOf(u8, text, "wfr_std_print") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern_call") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "iconst 42") != null);
+}
+
+test "lower: a generic fn is monomorphized per type argument" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn first[T](a: T, b: T) -> T {
+        \\    return a
+        \\}
+        \\fn main() -> i32 {
+        \\    let x = first(1, 2)
+        \\    return x
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // The template has no function of its own; the instance carries the
+    // mangled symbol `first__i32` (R22).
+    try std.testing.expect(std.mem.indexOf(u8, text, "first__i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fn @first__i32(") != null);
 }
 
 test "lower: expression-body fn shorthand returns its value" {

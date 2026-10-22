@@ -4,6 +4,7 @@ const diag = @import("../diagnostics.zig");
 const prelude = @import("../prelude.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
+const generics_mod = @import("generics.zig");
 
 const Allocator = std.mem.Allocator;
 const AstArena = ast.AstArena;
@@ -16,6 +17,9 @@ const TypePool = types_mod.TypePool;
 const TypeIdx = types_mod.TypeIdx;
 const SemType = types_mod.SemType;
 const FloatKind = types_mod.FloatKind;
+const GenericInfo = generics_mod.GenericInfo;
+const GenericInstance = generics_mod.GenericInstance;
+const ComptimeValue = generics_mod.ComptimeValue;
 
 /// What an inferred type placeholder stands for, for diagnostics.
 const PendingKind = enum { param, closure_ret };
@@ -36,6 +40,15 @@ const PendingType = struct {
 const UnifiedPair = struct {
     left: TypeIdx,
     right: TypeIdx,
+};
+
+/// A comptime value and the type it denotes (docs/semantics.md §7.5, R23a).
+///
+/// The value is what the comptime expression evaluated to; the type is what
+/// the expression is typed as, so the lowerer knows what to emit for it.
+const ComptimeBinding = struct {
+    value: ComptimeValue,
+    ty: TypeIdx,
 };
 
 /// Walking state for closure capture-set inference (R7): the captures found so
@@ -97,6 +110,8 @@ pub const TypeChecker = struct {
 
     type_name_buf: [2][16]u8,
     type_name_toggle: u1 = 0,
+    /// Scratch buffer for rendering a comptime expression into a diagnostic.
+    constraint_buf: [256]u8 = undefined,
 
     /// Inference state for closures typed without annotations (R11b). Keyed by
     /// the binder: a closure parameter node, or the closure node itself for its
@@ -107,6 +122,31 @@ pub const TypeChecker = struct {
 
     /// Cache for instantiated generic functions: (decl, args hash/signature) -> applied_fn sig/type
     instantiations: std.AutoHashMapUnmanaged(u64, TypeIdx),
+
+    /// The generic table (R21): one template per generic declaration.
+    generic_info: std.AutoHashMapUnmanaged(NodeIdx, GenericInfo),
+    /// The instantiation cache (R20b/R21b): instance key -> instance. The
+    /// key is the declaration plus the structural hash of the type arguments,
+    /// so the same `(decl, args)` always maps to one instance.
+    fn_instances: std.AutoHashMapUnmanaged(u64, *GenericInstance),
+    /// The instances in creation order, so codegen can emit one function per
+    /// instance.
+    instance_list: std.ArrayListUnmanaged(*GenericInstance),
+    /// The instance a call site resolves to, keyed by the callee node. The
+    /// callee node is the identifier (or the type application) the call
+    /// names, so a pipeline and a direct call of the same generic share it.
+    instance_by_callee: std.AutoHashMapUnmanaged(NodeIdx, *GenericInstance),
+
+    /// The comptime value of every evaluated comptime expression, keyed by
+    /// node (R23a). The checker computes the value; the lowerer only has to
+    /// turn it into a constant.
+    comptime_values: std.AutoHashMapUnmanaged(NodeIdx, ComptimeBinding),
+    /// The branch a `comptime if` takes, keyed by the `if` node: true when
+    /// the then-branch is taken (R23c).
+    comptime_branches: std.AutoHashMapUnmanaged(NodeIdx, bool),
+    /// Set when a comptime constraint fails. The instance being checked stops
+    /// type-checking at that point (R23b).
+    constraint_failed: bool = false,
 
     void_ty: TypeIdx,
     bool_ty: TypeIdx,
@@ -121,6 +161,8 @@ pub const TypeChecker = struct {
     f32_ty: TypeIdx,
     f64_ty: TypeIdx,
     string_ty: TypeIdx,
+    /// The type of a type value (`@typeOf(x)`).
+    type_value_ty: TypeIdx,
 
     pub fn init(
         allocator: Allocator,
@@ -144,6 +186,7 @@ pub const TypeChecker = struct {
         const f32_ty = type_pool.add(.{ .float = .f32 }) catch @panic("OOM");
         const f64_ty = type_pool.add(.{ .float = .f64 }) catch @panic("OOM");
         const string_ty = type_pool.add(.string_type) catch @panic("OOM");
+        const type_value_ty = type_pool.add(.type_value) catch @panic("OOM");
 
         var node_types: std.ArrayListUnmanaged(TypeIdx) = .empty;
         node_types.append(allocator, void_ty) catch @panic("OOM");
@@ -175,6 +218,12 @@ pub const TypeChecker = struct {
             .pending = .empty,
             .pending_by_type = .empty,
             .instantiations = .empty,
+            .generic_info = .empty,
+            .fn_instances = .empty,
+            .instance_list = .empty,
+            .instance_by_callee = .empty,
+            .comptime_values = .empty,
+            .comptime_branches = .empty,
             .void_ty = void_ty,
             .bool_ty = bool_ty,
             .i8_ty = i8_ty,
@@ -188,6 +237,7 @@ pub const TypeChecker = struct {
             .f32_ty = f32_ty,
             .f64_ty = f64_ty,
             .string_ty = string_ty,
+            .type_value_ty = type_value_ty,
         };
     }
 
@@ -213,6 +263,24 @@ pub const TypeChecker = struct {
         self.pending.deinit(self.allocator);
         self.pending_by_type.deinit(self.allocator);
         self.instantiations.deinit(self.allocator);
+        for (self.instance_list.items) |inst| {
+            self.allocator.free(inst.args);
+            self.allocator.free(inst.mangled);
+            self.allocator.destroy(inst);
+        }
+        self.instance_list.deinit(self.allocator);
+        self.fn_instances.deinit(self.allocator);
+        self.instance_by_callee.deinit(self.allocator);
+        self.comptime_values.deinit(self.allocator);
+        self.comptime_branches.deinit(self.allocator);
+        var info_it = self.generic_info.iterator();
+        while (info_it.next()) |entry| {
+            const info = entry.value_ptr.*;
+            self.allocator.free(info.param_names);
+            self.allocator.free(info.param_nodes);
+            self.allocator.free(info.template_params);
+        }
+        self.generic_info.deinit(self.allocator);
         self.scopes.deinit();
     }
 
@@ -262,7 +330,19 @@ pub const TypeChecker = struct {
     fn checkDecl(self: *TypeChecker, decl_idx: NodeIdx) anyerror!void {
         const decl = self.arena.get(decl_idx);
         switch (decl.*) {
-            .fn_decl => try self.checkFnDecl(decl_idx),
+            .fn_decl => {
+                const f = decl.fn_decl;
+                if (f.generic_params.indices.len > 0) {
+                    // A generic fn is a template: its parameters stand for
+                    // `generic_param` placeholders, so the body cannot be
+                    // type-checked as written. It is checked once per
+                    // instance, on a clone with the type arguments bound
+                    // (R21 step 2). Here only the template is resolved.
+                    _ = self.genericInfoFor(decl_idx);
+                    return;
+                }
+                try self.checkFnDecl(decl_idx);
+            },
             .enum_decl => try self.checkEnumDecl(decl_idx),
             else => {},
         }
@@ -336,7 +416,1113 @@ pub const TypeChecker = struct {
         self.in_function = prev_in_fn;
     }
 
+    // ========================================================================
+    // Comptime generics and monomorphization (R19-R25)
+    // ========================================================================
+
+    /// The declared name of a declaration, for diagnostics and mangling.
+    fn declName(self: *const TypeChecker, decl_idx: NodeIdx) []const u8 {
+        const decl = self.arena.get(decl_idx);
+        return switch (decl.*) {
+            .fn_decl => |f| f.name.slice(self.source),
+            .struct_decl => |s| s.name.slice(self.source),
+            .enum_decl => |e| e.name.slice(self.source),
+            else => "generic",
+        };
+    }
+
+    /// Whether a declaration is a generic template.
+    fn isGenericDecl(self: *const TypeChecker, decl_idx: NodeIdx) bool {
+        const decl = self.arena.get(decl_idx);
+        return decl.* == .fn_decl and decl.fn_decl.generic_params.indices.len > 0;
+    }
+
+    /// The template of a generic declaration: its generic parameters, the
+    /// parameter types written with `generic_param` placeholders, and the
+    /// return type template (R19d).
+    ///
+    /// The template is resolved once per declaration and shared by every
+    /// instance; substitution turns it into concrete types (R21 step 2).
+    fn genericInfoFor(self: *TypeChecker, decl_idx: NodeIdx) GenericInfo {
+        if (self.generic_info.get(decl_idx)) |info| return info;
+
+        const f = self.arena.get(decl_idx).fn_decl;
+        const count = f.generic_params.indices.len;
+
+        const names = self.allocator.alloc(StringRef, count) catch @panic("OOM");
+        const nodes = self.allocator.alloc(NodeIdx, count) catch @panic("OOM");
+        for (f.generic_params.indices, 0..) |gp_idx, i| {
+            const gp = self.arena.get(gp_idx);
+            names[i] = gp.identifier;
+            nodes[i] = gp_idx;
+        }
+
+        const tparams = self.allocator.alloc(TypeIdx, f.params.indices.len) catch @panic("OOM");
+        for (f.params.indices, 0..) |param_idx, i| {
+            const param = self.arena.get(param_idx);
+            tparams[i] = self.resolveTemplateType(f.generic_params, param.param.ty);
+        }
+
+        const tret: TypeIdx = if (f.return_type) |ret|
+            self.resolveTemplateType(f.generic_params, ret)
+        else
+            self.void_ty;
+
+        const info = GenericInfo{
+            .decl = decl_idx,
+            .param_names = names,
+            .param_nodes = nodes,
+            .template_params = tparams,
+            .template_return = tret,
+        };
+        self.generic_info.put(self.allocator, decl_idx, info) catch @panic("OOM");
+        return info;
+    }
+
+    /// The index of the generic parameter a type node names, if any.
+    fn genericParamIndex(self: *const TypeChecker, gparams: NodeList, node: NodeIdx) ?u32 {
+        const inner = self.arena.get(node);
+        if (inner.* != .identifier) return null;
+        const name = self.nameSlice(inner.identifier);
+        for (gparams.indices, 0..) |gp_idx, i| {
+            const gp = self.arena.get(gp_idx);
+            if (std.mem.eql(u8, self.nameSlice(gp.identifier), name)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// The `generic_param` placeholder for a generic parameter used in type
+    /// position (R19d).
+    fn genericParamType(self: *TypeChecker, node: NodeIdx, index: u32) TypeIdx {
+        const inner = self.arena.get(node).identifier;
+        return self.type_pool.add(.{ .generic_param = .{ .name = inner, .index = index } }) catch @panic("OOM");
+    }
+
+    /// Resolve a type node in template mode: a name that is one of the
+    /// declaration's generic parameters becomes a `generic_param` placeholder;
+    /// every other type resolves as usual.
+    fn resolveTemplateType(self: *TypeChecker, gparams: NodeList, node: NodeIdx) TypeIdx {
+        const n = self.arena.get(node);
+        switch (n.*) {
+            .identifier => {
+                if (self.genericParamIndex(gparams, node)) |i| {
+                    return self.genericParamType(node, i);
+                }
+                return self.inferExprType(node);
+            },
+            .unary_op => |u| {
+                switch (u.op) {
+                    .ref, .mut_ref => {
+                        const pointee = self.resolveTemplateType(gparams, u.operand);
+                        return self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
+                    },
+                    else => return self.inferExprType(node),
+                }
+            },
+            .fn_type => |ft| {
+                const params = self.allocator.alloc(TypeIdx, ft.params.indices.len) catch @panic("OOM");
+                defer self.allocator.free(params);
+                for (ft.params.indices, 0..) |p, i| {
+                    params[i] = self.resolveTemplateType(gparams, p);
+                }
+                const ret = self.resolveTemplateType(gparams, ft.return_type);
+                return self.functionType(params, ret);
+            },
+            .generic_app => |ga| {
+                if (self.resolveTemplateApp(gparams, ga.base, ga.args.indices)) |ty| return ty;
+                return self.inferExprType(node);
+            },
+            .index_access => |ia| {
+                const one = [_]NodeIdx{ia.index};
+                if (self.resolveTemplateApp(gparams, ia.object, &one)) |ty| return ty;
+                return self.inferExprType(node);
+            },
+            else => return self.inferExprType(node),
+        }
+    }
+
+    /// Resolve a type application in template mode: `Pair[T, U]` inside a
+    /// generic body is an applied struct whose arguments are still
+    /// placeholders.
+    fn resolveTemplateApp(
+        self: *TypeChecker,
+        gparams: NodeList,
+        base: NodeIdx,
+        arg_nodes: []const NodeIdx,
+    ) ?TypeIdx {
+        const base_node = self.arena.get(base);
+        if (base_node.* != .identifier) return null;
+        const name = self.nameSlice(base_node.identifier);
+        const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return null;
+        switch (sym.kind) {
+            .struct_type, .enum_type => {},
+            else => return null,
+        }
+        const decl = self.arena.get(sym.decl_node);
+        const gp_count = switch (decl.*) {
+            .struct_decl => |s| s.generic_params.indices.len,
+            .enum_decl => |e| e.generic_params.indices.len,
+            else => return null,
+        };
+        if (gp_count != arg_nodes.len) return null;
+
+        const args = self.allocator.alloc(TypeIdx, arg_nodes.len) catch @panic("OOM");
+        for (arg_nodes, 0..) |a, i| {
+            args[i] = self.resolveTemplateType(gparams, a);
+        }
+        return self.appliedType(sym.decl_node, args);
+    }
+
+    /// The instance of a generic declaration for a concrete set of type
+    /// arguments (R20b/R21).
+    ///
+    /// The instance is cached: the same `(decl, args)` always maps to the same
+    /// instance (R21b), and the cache entry is published *before* the body is
+    /// checked, so a recursive use resolves to the instance being built
+    /// (R21a).
+    fn instanceFor(self: *TypeChecker, decl_idx: NodeIdx, args: []const TypeIdx) !*GenericInstance {
+        const key = self.instanceKey(decl_idx, args);
+        if (self.fn_instances.get(key)) |inst| return inst;
+
+        const info = self.genericInfoFor(decl_idx);
+
+        // The clone stands in for the generic body: it is type-checked and
+        // lowered as its own function (R21 step 2).
+        const clone = try ast.cloneSubtree(self.arena, decl_idx);
+
+        const owned_args = try self.allocator.alloc(TypeIdx, args.len);
+        @memcpy(owned_args, args);
+
+        // The concrete signature: the template's parameter and return types
+        // with the type arguments substituted in.
+        const param_types = try self.allocator.alloc(TypeIdx, info.template_params.len);
+        defer self.allocator.free(param_types);
+        for (info.template_params, 0..) |t, i| {
+            param_types[i] = try generics_mod.substType(self.type_pool, t, owned_args);
+        }
+        const return_type = try generics_mod.substType(self.type_pool, info.template_return, owned_args);
+        const sig = self.functionType(param_types, return_type);
+
+        var mangler = generics_mod.Mangler.init(self.arena, self.source, self.type_pool, self.allocator);
+        defer mangler.deinit();
+        try mangler.mangleInstance(self.declName(decl_idx), owned_args);
+        const mangled = try self.allocator.dupe(u8, mangler.out.items);
+
+        const inst = try self.allocator.create(GenericInstance);
+        errdefer self.allocator.destroy(inst);
+        inst.* = .{
+            .decl = decl_idx,
+            .args = owned_args,
+            .mangled = mangled,
+            .clone = clone,
+            .sig = sig,
+            .return_type = return_type,
+        };
+
+        // Publish the instance before checking the body so that a recursive
+        // use of the same `(decl, args)` resolves to it (R21a).
+        try self.fn_instances.put(self.allocator, key, inst);
+        try self.instance_list.append(self.allocator, inst);
+
+        try self.checkGenericInstance(inst);
+        return inst;
+    }
+
+    /// The cache key of an instance: the declaration plus the structural hash
+    /// of the type arguments, so that two sites naming the same instance land
+    /// on the same key (R20a).
+    fn instanceKey(self: *const TypeChecker, decl_idx: NodeIdx, args: []const TypeIdx) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        h = (h ^ @as(u64, @intFromEnum(decl_idx))) *% 0x100000001b3;
+        for (args) |arg| {
+            h = (h ^ generics_mod.typeHash(self.type_pool, arg)) *% 0x100000001b3;
+        }
+        return h;
+    }
+
+    /// Type-check the clone of a generic body with the type arguments bound
+    /// (R21 step 2: substitute, then resolve and type-check the clone in a
+    /// fresh scope, exactly like ordinary code).
+    fn checkGenericInstance(self: *TypeChecker, inst: *GenericInstance) !void {
+        const clone = self.arena.get(inst.clone).fn_decl;
+
+        const prev_ret = self.fn_ret_type;
+        const prev_in_fn = self.in_function;
+
+        self.in_function = true;
+        self.fn_ret_type = inst.return_type;
+        self.setNodeType(inst.clone, inst.return_type);
+
+        // A fresh scope whose parent is the module scope: the instance body
+        // sees the module's names, but none of the caller's locals.
+        _ = self.scopes.pushScope(0) catch @panic("OOM");
+
+        // The generic parameters, bound to their concrete types.
+        for (clone.generic_params.indices, 0..) |gp_idx, i| {
+            const gp = self.arena.get(gp_idx);
+            self.scopes.insert(self.nameSlice(gp.identifier), .{
+                .name = gp.identifier,
+                .kind = .generic_param,
+                .decl_node = gp_idx,
+                .type_idx = inst.args[i],
+            }) catch @panic("OOM");
+        }
+
+        for (clone.params.indices) |param_idx| {
+            const param = self.arena.get(param_idx);
+            const param_ty = self.inferTypeRef(param.param.ty);
+            self.setNodeType(param_idx, param_ty);
+            self.scopes.insert(self.nameSlice(param.param.name), .{
+                .name = param.param.name,
+                .kind = .param,
+                .decl_node = param_idx,
+                .type_idx = param_ty,
+            }) catch @panic("OOM");
+        }
+
+        if (clone.body != NodeIdx.none) {
+            try self.checkStmt(clone.body);
+        }
+
+        // The next instance starts from a clean slate.
+        self.constraint_failed = false;
+
+        self.scopes.popScope();
+
+        self.fn_ret_type = prev_ret;
+        self.in_function = prev_in_fn;
+    }
+
+    /// A call to a generic fn: resolve the type arguments — written out at the
+    /// call site, or inferred from the argument types (R24) — then instantiate
+    /// the declaration for them (R21).
+    fn checkGenericCall(
+        self: *TypeChecker,
+        node_idx: NodeIdx,
+        decl_idx: NodeIdx,
+        callee_node: NodeIdx,
+        args: NodeList,
+        piped: ?NodeIdx,
+        hole: ?usize,
+    ) TypeIdx {
+        const info = self.genericInfoFor(decl_idx);
+        const name = self.declName(decl_idx);
+
+        // The effective argument list: the piped value takes the `_` hole, or
+        // is prepended as argument 0 (R30).
+        var effective: std.ArrayList(NodeIdx) = .empty;
+        defer effective.deinit(self.allocator);
+        if (piped) |p| {
+            if (hole) |h| {
+                for (args.indices, 0..) |a, i| {
+                    effective.append(self.allocator, if (i == h) p else a) catch @panic("OOM");
+                }
+            } else {
+                effective.append(self.allocator, p) catch @panic("OOM");
+                for (args.indices) |a| effective.append(self.allocator, a) catch @panic("OOM");
+            }
+        } else {
+            for (args.indices) |a| effective.append(self.allocator, a) catch @panic("OOM");
+        }
+
+        // The type arguments: written out at the call site, or inferred.
+        var concrete: []TypeIdx = &.{};
+        var owned_concrete = false;
+        defer if (owned_concrete) self.allocator.free(concrete);
+
+        if (self.explicitTypeArgs(callee_node)) |ta| {
+            if (ta.len != info.paramCount()) {
+                self.allocator.free(ta);
+                self.errorAt(node_idx, "generic '{s}' expects {d} type argument(s), got {d}", .{
+                    name, info.paramCount(), ta.len,
+                });
+                for (effective.items) |a| _ = self.inferExprType(a);
+                return self.void_ty;
+            }
+            concrete = ta;
+            owned_concrete = true;
+        } else {
+            const inferred = self.inferGenericArgs(node_idx, info, effective.items, name) orelse {
+                for (effective.items) |a| _ = self.inferExprType(a);
+                return self.void_ty;
+            };
+            concrete = inferred;
+            owned_concrete = true;
+        }
+
+        const inst = self.instanceFor(decl_idx, concrete) catch |err| {
+            self.errorAt(node_idx, "cannot instantiate generic '{s}': {s}", .{ name, @errorName(err) });
+            return self.void_ty;
+        };
+
+        // Check the value arguments against the instance's concrete parameter
+        // types.
+        const param_types = self.type_pool.get(inst.sig).function.param_types;
+        self.checkArgList(node_idx, param_types, args, piped, hole);
+
+        self.instance_by_callee.put(self.allocator, callee_node, inst) catch @panic("OOM");
+        return inst.return_type;
+    }
+
+    /// The type arguments written at a generic call site: `first[i32](...)`
+    /// and `pair[i32, f64](...)`.
+    fn explicitTypeArgs(self: *TypeChecker, callee_node: NodeIdx) ?[]TypeIdx {
+        const n = self.arena.get(callee_node);
+        switch (n.*) {
+            .index_access => |ia| {
+                const out = self.allocator.alloc(TypeIdx, 1) catch @panic("OOM");
+                out[0] = self.inferExprType(ia.index);
+                return out;
+            },
+            .generic_app => |ga| {
+                const out = self.allocator.alloc(TypeIdx, ga.args.indices.len) catch @panic("OOM");
+                for (ga.args.indices, 0..) |a, i| out[i] = self.inferExprType(a);
+                return out;
+            },
+            else => return null,
+        }
+    }
+
+    /// Infer the type arguments of a generic call from the argument types
+    /// (R24).
+    ///
+    /// Each generic parameter that occurs in a parameter type is unified
+    /// *from* the corresponding argument type — one-way, argument to
+    /// parameter. A parameter that occurs only in the return type is not
+    /// inferable and has to be written out (R24b).
+    fn inferGenericArgs(
+        self: *TypeChecker,
+        node_idx: NodeIdx,
+        info: GenericInfo,
+        arg_nodes: []const NodeIdx,
+        name: []const u8,
+    ) ?[]TypeIdx {
+        var bindings = generics_mod.Bindings.init(self.allocator, info.paramCount()) catch @panic("OOM");
+        defer bindings.deinit(self.allocator);
+
+        const arg_types = self.allocator.alloc(TypeIdx, arg_nodes.len) catch @panic("OOM");
+        defer self.allocator.free(arg_types);
+        for (arg_nodes, 0..) |a, i| arg_types[i] = self.inferExprType(a);
+
+        for (info.template_params, arg_types) |t, a| {
+            generics_mod.unifyTemplate(self.type_pool, t, a, &bindings);
+        }
+
+        if (bindings.conflict) {
+            const pname = if (bindings.conflict_index < info.param_names.len)
+                self.nameSlice(info.param_names[bindings.conflict_index])
+            else
+                name;
+            self.errorAt(node_idx, "conflicting types for generic parameter '{s}' of '{s}'", .{ pname, name });
+            return null;
+        }
+
+        const out = self.allocator.alloc(TypeIdx, info.paramCount()) catch @panic("OOM");
+        errdefer self.allocator.free(out);
+        for (info.param_names, 0..) |pn, i| {
+            const bound = bindings.bound[i] orelse {
+                self.errorAt(node_idx, "cannot infer generic parameter '{s}' of '{s}'; write it out", .{
+                    self.nameSlice(pn), name,
+                });
+                return null;
+            };
+            if (!self.isConcrete(bound)) {
+                self.errorAt(node_idx, "cannot infer a concrete type for generic parameter '{s}' of '{s}'", .{
+                    self.nameSlice(pn), name,
+                });
+                return null;
+            }
+            out[i] = bound;
+        }
+        return out;
+    }
+
+    /// The generic declaration a callee node names, if any: `first[i32](...)`
+    /// and `pair[i32, f64](...)` name a generic fn with explicit type
+    /// arguments.
+    fn genericCalleeDecl(self: *TypeChecker, callee_node: NodeIdx) ?NodeIdx {
+        const n = self.arena.get(callee_node);
+        const base = switch (n.*) {
+            .index_access => |ia| ia.object,
+            .generic_app => |ga| ga.base,
+            else => return null,
+        };
+        const base_node = self.arena.get(base);
+        if (base_node.* != .identifier) return null;
+        const name = self.nameSlice(base_node.identifier);
+        const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return null;
+        if (sym.kind != .function) return null;
+        if (!self.isGenericDecl(sym.decl_node)) return null;
+        return sym.decl_node;
+    }
+
+    // ========================================================================
+    // Comptime evaluation (R23)
+    // ========================================================================
+
+    /// The comptime value of a node. `.none` means the expression has no
+    /// compile-time value.
+    pub fn comptimeValue(self: *const TypeChecker, node_idx: NodeIdx) ComptimeValue {
+        return self.getComptimeValue(node_idx);
+    }
+
+    /// The branch a `comptime if` takes: true when the then-branch is taken.
+    pub fn comptimeBranch(self: *const TypeChecker, node_idx: NodeIdx) ?bool {
+        return self.getComptimeBranch(node_idx);
+    }
+
+    /// Type-check a comptime builtin call and evaluate it (R23a).
+    ///
+    /// The roster is final: `@typeOf`, `@sizeOf`, `@alignOf`, `@hasField`,
+    /// `@field` and `@assert`. The result type follows the builtin, and the
+    /// value is recorded so that the lowerer does not have to recompute it.
+    fn inferComptimeCall(self: *TypeChecker, node_idx: NodeIdx, cc: anytype) TypeIdx {
+        const name = self.nameSlice(cc.name);
+        var ty: TypeIdx = self.void_ty;
+        if (std.mem.eql(u8, name, "typeOf")) {
+            ty = self.type_value_ty;
+        } else if (std.mem.eql(u8, name, "sizeOf") or std.mem.eql(u8, name, "alignOf")) {
+            ty = self.u64_ty;
+        } else if (std.mem.eql(u8, name, "hasField")) {
+            ty = self.bool_ty;
+        } else if (std.mem.eql(u8, name, "field")) {
+            ty = self.comptimeFieldType(node_idx, cc);
+        }
+        const value = self.evalComptimeCall(node_idx, cc);
+        self.comptime_values.put(self.allocator, node_idx, .{ .value = value, .ty = ty }) catch @panic("OOM");
+        return ty;
+    }
+
+    /// Evaluate a comptime builtin call (R23a).
+    ///
+    /// Every builtin evaluates once its arguments are concrete, which — inside
+    /// an instance — they are: the type arguments are already substituted.
+    fn evalComptimeCall(self: *TypeChecker, node_idx: NodeIdx, cc: anytype) ComptimeValue {
+        const name = self.nameSlice(cc.name);
+
+        if (std.mem.eql(u8, name, "typeOf")) {
+            if (cc.args.indices.len != 1) {
+                self.errorAt(node_idx, "@typeOf expects one argument", .{});
+                return .{ .none = {} };
+            }
+            return .{ .type_value = self.inferExprType(cc.args.indices[0]) };
+        }
+
+        if (std.mem.eql(u8, name, "sizeOf") or std.mem.eql(u8, name, "alignOf")) {
+            if (cc.args.indices.len != 1) {
+                self.errorAt(node_idx, "@{s} expects one type argument", .{name});
+                return .{ .none = {} };
+            }
+            const ty = self.comptimeTypeArg(cc.args.indices[0]) orelse {
+                self.errorAt(node_idx, "@{s} expects a type argument", .{name});
+                return .{ .none = {} };
+            };
+            const size: i64 = if (std.mem.eql(u8, name, "sizeOf"))
+                self.sizeOfType(ty)
+            else
+                self.alignOfType(ty);
+            return .{ .int = size };
+        }
+
+        if (std.mem.eql(u8, name, "hasField")) {
+            if (cc.args.indices.len != 2) {
+                self.errorAt(node_idx, "@hasField expects a type and a field name", .{});
+                return .{ .none = {} };
+            }
+            const ty = self.comptimeTypeArg(cc.args.indices[0]) orelse {
+                self.errorAt(node_idx, "@hasField expects a type argument", .{});
+                return .{ .none = {} };
+            };
+            const field = self.stringLiteral(cc.args.indices[1]) orelse {
+                self.errorAt(node_idx, "@hasField expects a string field name", .{});
+                return .{ .none = {} };
+            };
+            return .{ .bool = self.structHasField(ty, field) };
+        }
+
+        if (std.mem.eql(u8, name, "field")) {
+            if (cc.args.indices.len != 2) {
+                self.errorAt(node_idx, "@field expects a value and a field name", .{});
+                return .{ .none = {} };
+            }
+            const field = self.stringLiteral(cc.args.indices[1]) orelse {
+                self.errorAt(node_idx, "@field expects a string field name", .{});
+                return .{ .none = {} };
+            };
+            // A struct literal is a comptime value, so its field is one too;
+            // any other value is read at runtime.
+            const obj = self.arena.get(cc.args.indices[0]);
+            if (obj.* == .struct_init) {
+                const value_node = self.structInitFieldValue(obj.struct_init, field) orelse return .{ .none = {} };
+                return self.evalComptime(value_node);
+            }
+            return .{ .none = {} };
+        }
+
+        if (std.mem.eql(u8, name, "assert")) {
+            if (cc.args.indices.len == 0 or cc.args.indices.len > 2) {
+                self.errorAt(node_idx, "@assert expects a condition and an optional message", .{});
+                return .{ .none = {} };
+            }
+            const cond = self.evalComptime(cc.args.indices[0]);
+            var message: []const u8 = "";
+            if (cc.args.indices.len == 2) {
+                message = self.stringLiteral(cc.args.indices[1]) orelse "";
+            }
+            switch (cond) {
+                .bool => |ok| {
+                    if (!ok) self.reportConstraintFailure(node_idx, cc.args.indices[0], message);
+                },
+                .none => self.errorAt(node_idx, "@assert needs a comptime condition", .{}),
+                else => self.errorAt(node_idx, "@assert needs a bool condition", .{}),
+            }
+            return .{ .bool = true };
+        }
+
+        self.errorAt(node_idx, "unknown comptime builtin '@{s}'", .{name});
+        return .{ .none = {} };
+    }
+
+    /// Evaluate an expression to a comptime value (R23a).
+    ///
+    /// Only the expressions whose value is known at compile time evaluate: the
+    /// literals, the comptime builtins, and the operators over them.
+    fn evalComptime(self: *TypeChecker, node_idx: NodeIdx) ComptimeValue {
+        const node = self.arena.get(node_idx);
+        switch (node.*) {
+            .int_literal => |v| return .{ .int = v },
+            .float_literal => |v| return .{ .float = v },
+            .string_literal => |ref| return .{ .string = self.nameSlice(ref) },
+            .char_literal => |ref| return .{ .int = self.charCode(ref) },
+            .bool_literal => |v| return .{ .bool = v },
+            .paren_expr => |p| return self.evalComptime(p),
+            .unary_op => |u| return self.evalComptimeUnary(u),
+            .binary_op => |b| return self.evalComptimeBinary(b),
+            .comptime_expr => |inner| return self.evalComptime(inner),
+            .comptime_call => {
+                // An evaluated builtin keeps its value, so it is never
+                // evaluated (and never diagnosed) twice.
+                if (self.comptime_values.get(node_idx)) |b| return b.value;
+                return self.evalComptimeCall(node_idx, node.comptime_call);
+            },
+            .if_expr => |i| {
+                const taken = self.comptime_branches.get(node_idx) orelse return .{ .none = {} };
+                const branch = if (taken) i.then_body else (i.else_body orelse return .{ .none = {} });
+                return self.evalComptime(branch);
+            },
+            else => return .{ .none = {} },
+        }
+    }
+
+    /// The comptime value of a unary operation over a comptime operand.
+    fn evalComptimeUnary(self: *TypeChecker, u: anytype) ComptimeValue {
+        const operand = self.evalComptime(u.operand);
+        return switch (operand) {
+            .int => |v| switch (u.op) {
+                .neg => ComptimeValue{ .int = -%v },
+                .bit_not => ComptimeValue{ .int = ~v },
+                else => ComptimeValue{ .none = {} },
+            },
+            .float => |v| switch (u.op) {
+                .neg => ComptimeValue{ .float = -v },
+                else => ComptimeValue{ .none = {} },
+            },
+            .bool => |v| switch (u.op) {
+                .not => ComptimeValue{ .bool = !v },
+                else => ComptimeValue{ .none = {} },
+            },
+            else => ComptimeValue{ .none = {} },
+        };
+    }
+
+    /// The comptime value of a binary operation over comptime operands.
+    fn evalComptimeBinary(self: *TypeChecker, b: anytype) ComptimeValue {
+        const left = self.evalComptime(b.left);
+        const right = self.evalComptime(b.right);
+
+        // Type values compare by identity (def-eq).
+        if (left == .type_value or right == .type_value) {
+            const eq_opt = switch (left) {
+                .type_value => |lv| blk: {
+                    const other = switch (right) {
+                        .type_value => |rv| rv,
+                        else => self.comptimeTypeArg(b.right) orelse break :blk null,
+                    };
+                    break :blk self.typesEqual(lv, other);
+                },
+                else => blk: {
+                    const other = self.comptimeTypeArg(b.left) orelse break :blk null;
+                    break :blk self.typesEqual(other, right.type_value);
+                },
+            };
+            if (eq_opt == null) return ComptimeValue{ .none = {} };
+            const eq = eq_opt.?;
+            return switch (b.op) {
+                .eq => ComptimeValue{ .bool = eq },
+                .ne => ComptimeValue{ .bool = !eq },
+                else => ComptimeValue{ .none = {} },
+            };
+        }
+
+        switch (left) {
+            .int => |lv| switch (right) {
+                .int => |rv| return comptimeIntOp(b.op, lv, rv),
+                .float => |rv| return comptimeFloatOp(b.op, @floatFromInt(lv), rv),
+                else => return ComptimeValue{ .none = {} },
+            },
+            .float => |lv| switch (right) {
+                .int => |rv| return comptimeFloatOp(b.op, lv, @floatFromInt(rv)),
+                .float => |rv| return comptimeFloatOp(b.op, lv, rv),
+                else => return ComptimeValue{ .none = {} },
+            },
+            .bool => |lv| switch (right) {
+                .bool => |rv| return switch (b.op) {
+                    .eq => ComptimeValue{ .bool = lv == rv },
+                    .ne => ComptimeValue{ .bool = lv != rv },
+                    .and_op => ComptimeValue{ .bool = lv and rv },
+                    .or_op => ComptimeValue{ .bool = lv or rv },
+                    else => ComptimeValue{ .none = {} },
+                },
+                else => return ComptimeValue{ .none = {} },
+            },
+            .string => |lv| switch (right) {
+                .string => |rv| return switch (b.op) {
+                    .eq => ComptimeValue{ .bool = std.mem.eql(u8, lv, rv) },
+                    .ne => ComptimeValue{ .bool = !std.mem.eql(u8, lv, rv) },
+                    else => ComptimeValue{ .none = {} },
+                },
+                else => return ComptimeValue{ .none = {} },
+            },
+            else => return ComptimeValue{ .none = {} },
+        }
+    }
+
+    /// A `comptime if`: the condition is evaluated at compile time and only
+    /// the branch it selects is type-checked and lowered (R23c).
+    ///
+    /// Specialization is the point of the construct, so the branch that is not
+    /// taken is pruned: it is never checked and never emitted.
+    fn inferComptimeIf(self: *TypeChecker, expr_idx: NodeIdx, if_idx: NodeIdx) TypeIdx {
+        const i = self.arena.get(if_idx).if_expr;
+        const cond = self.evalComptime(i.cond);
+        var taken_then = false;
+        switch (cond) {
+            .bool => |ok| taken_then = ok,
+            .none => self.errorAt(expr_idx, "a comptime condition must be known at compile time", .{}),
+            else => self.errorAt(expr_idx, "a comptime condition must be a bool", .{}),
+        }
+        self.comptime_branches.put(self.allocator, if_idx, taken_then) catch @panic("OOM");
+
+        const branch: NodeIdx = if (taken_then) i.then_body else (i.else_body orelse NodeIdx.none);
+        var ty: TypeIdx = self.void_ty;
+        if (branch != NodeIdx.none) ty = self.inferExprType(branch);
+        self.setNodeType(if_idx, ty);
+        return ty;
+    }
+
+    /// The type a node denotes in type position: a generic parameter, a
+    /// builtin type name, a struct or enum declaration, or an application of
+    /// one. Null when the node does not denote a type.
+    fn comptimeTypeArg(self: *TypeChecker, node_idx: NodeIdx) ?TypeIdx {
+        const node = self.arena.get(node_idx);
+        switch (node.*) {
+            .identifier => |id| {
+                const name = self.nameSlice(id);
+                if (self.builtinTypeName(name)) |ty| return ty;
+                const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return null;
+                switch (sym.kind) {
+                    // A generic parameter stands for the type argument the
+                    // instance was created with.
+                    .generic_param => return sym.type_idx,
+                    .struct_type, .enum_type => return self.resolveDeclType(sym.decl_node),
+                    else => return null,
+                }
+            },
+            .generic_app => {
+                const ty = self.inferExprType(node_idx);
+                return switch (self.type_pool.get(ty)) {
+                    .struct_type, .applied_struct, .enum_type, .applied_enum => ty,
+                    else => null,
+                };
+            },
+            .index_access => |ia| {
+                // A one-argument application of a generic type name.
+                const base = self.arena.get(ia.object);
+                if (base.* != .identifier) return null;
+                const sym = self.scopes.lookup(self.nameSlice(base.identifier), self.scopes.currentScope()) orelse return null;
+                if (sym.kind != .struct_type and sym.kind != .enum_type) return null;
+                const ty = self.inferExprType(node_idx);
+                return switch (self.type_pool.get(ty)) {
+                    .struct_type, .applied_struct, .enum_type, .applied_enum => ty,
+                    else => null,
+                };
+            },
+            .fn_type => return self.inferExprType(node_idx),
+            .unary_op => |u| switch (u.op) {
+                .ref, .mut_ref => {
+                    const pointee = self.comptimeTypeArg(u.operand) orelse return null;
+                    return self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
+                },
+                else => return null,
+            },
+            else => return null,
+        }
+    }
+
+    /// The text of a string literal node.
+    fn stringLiteral(self: *const TypeChecker, node_idx: NodeIdx) ?[]const u8 {
+        const node = self.arena.get(node_idx);
+        if (node.* != .string_literal) return null;
+        return self.nameSlice(node.string_literal);
+    }
+
+    /// The initializer of a named field of a struct literal.
+    fn structInitFieldValue(self: *const TypeChecker, si: anytype, field_name: []const u8) ?NodeIdx {
+        for (si.fields.indices) |field_idx| {
+            const field = self.arena.get(field_idx).struct_init_field;
+            if (std.mem.eql(u8, self.nameSlice(field.name), field_name)) return field.value;
+        }
+        return null;
+    }
+
+    /// Whether a type is a struct with the named field (R23a).
+    fn structHasField(self: *TypeChecker, ty: TypeIdx, field_name: []const u8) bool {
+        return switch (self.type_pool.get(ty)) {
+            .struct_type => |decl| self.structFieldType(decl, field_name) != null,
+            .applied_struct => |a| self.appliedFieldType(a.decl, a.args, field_name) != null,
+            else => false,
+        };
+    }
+
+    /// The type of a named field of a struct type.
+    fn fieldTypeOf(self: *TypeChecker, ty: TypeIdx, field_name: []const u8) ?TypeIdx {
+        return switch (self.type_pool.get(ty)) {
+            .struct_type => |decl| self.structFieldType(decl, field_name),
+            .applied_struct => |a| self.appliedFieldType(a.decl, a.args, field_name),
+            else => null,
+        };
+    }
+
+    /// The type of `@field(x, "name")`: the type of the named field of `x`.
+    fn comptimeFieldType(self: *TypeChecker, node_idx: NodeIdx, cc: anytype) TypeIdx {
+        if (cc.args.indices.len != 2) {
+            self.errorAt(node_idx, "@field expects a value and a field name", .{});
+            return self.void_ty;
+        }
+        const obj_ty = self.inferExprType(cc.args.indices[0]);
+        const field = self.stringLiteral(cc.args.indices[1]) orelse {
+            self.errorAt(node_idx, "@field expects a string field name", .{});
+            return self.void_ty;
+        };
+        return self.fieldTypeOf(obj_ty, field) orelse {
+            self.errorAt(node_idx, "'{s}' has no field '{s}'", .{ self.typeName(obj_ty), field });
+            return self.void_ty;
+        };
+    }
+
+    /// The byte size of a type (docs/semantics.md §3).
+    fn sizeOfType(self: *const TypeChecker, ty: TypeIdx) i64 {
+        return switch (self.type_pool.get(ty)) {
+            .void => 0,
+            .bool_type => 1,
+            .int => |i| @divExact(i.bits, 8),
+            .float => |f| switch (f) {
+                .f16 => 2,
+                .f32 => 4,
+                .f64 => 8,
+            },
+            .string_type => 16,
+            .pointer => 8,
+            .function => 16,
+            .struct_type => |decl| 8 * @as(i64, @intCast(structFieldCount(self.arena, decl))),
+            .applied_struct => |a| 8 * @as(i64, @intCast(structFieldCount(self.arena, a.decl))),
+            .enum_type => |decl| 8 * @as(i64, @intCast(enumPayloadSlots(self.arena, decl) + 1)),
+            .applied_enum => |a| 8 * @as(i64, @intCast(enumPayloadSlots(self.arena, a.decl) + 1)),
+            .array => |a| @as(i64, @intCast(a.size orelse 0)) * self.sizeOfType(a.elem),
+            .slice => 16,
+            .generic_param => 8,
+            .type_value => 8,
+            .applied_fn => 16,
+            .inferred => 8,
+        };
+    }
+
+    /// The natural alignment of a type (docs/semantics.md §3).
+    fn alignOfType(self: *const TypeChecker, ty: TypeIdx) i64 {
+        return switch (self.type_pool.get(ty)) {
+            .bool_type => 1,
+            .int => |i| if (i.bits <= 8) 1 else if (i.bits <= 16) 2 else if (i.bits <= 32) 4 else 8,
+            .float => |f| switch (f) {
+                .f16 => 2,
+                .f32 => 4,
+                .f64 => 8,
+            },
+            .type_value => 8,
+            .applied_fn => 8,
+            .inferred => 8,
+            .void, .string_type, .pointer, .function, .struct_type, .applied_struct, .enum_type, .applied_enum, .array, .slice, .generic_param => 8,
+        };
+    }
+
+    /// The code point of a character literal.
+    fn charCode(self: *const TypeChecker, ref: StringRef) i64 {
+        const raw = ref.slice(self.source);
+        if (raw.len < 2) return 0;
+        const body = raw[1 .. raw.len - 1];
+        if (body.len == 0) return 0;
+        if (body[0] != '\\') return body[0];
+        if (body.len < 2) return 0;
+        return switch (body[1]) {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => 0,
+            '\\' => '\\',
+            '\'' => '\'',
+            else => body[1],
+        };
+    }
+
+    /// Report a failed comptime constraint (R23b).
+    ///
+    /// A constraint that mentions a bound generic parameter is reported as a
+    /// generic constraint failure naming the parameter and the type argument
+    /// it was given; anything else uses the assertion's own message.
+    fn reportConstraintFailure(self: *TypeChecker, node_idx: NodeIdx, cond: NodeIdx, message: []const u8) void {
+        if (self.genericParamMention(cond)) |param_node| {
+            const name = self.nameSlice(self.arena.get(param_node).identifier);
+            const sym = self.scopes.lookup(name, self.scopes.currentScope());
+            const arg_ty = if (sym) |s| s.type_idx else TypeIdx.none;
+            const rendered = self.renderComptimeExpr(cond);
+            self.errorAt(node_idx, "generic constraint not satisfied: {s} = {s} does not satisfy {s}", .{
+                name, self.typeName(arg_ty), rendered,
+            });
+            self.constraint_failed = true;
+            return;
+        }
+        if (message.len > 0) {
+            self.errorAt(node_idx, "{s}", .{message});
+        } else {
+            self.errorAt(node_idx, "comptime assertion failed", .{});
+        }
+        self.constraint_failed = true;
+    }
+
+    /// The generic parameter an expression mentions, if any: an identifier
+    /// that resolves to a generic parameter of the enclosing instance.
+    fn genericParamMention(self: *TypeChecker, node_idx: NodeIdx) ?NodeIdx {
+        const node = self.arena.get(node_idx);
+        switch (node.*) {
+            .identifier => |id| {
+                const name = self.nameSlice(id);
+                const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return null;
+                if (sym.kind != .generic_param) return null;
+                return node_idx;
+            },
+            .binary_op => |b| {
+                if (self.genericParamMention(b.left)) |n| return n;
+                return self.genericParamMention(b.right);
+            },
+            .unary_op => |u| return self.genericParamMention(u.operand),
+            .paren_expr => |p| return self.genericParamMention(p),
+            .comptime_expr => |inner| return self.genericParamMention(inner),
+            .comptime_call => |cc| {
+                for (cc.args.indices) |arg| {
+                    if (self.genericParamMention(arg)) |n| return n;
+                }
+                return null;
+            },
+            .field_access => |fa| return self.genericParamMention(fa.object),
+            .index_access => |ia| {
+                if (self.genericParamMention(ia.object)) |n| return n;
+                return self.genericParamMention(ia.index);
+            },
+            .generic_app => |ga| {
+                if (self.genericParamMention(ga.base)) |n| return n;
+                for (ga.args.indices) |arg| {
+                    if (self.genericParamMention(arg)) |n| return n;
+                }
+                return null;
+            },
+            .call => |c| {
+                if (self.genericParamMention(c.func)) |n| return n;
+                for (c.args.indices) |arg| {
+                    if (self.genericParamMention(arg)) |n| return n;
+                }
+                return null;
+            },
+            .struct_init => |si| {
+                for (si.fields.indices) |field_idx| {
+                    const value = self.arena.get(field_idx).struct_init_field.value;
+                    if (self.genericParamMention(value)) |n| return n;
+                }
+                return null;
+            },
+            .if_expr => |i| {
+                if (self.genericParamMention(i.cond)) |n| return n;
+                if (self.genericParamMention(i.then_body)) |n| return n;
+                if (i.else_body) |else_body| {
+                    if (self.genericParamMention(else_body)) |n| return n;
+                }
+                return null;
+            },
+            .pipeline => |p| {
+                if (self.genericParamMention(p.lhs)) |n| return n;
+                return self.genericParamMention(p.rhs);
+            },
+            .try_propagate => |inner| return self.genericParamMention(inner),
+            .move_expr => |inner| return self.genericParamMention(inner),
+            .block => |b| {
+                for (b.stmts.indices) |stmt| {
+                    if (self.genericParamMention(stmt)) |n| return n;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Render a comptime expression as source text, for a diagnostic: the
+    /// constraint that failed is shown the way it was written.
+    fn renderComptimeExpr(self: *TypeChecker, node_idx: NodeIdx) []const u8 {
+        var len: usize = 0;
+        self.renderComptimeExprInto(node_idx, &self.constraint_buf, &len);
+        return self.constraint_buf[0..len];
+    }
+
+    fn renderComptimeExprInto(self: *TypeChecker, node_idx: NodeIdx, buf: []u8, len: *usize) void {
+        const node = self.arena.get(node_idx);
+        switch (node.*) {
+            .identifier => |id| self.appendTo(buf, len, self.nameSlice(id)),
+            .string_literal => |ref| {
+                self.appendTo(buf, len, "\"");
+                self.appendTo(buf, len, self.nameSlice(ref));
+                self.appendTo(buf, len, "\"");
+            },
+            .char_literal => |ref| {
+                self.appendTo(buf, len, "'");
+                self.appendTo(buf, len, self.nameSlice(ref));
+                self.appendTo(buf, len, "'");
+            },
+            .int_literal => |v| {
+                var tmp: [24]u8 = undefined;
+                self.appendTo(buf, len, std.fmt.bufPrint(&tmp, "{d}", .{v}) catch "0");
+            },
+            .float_literal => |v| {
+                var tmp: [24]u8 = undefined;
+                self.appendTo(buf, len, std.fmt.bufPrint(&tmp, "{d}", .{v}) catch "0");
+            },
+            .bool_literal => |v| self.appendTo(buf, len, if (v) "true" else "false"),
+            .comptime_call => |cc| {
+                self.appendTo(buf, len, "@");
+                self.appendTo(buf, len, self.nameSlice(cc.name));
+                self.appendTo(buf, len, "(");
+                for (cc.args.indices, 0..) |arg, i| {
+                    if (i > 0) self.appendTo(buf, len, ", ");
+                    self.renderComptimeExprInto(arg, buf, len);
+                }
+                self.appendTo(buf, len, ")");
+            },
+            .paren_expr => |p| {
+                self.appendTo(buf, len, "(");
+                self.renderComptimeExprInto(p, buf, len);
+                self.appendTo(buf, len, ")");
+            },
+            .binary_op => |b| {
+                self.renderComptimeExprInto(b.left, buf, len);
+                self.appendTo(buf, len, " ");
+                self.appendTo(buf, len, binaryOpName(b.op));
+                self.appendTo(buf, len, " ");
+                self.renderComptimeExprInto(b.right, buf, len);
+            },
+            .unary_op => |u| {
+                self.appendTo(buf, len, unaryOpName(u.op));
+                self.renderComptimeExprInto(u.operand, buf, len);
+            },
+            .comptime_expr => |inner| {
+                self.appendTo(buf, len, "comptime ");
+                self.renderComptimeExprInto(inner, buf, len);
+            },
+            .field_access => |fa| {
+                self.renderComptimeExprInto(fa.object, buf, len);
+                self.appendTo(buf, len, ".");
+                self.appendTo(buf, len, self.nameSlice(fa.field));
+            },
+            .index_access => |ia| {
+                self.renderComptimeExprInto(ia.object, buf, len);
+                self.appendTo(buf, len, "[");
+                self.renderComptimeExprInto(ia.index, buf, len);
+                self.appendTo(buf, len, "]");
+            },
+            .generic_app => |ga| {
+                self.renderComptimeExprInto(ga.base, buf, len);
+                self.appendTo(buf, len, "[");
+                for (ga.args.indices, 0..) |arg, i| {
+                    if (i > 0) self.appendTo(buf, len, ", ");
+                    self.renderComptimeExprInto(arg, buf, len);
+                }
+                self.appendTo(buf, len, "]");
+            },
+            .call => |c| {
+                self.renderComptimeExprInto(c.func, buf, len);
+                self.appendTo(buf, len, "(");
+                for (c.args.indices, 0..) |arg, i| {
+                    if (i > 0) self.appendTo(buf, len, ", ");
+                    self.renderComptimeExprInto(arg, buf, len);
+                }
+                self.appendTo(buf, len, ")");
+            },
+            .if_expr => |i| {
+                self.appendTo(buf, len, "if ");
+                self.renderComptimeExprInto(i.cond, buf, len);
+                self.appendTo(buf, len, " { ... }");
+                if (i.else_body != null) self.appendTo(buf, len, " else { ... }");
+            },
+            .pipeline => |p| {
+                self.renderComptimeExprInto(p.lhs, buf, len);
+                self.appendTo(buf, len, " |> ");
+                self.renderComptimeExprInto(p.rhs, buf, len);
+            },
+            .try_propagate => |inner| {
+                self.renderComptimeExprInto(inner, buf, len);
+                self.appendTo(buf, len, "?");
+            },
+            .move_expr => |inner| {
+                self.appendTo(buf, len, "move ");
+                self.renderComptimeExprInto(inner, buf, len);
+            },
+            .fn_type => |ft| {
+                self.appendTo(buf, len, "fn(");
+                for (ft.params.indices, 0..) |arg, i| {
+                    if (i > 0) self.appendTo(buf, len, ", ");
+                    self.renderComptimeExprInto(arg, buf, len);
+                }
+                self.appendTo(buf, len, ") -> ");
+                self.renderComptimeExprInto(ft.return_type, buf, len);
+            },
+            .block => {
+                self.appendTo(buf, len, "{ ... }");
+            },
+            .struct_init => |si| {
+                self.renderComptimeExprInto(si.ty, buf, len);
+                self.appendTo(buf, len, "{ ... }");
+            },
+            else => self.appendTo(buf, len, "..."),
+        }
+    }
+
+    /// Append text to a fixed buffer, dropping what does not fit.
+    fn appendTo(_: *TypeChecker, buf: []u8, len: *usize, text: []const u8) void {
+        const room = buf.len - len.*;
+        const n = @min(room, text.len);
+        @memcpy(buf[len.*..][0..n], text[0..n]);
+        len.* += n;
+    }
+
     fn checkStmt(self: *TypeChecker, stmt_idx: NodeIdx) anyerror!void {
+        // A failed comptime constraint stops the check of the instance it was
+        // found in (R23b).
+        if (self.constraint_failed) return;
         const stmt = self.arena.get(stmt_idx);
         switch (stmt.*) {
             .block => |b| {
@@ -473,6 +1659,9 @@ pub const TypeChecker = struct {
     }
 
     fn inferExprType(self: *TypeChecker, expr_idx: NodeIdx) TypeIdx {
+        // A comptime expression keeps both its value and its type: evaluating
+        // it twice would repeat the diagnostics it produced.
+        if (self.comptime_values.get(expr_idx)) |b| return b.ty;
         const prev = self.getNodeType(expr_idx);
         if (prev != self.void_ty) return prev;
 
@@ -491,45 +1680,100 @@ pub const TypeChecker = struct {
         for (ga.args.indices, 0..) |arg_idx, i| {
             args[i] = self.inferExprType(arg_idx);
         }
+        return self.applyTypeArgs(expr_idx, base, args);
+    }
 
-        const base_sem = self.type_pool.get(base);
-        switch (base_sem) {
-            .struct_type => |decl_node| {
-                const decl = self.arena.get(decl_node);
-                if (decl.* != .struct_decl) return self.void_ty;
-                const gp_count = decl.struct_decl.generic_params.indices.len;
-                if (gp_count != arg_count) {
-                    self.errorAt(expr_idx, "struct expects {d} generic argument(s), got {d}", .{ gp_count, arg_count });
-                    return self.void_ty;
-                }
-                const key = genericAppKey(decl_node, args);
-                if (self.instantiations.get(key)) |cached| return cached;
-                const owned = self.allocator.alloc(TypeIdx, arg_count) catch @panic("OOM");
-                @memcpy(owned, args);
-                const applied = self.type_pool.add(.{ .applied_struct = .{ .decl = decl_node, .args = owned } }) catch @panic("OOM");
-                self.instantiations.put(self.allocator, key, applied) catch @panic("OOM");
-                return applied;
-            },
-            .enum_type => |decl_node| {
-                const decl = self.arena.get(decl_node);
-                if (decl.* != .enum_decl) return self.void_ty;
-                const gp_count = decl.enum_decl.generic_params.indices.len;
-                if (gp_count != arg_count) {
-                    self.errorAt(expr_idx, "enum expects {d} generic argument(s), got {d}", .{ gp_count, arg_count });
-                    return self.void_ty;
-                }
-                const key = genericAppKey(decl_node, args);
-                if (self.instantiations.get(key)) |cached| return cached;
-                const owned = self.allocator.alloc(TypeIdx, arg_count) catch @panic("OOM");
-                @memcpy(owned, args);
-                const applied = self.type_pool.add(.{ .applied_enum = .{ .decl = decl_node, .args = owned } }) catch @panic("OOM");
-                self.instantiations.put(self.allocator, key, applied) catch @panic("OOM");
-                return applied;
-            },
-            else => {
-                return base;
-            },
+    /// Apply type arguments to a generic struct or enum declaration
+    /// (R19c/R25).
+    fn applyTypeArgs(self: *TypeChecker, expr_idx: NodeIdx, base: TypeIdx, args: []const TypeIdx) TypeIdx {
+        switch (self.type_pool.get(base)) {
+            .struct_type => |decl_node| return self.applyToDecl(expr_idx, decl_node, args),
+            .enum_type => |decl_node| return self.applyToDecl(expr_idx, decl_node, args),
+            else => return base,
         }
+    }
+
+    /// Apply type arguments to a generic struct or enum declaration, checking
+    /// the arity (R19c: all arguments have to be supplied).
+    fn applyToDecl(self: *TypeChecker, expr_idx: NodeIdx, decl_node: NodeIdx, args: []const TypeIdx) TypeIdx {
+        const decl = self.arena.get(decl_node);
+        switch (decl.*) {
+            .struct_decl => |s| {
+                const gp_count = s.generic_params.indices.len;
+                if (gp_count != args.len) {
+                    self.errorAt(expr_idx, "struct expects {d} generic argument(s), got {d}", .{ gp_count, args.len });
+                    return self.void_ty;
+                }
+                return self.appliedType(decl_node, args);
+            },
+            .enum_decl => |e| {
+                const gp_count = e.generic_params.indices.len;
+                if (gp_count != args.len) {
+                    self.errorAt(expr_idx, "enum expects {d} generic argument(s), got {d}", .{ gp_count, args.len });
+                    return self.void_ty;
+                }
+                return self.appliedType(decl_node, args);
+            },
+            else => return self.void_ty,
+        }
+    }
+
+    /// The type of a generic application `Name[Args]` (R20b): the applied
+    /// struct/enum type, memoized in the application cache so that
+    /// `Option[i32]` used a hundred times is one `TypeIdx`.
+    fn appliedType(self: *TypeChecker, decl_node: NodeIdx, args: []const TypeIdx) TypeIdx {
+        const key = self.appKey(decl_node, args);
+        if (self.instantiations.get(key)) |cached| return cached;
+        const owned = self.allocator.alloc(TypeIdx, args.len) catch @panic("OOM");
+        @memcpy(owned, args);
+        const decl = self.arena.get(decl_node);
+        const sem: SemType = switch (decl.*) {
+            .enum_decl => .{ .applied_enum = .{ .decl = decl_node, .args = owned } },
+            else => .{ .applied_struct = .{ .decl = decl_node, .args = owned } },
+        };
+        const applied = self.type_pool.add(sem) catch @panic("OOM");
+        self.instantiations.put(self.allocator, key, applied) catch @panic("OOM");
+        return applied;
+    }
+
+    /// The cache key of a type application: the declaration plus the
+    /// structural hash of the type arguments, so that two sites naming the
+    /// same instance land on the same key (R20a).
+    fn appKey(self: *const TypeChecker, decl_node: NodeIdx, args: []const TypeIdx) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        h = (h ^ @as(u64, @intFromEnum(decl_node))) *% 0x100000001b3;
+        for (args) |arg| {
+            h = (h ^ generics_mod.typeHash(self.type_pool, arg)) *% 0x100000001b3;
+        }
+        return h;
+    }
+
+    /// A one-argument application of a generic type name: `Option[i32]`.
+    ///
+    /// The parser gives a one-argument application the same shape as an
+    /// index, so this returns null when the base is not a generic type name
+    /// and an ordinary index keeps its meaning.
+    fn tryTypeApplication(self: *TypeChecker, expr_idx: NodeIdx, base: NodeIdx, arg: NodeIdx) ?TypeIdx {
+        const base_node = self.arena.get(base);
+        if (base_node.* != .identifier) return null;
+        const name = self.nameSlice(base_node.identifier);
+        const sym = self.scopes.lookup(name, self.scopes.currentScope()) orelse return null;
+        switch (sym.kind) {
+            .struct_type, .enum_type => {},
+            else => return null,
+        }
+        const decl = self.arena.get(sym.decl_node);
+        const gp_count = switch (decl.*) {
+            .struct_decl => |s| s.generic_params.indices.len,
+            .enum_decl => |e| e.generic_params.indices.len,
+            else => return null,
+        };
+        if (gp_count != 1) return null;
+
+        const args = self.allocator.alloc(TypeIdx, 1) catch @panic("OOM");
+        defer self.allocator.free(args);
+        args[0] = self.inferExprType(arg);
+        return self.applyToDecl(expr_idx, sym.decl_node, args);
     }
 
     fn inferExprTypeInner(self: *TypeChecker, expr_idx: NodeIdx, expr: *const Node) TypeIdx {
@@ -628,11 +1872,28 @@ pub const TypeChecker = struct {
                         });
                         return self.void_ty;
                     },
+                    .applied_struct => |a| {
+                        if (self.appliedFieldType(a.decl, a.args, self.nameSlice(fa.field))) |ft| {
+                            return ft;
+                        }
+                        const s = self.arena.get(a.decl).struct_decl;
+                        self.errorAt(expr_idx, "struct '{s}' has no field '{s}'", .{
+                            self.nameSlice(s.name), self.nameSlice(fa.field),
+                        });
+                        return self.void_ty;
+                    },
                     .pointer => |elem| {
                         const elem_type = self.type_pool.get(elem);
                         switch (elem_type) {
                             .struct_type => |decl_node| {
                                 if (self.structFieldType(decl_node, self.nameSlice(fa.field))) |ft| {
+                                    return ft;
+                                }
+                                self.errorAt(expr_idx, "struct has no field '{s}'", .{self.nameSlice(fa.field)});
+                                return self.void_ty;
+                            },
+                            .applied_struct => |a| {
+                                if (self.appliedFieldType(a.decl, a.args, self.nameSlice(fa.field))) |ft| {
                                     return ft;
                                 }
                                 self.errorAt(expr_idx, "struct has no field '{s}'", .{self.nameSlice(fa.field)});
@@ -650,6 +1911,10 @@ pub const TypeChecker = struct {
                 }
             },
             .index_access => |ia| {
+                // A one-argument application of a generic type name
+                // (`Option[i32]`) is not an index: it denotes the type
+                // itself (R19c).
+                if (self.tryTypeApplication(expr_idx, ia.object, ia.index)) |ty| return ty;
                 const obj_ty = self.inferExprType(ia.object);
                 _ = self.inferExprType(ia.index);
                 return self.inferElementType(expr_idx, obj_ty);
@@ -698,15 +1963,24 @@ pub const TypeChecker = struct {
             .comptime_expr => |inner| {
                 const prev_comptime = self.in_comptime;
                 self.in_comptime = true;
+                const inner_node = self.arena.get(inner);
+                if (inner_node.* == .if_expr) {
+                    // A `comptime if` picks its branch at compile time, so the
+                    // branch that is not taken is never checked (R23c).
+                    const ty = self.inferComptimeIf(expr_idx, inner);
+                    self.in_comptime = prev_comptime;
+                    return ty;
+                }
                 const ty = self.inferExprType(inner);
                 self.in_comptime = prev_comptime;
+                const value = self.evalComptime(inner);
+                if (value != .none) {
+                    self.comptime_values.put(self.allocator, expr_idx, .{ .value = value, .ty = ty }) catch @panic("OOM");
+                }
                 return ty;
             },
             .comptime_call => |cc| {
-                for (cc.args.indices) |arg| {
-                    _ = self.inferExprType(arg);
-                }
-                return self.i32_ty;
+                return self.inferComptimeCall(expr_idx, cc);
             },
             .pipeline => |p| {
                 return self.inferPipeline(expr_idx, p);
@@ -907,16 +2181,15 @@ pub const TypeChecker = struct {
         if (sem == .applied_struct) {
             const decl_node = sem.applied_struct.decl;
             const args = sem.applied_struct.args;
-            // Apply substitution to field types for applied struct
+            // The instance's field types, with the type arguments substituted
+            // in (R25).
             for (si.fields.indices) |field_idx| {
                 const f = self.arena.get(field_idx).struct_init_field;
-                if (self.structFieldType(decl_node, self.nameSlice(f.name))) |et| {
-                    // Substitute if it's a generic param? simple substitution
-                    const et_subst = self.substType(et, args, decl_node);
-                    const got = self.inferExprTypeExpected(f.value, et_subst);
-                    if (!self.typesEqual(et_subst, got)) {
+                if (self.appliedFieldType(decl_node, args, self.nameSlice(f.name))) |et| {
+                    const got = self.inferExprTypeExpected(f.value, et);
+                    if (!self.typesEqual(et, got)) {
                         self.errorAt(expr_idx, "field '{s}' expects '{s}' but got '{s}'", .{
-                            self.nameSlice(f.name), self.typeName(et_subst), self.typeName(got),
+                            self.nameSlice(f.name), self.typeName(et), self.typeName(got),
                         });
                     }
                 } else {
@@ -1276,7 +2549,12 @@ pub const TypeChecker = struct {
             if (self.scopes.lookup(name, self.scopes.currentScope())) |sym| {
                 switch (sym.kind) {
                     .prelude_fn => return self.checkPreludeCall(expr_idx, sym, c.args, null, null),
-                    .function => return self.checkDirectCall(expr_idx, sym, c.args),
+                    .function => {
+                        if (self.isGenericDecl(sym.decl_node)) {
+                            return self.checkGenericCall(expr_idx, sym.decl_node, c.func, c.args, null, null);
+                        }
+                        return self.checkDirectCall(expr_idx, sym, c.args);
+                    },
                     else => return self.checkFnValueCall(expr_idx, c),
                 }
             }
@@ -1284,6 +2562,10 @@ pub const TypeChecker = struct {
             // the arguments and produce no value rather than a second error.
             for (c.args.indices) |arg| _ = self.inferExprType(arg);
             return self.void_ty;
+        }
+        // A generic application in callee position: `first[i32](...)`.
+        if (self.genericCalleeDecl(c.func)) |decl_idx| {
+            return self.checkGenericCall(expr_idx, decl_idx, c.func, c.args, null, null);
         }
         return self.checkFnValueCall(expr_idx, c);
     }
@@ -1507,6 +2789,9 @@ pub const TypeChecker = struct {
                 switch (sym.kind) {
                     .prelude_fn => return self.checkPreludeCall(node_idx, sym, c.args, piped, hole),
                     .function => {
+                        if (self.isGenericDecl(sym.decl_node)) {
+                            return self.checkGenericCall(node_idx, sym.decl_node, c.func, c.args, piped, hole);
+                        }
                         const sig = self.fnSignatureType(sym.decl_node);
                         const f = self.type_pool.get(sig).function;
                         self.checkArgList(node_idx, f.param_types, c.args, piped, hole);
@@ -1515,6 +2800,11 @@ pub const TypeChecker = struct {
                     else => {},
                 }
             }
+        }
+
+        // A generic application in callee position: `first[i32](...)`.
+        if (self.genericCalleeDecl(c.func)) |decl_idx| {
+            return self.checkGenericCall(node_idx, decl_idx, c.func, c.args, piped, hole);
         }
 
         const callee_ty = self.inferExprType(c.func);
@@ -1855,23 +3145,35 @@ pub const TypeChecker = struct {
         return null;
     }
 
+    /// The type of a field of an applied struct: the declared field type with
+    /// the instance's type arguments substituted in (R25).
+    fn appliedFieldType(
+        self: *TypeChecker,
+        decl_node: NodeIdx,
+        args: []const TypeIdx,
+        field_name: []const u8,
+    ) ?TypeIdx {
+        const t = self.structFieldType(decl_node, field_name) orelse return null;
+        return generics_mod.substType(self.type_pool, t, args) catch @panic("OOM");
+    }
+
     /// The semantic type of a declared field. A field typed directly by one of
     /// the declaration's generic parameters (`first: A`) becomes a
     /// `generic_param` placeholder that an application substitutes; every other
     /// type is resolved in place.
     fn declFieldType(self: *TypeChecker, generic_params: NodeList, ty: ast.TypeRepr) TypeIdx {
-        if (ty == .plain) {
-            const inner = self.arena.get(ty.plain);
-            if (inner.* == .identifier) {
-                const id = inner.identifier;
-                const name = self.nameSlice(id);
-                for (generic_params.indices, 0..) |gp_idx, i| {
-                    const gp = self.arena.get(gp_idx);
-                    if (std.mem.eql(u8, self.nameSlice(gp.identifier), name)) {
-                        return self.type_pool.add(.{ .generic_param = .{ .name = id, .index = @intCast(i) } }) catch @panic("OOM");
-                    }
+        switch (ty) {
+            .plain => |n| {
+                if (self.genericParamIndex(generic_params, n)) |i| {
+                    return self.genericParamType(n, i);
                 }
-            }
+            },
+            .reference, .mut_reference => |n| {
+                if (self.genericParamIndex(generic_params, n)) |i| {
+                    const inner = self.genericParamType(n, i);
+                    return self.type_pool.add(.{ .pointer = inner }) catch @panic("OOM");
+                }
+            },
         }
         return self.inferTypeRefNode(ty);
     }
@@ -1884,19 +3186,6 @@ pub const TypeChecker = struct {
                 break :blk self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
             },
         };
-    }
-
-    fn substType(self: *TypeChecker, ty: TypeIdx, args: []const TypeIdx, _: NodeIdx) TypeIdx {
-        const sem = self.type_pool.get(ty);
-        switch (sem) {
-            .generic_param => |gp| {
-                if (gp.index < args.len) {
-                    return args[gp.index];
-                }
-                return ty;
-            },
-            else => return ty,
-        }
     }
 
     fn resolveDeclType(self: *TypeChecker, decl_node: NodeIdx) TypeIdx {
@@ -1974,6 +3263,7 @@ pub const TypeChecker = struct {
             },
             .slice => |ae| return self.typesEqual(ae, b.slice),
             .generic_param => |ag| return ag.index == b.generic_param.index,
+            .type_value => return true,
         }
     }
 
@@ -2007,12 +3297,36 @@ pub const TypeChecker = struct {
             .array => "array",
             .slice => "slice",
             .generic_param => "generic",
+            .type_value => "type",
             .inferred => "inferred",
         };
     }
 
     pub fn getNodeTypes(self: *const TypeChecker) []const TypeIdx {
         return self.node_types.items;
+    }
+
+    /// The monomorphized instances, in creation order. Codegen emits one
+    /// function per instance (R21 step 4).
+    pub fn instances(self: *const TypeChecker) []const *GenericInstance {
+        return self.instance_list.items;
+    }
+
+    /// The instance a call site resolves to, keyed by the callee node.
+    pub fn instanceForCallee(self: *const TypeChecker, callee_node: NodeIdx) ?*GenericInstance {
+        return self.instance_by_callee.get(callee_node);
+    }
+
+    /// The comptime value of a node. `.none` means the expression has no
+    /// compile-time value.
+    pub fn getComptimeValue(self: *const TypeChecker, node_idx: NodeIdx) ComptimeValue {
+        const binding = self.comptime_values.get(node_idx) orelse return .{ .none = {} };
+        return binding.value;
+    }
+
+    /// The branch a `comptime if` takes: true when the then-branch is taken.
+    pub fn getComptimeBranch(self: *const TypeChecker, node_idx: NodeIdx) ?bool {
+        return self.comptime_branches.get(node_idx);
     }
 };
 
@@ -2024,16 +3338,111 @@ fn tryStdTy(what: anyerror!TypeIdx) TypeIdx {
     return what catch @panic("OOM");
 }
 
-/// A stable key for an application of a generic declaration: the declaration
-/// node plus its type arguments. Lets `inferGenericApp` reuse the resolved type
-/// for repeats of the same application within a compilation.
-fn genericAppKey(decl_node: NodeIdx, args: []const TypeIdx) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    h = (h ^ @as(u64, @intFromEnum(decl_node))) *% 0x100000001b3;
-    for (args) |arg| {
-        h = (h ^ @as(u64, @intFromEnum(arg))) *% 0x100000001b3;
+/// The number of fields of a struct declaration.
+fn structFieldCount(arena: *const AstArena, decl_idx: NodeIdx) u64 {
+    const decl = arena.get(decl_idx);
+    return switch (decl.*) {
+        .struct_decl => |s| s.fields.indices.len,
+        else => 0,
+    };
+}
+
+/// The number of payload slots of an enum: the widest variant decides
+/// (docs/semantics.md §3.2).
+fn enumPayloadSlots(arena: *const AstArena, decl_idx: NodeIdx) u64 {
+    const decl = arena.get(decl_idx);
+    const e = decl.enum_decl;
+    var widest: u64 = 0;
+    for (e.variants.indices) |variant_idx| {
+        const variant = arena.get(variant_idx).enum_variant;
+        widest = @max(widest, variant.fields.indices.len);
     }
-    return h;
+    return widest;
+}
+
+/// The source spelling of a binary operator, for a diagnostic that shows a
+/// comptime expression the way it was written.
+fn binaryOpName(op: BinaryOp) []const u8 {
+    return switch (op) {
+        .add => "+",
+        .sub => "-",
+        .mul => "*",
+        .div => "/",
+        .mod => "%",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shift_left => "<<",
+        .shift_right => ">>",
+        .eq => "==",
+        .ne => "!=",
+        .lt => "<",
+        .gt => ">",
+        .le => "<=",
+        .ge => ">=",
+        .and_op => "&&",
+        .or_op => "||",
+        .assign => "=",
+        .add_assign => "+=",
+        .sub_assign => "-=",
+        .mul_assign => "*=",
+        .div_assign => "/=",
+        .range => "..",
+    };
+}
+
+/// The source spelling of a unary operator, for a diagnostic that shows a
+/// comptime expression the way it was written.
+fn unaryOpName(op: ast.UnaryOp) []const u8 {
+    return switch (op) {
+        .neg => "-",
+        .not => "!",
+        .bit_not => "~",
+        .ref => "&",
+        .mut_ref => "&mut ",
+    };
+}
+
+/// The comptime value of an integer operation.
+fn comptimeIntOp(op: BinaryOp, l: i64, r: i64) ComptimeValue {
+    return switch (op) {
+        .add => ComptimeValue{ .int = l +% r },
+        .sub => ComptimeValue{ .int = l -% r },
+        .mul => ComptimeValue{ .int = l *% r },
+        .div => if (r == 0) ComptimeValue{ .none = {} } else ComptimeValue{ .int = @divTrunc(l, r) },
+        .mod => if (r == 0) ComptimeValue{ .none = {} } else ComptimeValue{ .int = @rem(l, r) },
+        .eq => ComptimeValue{ .bool = l == r },
+        .ne => ComptimeValue{ .bool = l != r },
+        .lt => ComptimeValue{ .bool = l < r },
+        .gt => ComptimeValue{ .bool = l > r },
+        .le => ComptimeValue{ .bool = l <= r },
+        .ge => ComptimeValue{ .bool = l >= r },
+        .bit_and => ComptimeValue{ .int = l & r },
+        .bit_or => ComptimeValue{ .int = l | r },
+        .bit_xor => ComptimeValue{ .int = l ^ r },
+        .shift_left => ComptimeValue{ .int = l << @as(u6, @truncate(@as(u64, @bitCast(r)))) },
+        .shift_right => ComptimeValue{ .int = l >> @as(u6, @truncate(@as(u64, @bitCast(r)))) },
+        .and_op => ComptimeValue{ .bool = l != 0 and r != 0 },
+        .or_op => ComptimeValue{ .bool = l != 0 or r != 0 },
+        else => ComptimeValue{ .none = {} },
+    };
+}
+
+/// The comptime value of a floating-point operation.
+fn comptimeFloatOp(op: BinaryOp, l: f64, r: f64) ComptimeValue {
+    return switch (op) {
+        .add => ComptimeValue{ .float = l + r },
+        .sub => ComptimeValue{ .float = l - r },
+        .mul => ComptimeValue{ .float = l * r },
+        .div => ComptimeValue{ .float = l / r },
+        .eq => ComptimeValue{ .bool = l == r },
+        .ne => ComptimeValue{ .bool = l != r },
+        .lt => ComptimeValue{ .bool = l < r },
+        .gt => ComptimeValue{ .bool = l > r },
+        .le => ComptimeValue{ .bool = l <= r },
+        .ge => ComptimeValue{ .bool = l >= r },
+        else => ComptimeValue{ .none = {} },
+    };
 }
 
 const CheckRun = struct {

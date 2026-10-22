@@ -57,6 +57,10 @@ pub const SemType = union(enum) {
     array: struct { elem: TypeIdx, size: ?u64 },
     slice: TypeIdx,
     generic_param: struct { name: StringRef, index: u32 },
+    /// The type of a *type value*: the result of `@typeOf(x)`. A type value
+    /// is a compile-time thing and has no runtime representation, so it is
+    /// only ever compared at comptime (docs/semantics.md §7.5, R23a).
+    type_value,
     /// An unresolved type: the placeholder for a closure parameter or closure
     /// return type that is inferred rather than annotated (R11b). Comparisons
     /// against an `inferred` operand are permissive so a not-yet-resolved
