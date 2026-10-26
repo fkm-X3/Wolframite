@@ -477,7 +477,23 @@ pub const Lowerer = struct {
         const body = cl.body;
         const ret_ty = self.type_pool.get(self.exprType(closure_node)).function.return_type;
         if (self.arena.get(body).* == .block) {
-            try self.lowerStmt(body);
+            const val = try self.lowerBlockValue(self.arena.get(body).block);
+            if (!self.block_terminated) {
+                if (self.type_pool.get(ret_ty) == .void) {
+                    _ = try self.ctx.buildRetVoid();
+                } else if (self.tailPropagateVariant(body, ret_ty)) |svi| {
+                    // A tail `?` in a block-bodied closure: the checker pairs
+                    // it with the closure's return type only in the expression
+                    // form; for a block, the propagate is lowered as a statement
+                    // expression in lowerBlockValue and returns the success
+                    // payload value, so re-wrap it like the expression form.
+                    const wrapped = try self.lowerVariantInitValues(svi, &.{val});
+                    _ = try self.ctx.buildRet(wrapped);
+                } else {
+                    _ = try self.ctx.buildRet(val);
+                }
+                self.terminated();
+            }
         } else {
             // Expression-body shorthand: the body's value is the return value.
             const val = try self.lowerExpr(body);
@@ -884,7 +900,7 @@ pub const Lowerer = struct {
     fn lowerMatch(self: *Lowerer, node_idx: NodeIdx) !void {
         const m = self.arena.get(node_idx).match_expr;
         const scrutinee = try self.lowerExpr(m.scrutinee);
-        if (self.type_pool.get(self.exprType(m.scrutinee)) == .enum_type) {
+        if (self.isEnumType(self.exprType(m.scrutinee))) {
             _ = try self.lowerMatchEnum(node_idx, m, scrutinee, false);
         } else {
             _ = try self.lowerMatchInt(node_idx, m, scrutinee, false);
@@ -899,34 +915,62 @@ pub const Lowerer = struct {
         }
         const m = self.arena.get(node_idx).match_expr;
         const scrutinee = try self.lowerExpr(m.scrutinee);
-        if (self.type_pool.get(self.exprType(m.scrutinee)) == .enum_type) {
+        if (self.isEnumType(self.exprType(m.scrutinee))) {
             return self.lowerMatchEnum(node_idx, m, scrutinee, true);
         }
         return self.lowerMatchInt(node_idx, m, scrutinee, true);
     }
 
+    /// Whether a type is an enum, generic or not. An applied enum has the
+    /// layout of the declaration it was instantiated from (R2a), so both lower
+    /// the same way.
+    fn isEnumType(self: *const Lowerer, ty: TypeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .enum_type, .applied_enum => true,
+            else => false,
+        };
+    }
+
     /// Integer-literal match: icmp chain to per-arm blocks, phi at merge when
-    /// the match is in expression position.
+    /// the match is in expression position. A `_` pattern matches every value,
+    /// and a guard decides whether a matched arm runs.
     fn lowerMatchInt(self: *Lowerer, node_idx: NodeIdx, m: anytype, scrutinee: api.Value, want_value: bool) !api.Value {
         var arm_consts = std.ArrayList(api.Value).empty;
         defer arm_consts.deinit(self.gpa);
+        var wildcards = std.ArrayList(bool).empty;
+        defer wildcards.deinit(self.gpa);
         for (m.arms.indices) |arm_idx| {
             const arm = self.arena.get(arm_idx);
             const pattern = self.arena.get(arm.match_arm.pattern);
-            const value = switch (pattern.*) {
-                .int_literal => |v| try self.ctx.buildIntConst(self.i64_ty, v),
-                else => blk: {
-                    self.codegenError(arm_idx, "only integer match patterns are supported for non-enum scrutinees", .{});
-                    break :blk try self.ctx.buildIntConst(self.i64_ty, 0);
+            switch (pattern.*) {
+                .int_literal => |v| {
+                    try arm_consts.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, v));
+                    try wildcards.append(self.gpa, false);
                 },
-            };
-            try arm_consts.append(self.gpa, value);
+                .identifier => |id| {
+                    if (std.mem.eql(u8, self.nameSlice(id), "_")) {
+                        try arm_consts.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
+                        try wildcards.append(self.gpa, true);
+                    } else {
+                        self.codegenError(arm_idx, "only integer match patterns are supported for non-enum scrutinees", .{});
+                        try arm_consts.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
+                        try wildcards.append(self.gpa, false);
+                    }
+                },
+                else => {
+                    self.codegenError(arm_idx, "only integer match patterns are supported for non-enum scrutinees", .{});
+                    try arm_consts.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
+                    try wildcards.append(self.gpa, false);
+                },
+            }
         }
 
         var checks = std.ArrayList(api.BasicBlockIdx).empty;
         defer checks.deinit(self.gpa);
         var bodies = std.ArrayList(api.BasicBlockIdx).empty;
         defer bodies.deinit(self.gpa);
+        var body_blocks = std.ArrayList(api.BasicBlockIdx).empty;
+        defer body_blocks.deinit(self.gpa);
         var body_vals = std.ArrayList(api.Value).empty;
         defer body_vals.deinit(self.gpa);
         var terminated_flags = std.ArrayList(bool).empty;
@@ -934,19 +978,35 @@ pub const Lowerer = struct {
         for (m.arms.indices) |_| {
             try checks.append(self.gpa, try self.ctx.appendBlock());
             try bodies.append(self.gpa, try self.ctx.appendBlock());
+            try body_blocks.append(self.gpa, undefined);
             try terminated_flags.append(self.gpa, false);
         }
         const merge = try self.ctx.appendBlock();
         _ = try self.ctx.buildBr(checks.items[0]);
 
         for (m.arms.indices, 0..) |arm_idx, i| {
+            const arm = self.arena.get(arm_idx);
             self.setBlock(checks.items[i]);
-            const match_cond = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, scrutinee, arm_consts.items[i]);
             const next_check = if (i + 1 < checks.items.len) checks.items[i + 1] else merge;
-            _ = try self.ctx.buildCondBr(match_cond, bodies.items[i], next_check);
+            if (wildcards.items[i]) {
+                _ = try self.ctx.buildBr(bodies.items[i]);
+            } else {
+                const match_cond = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, scrutinee, arm_consts.items[i]);
+                _ = try self.ctx.buildCondBr(match_cond, bodies.items[i], next_check);
+            }
 
             self.setBlock(bodies.items[i]);
-            const arm = self.arena.get(arm_idx);
+            // A guard runs after the pattern matched; a failed guard falls
+            // through to the next arm.
+            if (arm.match_arm.guard) |guard| {
+                const guard_block = try self.ctx.appendBlock();
+                body_blocks.items[i] = guard_block;
+                const guard_val = try self.lowerExpr(guard);
+                _ = try self.ctx.buildCondBr(guard_val, guard_block, next_check);
+                self.setBlock(guard_block);
+            } else {
+                body_blocks.items[i] = bodies.items[i];
+            }
             if (want_value) {
                 try body_vals.append(self.gpa, try self.lowerExpr(arm.match_arm.body));
             } else {
@@ -962,7 +1022,7 @@ pub const Lowerer = struct {
         defer incoming.deinit(self.gpa);
         for (m.arms.indices, 0..) |_, i| {
             if (!terminated_flags.items[i]) {
-                try incoming.append(self.gpa, .{ .value = body_vals.items[i], .block = bodies.items[i] });
+                try incoming.append(self.gpa, .{ .value = body_vals.items[i], .block = body_blocks.items[i] });
             }
         }
         if (incoming.items.len == 0) return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -970,8 +1030,9 @@ pub const Lowerer = struct {
     }
 
     /// Enum match: compare the tag byte, then bind the matched variant's
-    /// payload identifiers for the arm body. Returns an expression value when
-    /// the match is in expression position.
+    /// payload identifiers for the arm body. A `_` pattern matches every
+    /// variant, and a guard decides whether a matched arm runs. Returns an
+    /// expression value when the match is in expression position.
     fn lowerMatchEnum(self: *Lowerer, node_idx: NodeIdx, m: anytype, scrutinee: api.Value, want_value: bool) !api.Value {
         const tag = try self.ctx.buildLoad(self.i64_ty, scrutinee);
 
@@ -979,6 +1040,8 @@ pub const Lowerer = struct {
         defer checks.deinit(self.gpa);
         var bodies = std.ArrayList(api.BasicBlockIdx).empty;
         defer bodies.deinit(self.gpa);
+        var body_blocks = std.ArrayList(api.BasicBlockIdx).empty;
+        defer body_blocks.deinit(self.gpa);
         var body_vals = std.ArrayList(api.Value).empty;
         defer body_vals.deinit(self.gpa);
         var terminated_flags = std.ArrayList(bool).empty;
@@ -986,6 +1049,7 @@ pub const Lowerer = struct {
         for (m.arms.indices) |_| {
             try checks.append(self.gpa, try self.ctx.appendBlock());
             try bodies.append(self.gpa, try self.ctx.appendBlock());
+            try body_blocks.append(self.gpa, undefined);
             try terminated_flags.append(self.gpa, false);
         }
         const merge = try self.ctx.appendBlock();
@@ -994,27 +1058,33 @@ pub const Lowerer = struct {
         for (m.arms.indices, 0..) |arm_idx, i| {
             const arm = self.arena.get(arm_idx);
             const pattern = self.arena.get(arm.match_arm.pattern);
-            const variant = self.matchVariantFor(arm_idx, pattern) orelse {
+            const next_check = if (i + 1 < checks.items.len) checks.items[i + 1] else merge;
+            const wildcard = self.isWildcardPattern(pattern);
+            const variant: ?ast.EnumVariantInfo = if (wildcard) null else self.matchVariantFor(arm_idx, pattern);
+
+            if (wildcard) {
                 self.setBlock(checks.items[i]);
-                const next_check = if (i + 1 < checks.items.len) checks.items[i + 1] else merge;
+                _ = try self.ctx.buildBr(bodies.items[i]);
+            } else if (variant == null) {
+                self.setBlock(checks.items[i]);
                 _ = try self.ctx.buildCondBr(tag, bodies.items[i], next_check);
                 self.setBlock(bodies.items[i]);
                 _ = try self.ctx.buildBr(merge);
                 terminated_flags.items[i] = false;
+                body_blocks.items[i] = bodies.items[i];
                 if (want_value) try body_vals.append(self.gpa, try self.ctx.buildIntConst(self.i64_ty, 0));
                 continue;
-            };
-
-            self.setBlock(checks.items[i]);
-            const tag_const = try self.ctx.buildIntConst(self.i64_ty, @intCast(variant.index));
-            const match_cond = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, tag, tag_const);
-            const next_check = if (i + 1 < checks.items.len) checks.items[i + 1] else merge;
-            _ = try self.ctx.buildCondBr(match_cond, bodies.items[i], next_check);
+            } else {
+                self.setBlock(checks.items[i]);
+                const tag_const = try self.ctx.buildIntConst(self.i64_ty, @intCast(variant.?.index));
+                const match_cond = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, tag, tag_const);
+                _ = try self.ctx.buildCondBr(match_cond, bodies.items[i], next_check);
+            }
 
             self.setBlock(bodies.items[i]);
             const local_marker = self.shadows.items.len;
-            const variant_node = self.arena.get(variant.variant_node);
             if (pattern.* == .call) {
+                const variant_node = self.arena.get(variant.?.variant_node);
                 for (pattern.call.args.indices, 0..) |arg_idx, j| {
                     const arg = self.arena.get(arg_idx);
                     if (arg.* != .identifier) continue;
@@ -1028,6 +1098,17 @@ pub const Lowerer = struct {
                         self.checker.void_ty;
                     try self.bindLocal(self.nameSlice(arg.identifier), slot, payload_ty);
                 }
+            }
+            // A guard runs after the pattern matched and its payload is bound;
+            // a failed guard falls through to the next arm.
+            if (arm.match_arm.guard) |guard| {
+                const guard_block = try self.ctx.appendBlock();
+                body_blocks.items[i] = guard_block;
+                const guard_val = try self.lowerExpr(guard);
+                _ = try self.ctx.buildCondBr(guard_val, guard_block, next_check);
+                self.setBlock(guard_block);
+            } else {
+                body_blocks.items[i] = bodies.items[i];
             }
             if (want_value) {
                 try body_vals.append(self.gpa, try self.lowerExpr(arm.match_arm.body));
@@ -1045,11 +1126,16 @@ pub const Lowerer = struct {
         defer incoming.deinit(self.gpa);
         for (m.arms.indices, 0..) |_, i| {
             if (!terminated_flags.items[i]) {
-                try incoming.append(self.gpa, .{ .value = body_vals.items[i], .block = bodies.items[i] });
+                try incoming.append(self.gpa, .{ .value = body_vals.items[i], .block = body_blocks.items[i] });
             }
         }
         if (incoming.items.len == 0) return self.ctx.buildIntConst(self.i64_ty, 0);
         return self.ctx.buildPhi(self.irTypeFor(self.exprType(node_idx)), incoming.items);
+    }
+
+    /// Whether a match pattern is the `_` wildcard.
+    fn isWildcardPattern(self: *Lowerer, pattern: *const Node) bool {
+        return pattern.* == .identifier and std.mem.eql(u8, self.nameSlice(pattern.identifier), "_");
     }
 
     /// Resolve a match arm pattern to an enum variant (either a bare variant
@@ -1206,7 +1292,12 @@ pub const Lowerer = struct {
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
         };
-        const shape = self.checker.propagateShape(enum_node) orelse {
+        const args: []const TypeIdx = switch (sem) {
+            .enum_type => &.{},
+            .applied_enum => |a| a.args,
+            else => &.{},
+        };
+        const shape = self.checker.propagateShapeFor(enum_node, args) orelse {
             self.codegenError(node_idx, "cannot propagate this enum: no one-payload success variant and error variant", .{});
             return self.ctx.buildIntConst(self.i64_ty, 0);
         };

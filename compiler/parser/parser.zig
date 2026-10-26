@@ -325,6 +325,10 @@ pub const Parser = struct {
                 break;
             };
             fields.append(self.allocator, field) catch unreachable;
+
+            // Fields may be separated by commas; the separator is optional.
+            self.skipNewlinesAndSemicolons();
+            if (self.check(.comma)) _ = self.advance();
         }
 
         _ = self.expect(.rbrace);
@@ -347,6 +351,13 @@ pub const Parser = struct {
         while (true) {
             self.skipNewlinesAndSemicolons();
             if (self.check(.rbrace)) break;
+
+            // Variants may be separated by commas; the separator is optional.
+            if (self.check(.comma)) {
+                _ = self.advance();
+                self.skipNewlinesAndSemicolons();
+                if (self.check(.rbrace)) break;
+            }
 
             const var_name = self.expect(.identifier) orelse {
                 self.recoverTo(.rbrace);
@@ -378,6 +389,9 @@ pub const Parser = struct {
                 .name = self.makeStringRef(var_name),
                 .fields = field_list,
             } })) catch unreachable;
+
+            self.skipNewlinesAndSemicolons();
+            if (self.check(.comma)) _ = self.advance();
         }
 
         _ = self.expect(.rbrace);
@@ -571,6 +585,7 @@ pub const Parser = struct {
         self.skipNewlinesAndSemicolons();
         const then_body = self.parseBlock() orelse {
             if (self.check(.if_kw)) {
+                _ = self.advance();
                 const nested = self.parseIfExpr() orelse return null;
                 return self.appendNode(.{ .if_expr = .{ .cond = cond, .then_body = nested, .else_body = null } });
             }
@@ -582,6 +597,7 @@ pub const Parser = struct {
         if (self.expectPeek(.else_kw)) |_| {
             self.skipNewlinesAndSemicolons();
             if (self.check(.if_kw)) {
+                _ = self.advance();
                 else_body = self.parseIfExpr();
             } else if (self.check(.lbrace)) {
                 else_body = self.parseBlock();

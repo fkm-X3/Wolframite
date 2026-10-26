@@ -1,30 +1,27 @@
-// Match on integer values
+enum Result[T, E] {
+    Ok(T),
+    Err(E),
+}
+
+fn describe(r: Result[i32, String]) -> i32 {
+    return match r {
+        Ok(v) => v,
+        Err(e) => 0,
+    }
+}
+
 fn classify(x: i32) -> String {
-    match x {
+    return match x {
         0 => "zero",
         1 => "one",
-        2 => "two",
-        // default fallthrough
-        _ => "many",
+        _ => "other",
     }
 }
 
-// Match on enum variants
-fn describe(result: Result[i32, String]) -> String {
-    match result {
-        Ok(v) => "got value: " + v,
-        Err(e) => "error: " + e,
-    }
-}
-
-// Match as expression
-fn value_or_default(opt: Option[i32]) -> i32 {
-    return match opt {
-        Some(v) => v,
-        None => -1,
-    }
-}
-
-fn main() -> String {
-    return classify(1)
+fn main() -> i32 {
+    let r1 = Ok(42)
+    let r2 = Err("fail")
+    let a = describe(r1)
+    let b = describe(r2)
+    return a + b
 }

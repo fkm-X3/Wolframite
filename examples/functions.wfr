@@ -1,17 +1,16 @@
-// Standard function with explicit types
 fn add(a: i32, b: i32) -> i32 {
     return a + b
 }
 
-// Single-expression shorthand (body = expr, no braces)
-fn double(x: i32) -> i32 = x * 2
+fn sub(a: i32, b: i32) -> i32 = a - b
 
-// No return type = void
-fn greet() {
-    let msg := "hello"
+fn inc(x: i32) -> i32 {
+    return x + 1
 }
 
-// Calling functions
 fn main() -> i32 {
-    return add(1, double(2))
+    let a = add(2, 3)
+    let b = sub(10, 4)
+    let c = inc(5)
+    return a + b + c
 }

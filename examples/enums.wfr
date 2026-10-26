@@ -1,25 +1,23 @@
-// Generic enum (sum type)
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
 enum Option[T] {
-    Some(T)
-    None
+    Some(T),
+    None,
 }
 
-enum Result[T, E] {
-    Ok(T)
-    Err(E)
-}
-
-fn divide(a: i32, b: i32) -> Result[i32, String] {
-    if b == 0 {
-        return Err("division by zero")
+fn color_code(c: Color) -> i32 {
+    return match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3,
     }
-    return Ok(a / b)
 }
 
-fn check() -> i32 {
-    let res := divide(10, 2)
-    match res {
-        Ok(v) => v,
-        Err(e) => 0,
-    }
+fn main() -> i32 {
+    let c = Red
+    return color_code(c)
 }

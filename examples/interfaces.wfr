@@ -1,38 +1,22 @@
-// Interface = structural contract (like Python duck typing, checked at compile time)
-// No `implements` keyword — satisfaction is structural
-interface Speakable {
-    fn speak(self: *Self) -> String
-}
-
-interface Indexable[T] {
-    fn get(self: *Self, index: i64) -> T
-}
-
-interface Addable[T] {
-    fn add(self: *Self, other: *T) -> T
-}
-
-// Types automatically satisfy interfaces by having matching signatures
 struct Person {
-    name: String
-
-    fn init(name: String) -> Person {
-        return Person{ .name = name }
-    }
+    name: String,
+    age: i32,
 }
 
-impl Person {
-    fn speak(self: *Person) -> String {
-        return "Hi, I'm " + self.name
-    }
+struct Pet {
+    name: String,
+    species: String,
 }
 
-// *impl Interface = fat pointer for dynamic dispatch
-fn greet(entity: *impl Speakable) -> String {
-    return "says: " + entity.speak()
+fn get_name[T](v: T) -> String {
+    comptime @assert(@hasField(T, "name"), "T must have a name field")
+    return @field(v, "name")
 }
 
-fn main() -> String {
-    let p := Person.init("Alice")
-    return greet(&p)
+fn main() -> i32 {
+    let p = Person{ .name = "Ada", .age = 36 }
+    let pet = Pet{ .name = "Fido", .species = "dog" }
+    print(get_name(p))
+    print(get_name(pet))
+    return 0
 }

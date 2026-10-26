@@ -1,0 +1,13 @@
+fn inc(x: i32) -> i32 = x + 1
+
+fn double(x: i32) -> i32 = x * 2
+
+fn square(x: i32) -> i32 = x * x
+
+fn main() -> i32 {
+    let f = compose(inc, double)
+    let g = compose(double, square)
+    let a = f(5)
+    let b = g(3)
+    return a + b
+}

@@ -1,26 +1,24 @@
-// Generic function (monomorphized at compile time)
-fn first[T](list: Slice[T]) -> T {
-    return list[0]
-}
-
-// Generic struct
 struct Pair[A, B] {
-    first: A
-    second: B
-
-    fn swap(self: *Pair[A, B]) -> Pair[B, A] {
-        return Pair[B, A]{ .first = self.second, .second = self.first }
-    }
+    first: A,
+    second: B,
 }
 
-// Generic enum
 enum Option[T] {
-    Some(T)
-    None
+    Some(T),
+    None,
+}
+
+fn first[A, B](p: Pair[A, B]) -> A {
+    return p.first
+}
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+    return Pair{ .first = p.second, .second = p.first }
 }
 
 fn main() -> i32 {
-    let p: Pair[i32, f64] = Pair{ .first = 1, .second = 2.0 }
-    let swapped := p.swap()
-    return 0
+    let p = Pair{ .first = 10, .second = 20 }
+    let a = first(p)
+    let q = swap(p)
+    return a + q.second
 }

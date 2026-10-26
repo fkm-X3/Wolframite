@@ -1,13 +1,6 @@
-fn demo() -> i32 {
-    // Immutable by default (let)
+fn main() -> i32 {
     let x: i32 = 42
-
-    // Mutable (mut)
-    mut y: f64 = 3.14
-    y = 2.71
-
-    // Type inference with :=
-    z := x + 10
-
-    return z
+    mut y: i32 = 10
+    y = y + 1
+    return x + y
 }

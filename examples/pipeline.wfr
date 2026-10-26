@@ -1,0 +1,14 @@
+fn inc(x: i32) -> i32 = x + 1
+
+fn double(x: i32) -> i32 = x * 2
+
+fn add(a: i32, b: i32) -> i32 = a + b
+
+fn main() -> i32 {
+    let a = pipe(3, inc)
+    let b = 3 |> inc
+    let c = 3 |> inc |> double
+    let d = 10 |> add(5)
+    let e = 10 |> add(_, 3)
+    return a + b + c + d + e
+}

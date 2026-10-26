@@ -992,7 +992,7 @@ pub const TypeChecker = struct {
         switch (node.*) {
             .int_literal => |v| return .{ .int = v },
             .float_literal => |v| return .{ .float = v },
-            .string_literal => |ref| return .{ .string = self.nameSlice(ref) },
+            .string_literal => |ref| return .{ .string = self.stringContent(ref) },
             .char_literal => |ref| return .{ .int = self.charCode(ref) },
             .bool_literal => |v| return .{ .bool = v },
             .paren_expr => |p| return self.evalComptime(p),
@@ -1169,11 +1169,21 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// The text of a string literal node.
+    /// The text of a string literal node, without its surrounding quotes.
     fn stringLiteral(self: *const TypeChecker, node_idx: NodeIdx) ?[]const u8 {
         const node = self.arena.get(node_idx);
         if (node.* != .string_literal) return null;
-        return self.nameSlice(node.string_literal);
+        return self.stringContent(node.string_literal);
+    }
+
+    /// The source text of a string literal token, stripped of its quotes.
+    ///
+    /// The lexer keeps the quotes in the token's lexeme, so comptime string
+    /// values (`@hasField`'s field name, `@assert`'s message) must be bare.
+    fn stringContent(self: *const TypeChecker, ref: StringRef) []const u8 {
+        const raw = ref.slice(self.source);
+        if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') return raw[1 .. raw.len - 1];
+        return raw;
     }
 
     /// The initializer of a named field of a struct literal.
@@ -1394,16 +1404,8 @@ pub const TypeChecker = struct {
         const node = self.arena.get(node_idx);
         switch (node.*) {
             .identifier => |id| self.appendTo(buf, len, self.nameSlice(id)),
-            .string_literal => |ref| {
-                self.appendTo(buf, len, "\"");
-                self.appendTo(buf, len, self.nameSlice(ref));
-                self.appendTo(buf, len, "\"");
-            },
-            .char_literal => |ref| {
-                self.appendTo(buf, len, "'");
-                self.appendTo(buf, len, self.nameSlice(ref));
-                self.appendTo(buf, len, "'");
-            },
+            .string_literal => |ref| self.appendTo(buf, len, self.nameSlice(ref)),
+            .char_literal => |ref| self.appendTo(buf, len, self.nameSlice(ref)),
             .int_literal => |v| {
                 var tmp: [24]u8 = undefined;
                 self.appendTo(buf, len, std.fmt.bufPrint(&tmp, "{d}", .{v}) catch "0");
@@ -2025,10 +2027,17 @@ pub const TypeChecker = struct {
             .match_expr => |m| {
                 const scrut_ty = self.inferExprType(m.scrutinee);
                 var result_ty: TypeIdx = self.void_ty;
-                if (self.type_pool.get(scrut_ty) == .enum_type) {
-                    const enum_node = self.type_pool.get(scrut_ty).enum_type;
+                const scrut_sem = self.type_pool.get(scrut_ty);
+                if (scrut_sem == .enum_type) {
+                    const enum_node = scrut_sem.enum_type;
                     for (m.arms.indices) |arm_idx| {
-                        result_ty = tryStdTy(self.checkEnumArm(arm_idx, enum_node));
+                        result_ty = tryStdTy(self.checkEnumArm(arm_idx, enum_node, &.{}));
+                    }
+                } else if (scrut_sem == .applied_enum) {
+                    const enum_node = scrut_sem.applied_enum.decl;
+                    const args = scrut_sem.applied_enum.args;
+                    for (m.arms.indices) |arm_idx| {
+                        result_ty = tryStdTy(self.checkEnumArm(arm_idx, enum_node, args));
                     }
                 } else {
                     for (m.arms.indices) |arm_idx| {
@@ -2169,7 +2178,29 @@ pub const TypeChecker = struct {
             self.resolvePlaceholder(ty, expected);
             return expected;
         }
+        // An expected instance refines the bare declaration: a variant
+        // constructor has the declaration's type, but in a context that
+        // expects `Option[i32]` the value is that instance.
+        if (self.refines(expected, ty)) return expected;
         return ty;
+    }
+
+    /// Whether `expected` is an instance of the generic declaration that `ty`
+    /// names.
+    fn refines(self: *const TypeChecker, expected: TypeIdx, ty: TypeIdx) bool {
+        const e = self.type_pool.get(expected);
+        const t = self.type_pool.get(ty);
+        return switch (e) {
+            .applied_enum => |a| switch (t) {
+                .enum_type => |d| d == a.decl,
+                else => false,
+            },
+            .applied_struct => |a| switch (t) {
+                .struct_type => |d| d == a.decl,
+                else => false,
+            },
+            else => false,
+        };
     }
 
     /// Type a struct literal and check each provided field against its declared
@@ -2205,7 +2236,17 @@ pub const TypeChecker = struct {
             return ty;
         }
         const decl_node = sem.struct_type;
-        const is_generic = self.arena.get(decl_node).struct_decl.generic_params.indices.len > 0;
+        const gparams = self.arena.get(decl_node).struct_decl.generic_params;
+        const is_generic = gparams.indices.len > 0;
+        // The field types as templates: a field typed by one of the struct's
+        // generic parameters stays a placeholder until the instance's type
+        // arguments are known.
+        const templates = self.allocator.alloc(TypeIdx, si.fields.indices.len) catch @panic("OOM");
+        defer self.allocator.free(templates);
+        for (si.fields.indices, 0..) |field_idx, i| {
+            const f = self.arena.get(field_idx).struct_init_field;
+            templates[i] = self.structFieldType(decl_node, self.nameSlice(f.name)) orelse self.void_ty;
+        }
         for (si.fields.indices) |field_idx| {
             const f = self.arena.get(field_idx).struct_init_field;
             const field_name = self.nameSlice(f.name);
@@ -2224,6 +2265,19 @@ pub const TypeChecker = struct {
             } else {
                 _ = self.inferExprType(f.value);
                 self.errorAt(expr_idx, "struct has no field '{s}'", .{field_name});
+            }
+        }
+        // A generic struct's type arguments are recoverable from the field
+        // values, so the initializer may leave them out (R25).
+        if (is_generic) {
+            const values = self.allocator.alloc(TypeIdx, si.fields.indices.len) catch @panic("OOM");
+            defer self.allocator.free(values);
+            for (si.fields.indices, 0..) |field_idx, i| {
+                values[i] = self.inferExprType(self.arena.get(field_idx).struct_init_field.value);
+            }
+            if (self.inferTypeArgs(expr_idx, decl_node, gparams, templates, values)) |type_args| {
+                defer self.allocator.free(type_args);
+                return self.appliedType(decl_node, type_args);
             }
         }
         return ty;
@@ -3102,6 +3156,13 @@ pub const TypeChecker = struct {
     /// one-field variant is the success variant. There is no hard-coded
     /// `Result`/`Option`; the shape alone decides.
     pub fn propagateShape(self: *TypeChecker, enum_node: NodeIdx) ?PropagateShape {
+        return self.propagateShapeFor(enum_node, &.{});
+    }
+
+    /// The same split, with an instance's type arguments substituted into the
+    /// payload types (R27b): the success payload of `Result[i32, string]` is
+    /// `i32`, not the declaration's `T`.
+    pub fn propagateShapeFor(self: *TypeChecker, enum_node: NodeIdx, args: []const TypeIdx) ?PropagateShape {
         const decl = self.arena.get(enum_node);
         if (decl.* != .enum_decl) return null;
         const variants = decl.enum_decl.variants.indices;
@@ -3122,20 +3183,36 @@ pub const TypeChecker = struct {
         const success_i = success orelse return null;
         const error_i = err orelse return null;
 
+        const gparams = decl.enum_decl.generic_params;
         const success_variant = self.arena.get(variants[success_i]).enum_variant;
         const error_variant = self.arena.get(variants[error_i]).enum_variant;
         const error_count = error_variant.fields.indices.len;
 
         return .{
             .success_index = @intCast(success_i),
-            .success_payload_ty = self.inferExprType(success_variant.fields.indices[0]),
+            .success_payload_ty = self.enumPayloadType(gparams, args, success_variant.fields.indices[0]),
             .error_index = @intCast(error_i),
             .error_field_count = @intCast(error_count),
             .error_payload_ty = if (error_count == 1)
-                self.inferExprType(error_variant.fields.indices[0])
+                self.enumPayloadType(gparams, args, error_variant.fields.indices[0])
             else
                 self.void_ty,
         };
+    }
+
+    /// The type of an enum variant's payload field: the declared field type
+    /// with the instance's type arguments substituted in (R27b). A field typed
+    /// by one of the declaration's generic parameters (`Ok(T)`) becomes a
+    /// `generic_param` placeholder that the substitution replaces.
+    fn enumPayloadType(
+        self: *TypeChecker,
+        gparams: NodeList,
+        args: []const TypeIdx,
+        field_idx: NodeIdx,
+    ) TypeIdx {
+        const ty = self.resolveTemplateType(gparams, field_idx);
+        if (args.len == 0) return ty;
+        return generics_mod.substType(self.type_pool, ty, args) catch @panic("OOM");
     }
 
     /// Whether `ty` is an instance of the enum declared at `enum_node`.
@@ -3151,9 +3228,9 @@ pub const TypeChecker = struct {
     /// single-payload success variant and a 0-or-1-field error variant; the
     /// expression has the success payload's type. The enclosing fn/closure must
     /// return an instance of the same enum declaration (R27a) — that enum is the
-    /// branch-to-return target of R28. Substituting the instance's type arguments
-    /// into the payload (R27b/R27c) is not done here, so a generic enum's payload
-    /// is still its declared (unresolved) type.
+    /// branch-to-return target of R28. The instance's type arguments are
+    /// substituted into the payload (R27b), so `Result[i32, string]?` has the
+    /// type `i32`.
     fn inferPropagate(self: *TypeChecker, expr_idx: NodeIdx, operand: NodeIdx) TypeIdx {
         if (self.in_comptime) {
             self.errorAt(expr_idx, "'?' cannot propagate at comptime", .{});
@@ -3172,7 +3249,8 @@ pub const TypeChecker = struct {
             return self.void_ty;
         }
         const enum_node = if (sem == .enum_type) sem.enum_type else sem.applied_enum.decl;
-        const shape = self.propagateShape(enum_node) orelse {
+        const args: []const TypeIdx = if (sem == .enum_type) &.{} else sem.applied_enum.args;
+        const shape = self.propagateShapeFor(enum_node, args) orelse {
             self.errorAt(expr_idx, "'?' needs a one-payload success variant and an error variant", .{});
             return self.void_ty;
         };
@@ -3196,7 +3274,11 @@ pub const TypeChecker = struct {
     // ========================================================================
 
     /// Type an enum variant constructor `Some(x)` and return the enum type.
-    /// Payload arguments are checked against the declared field types.
+    /// Payload arguments are checked against the declared field types. A
+    /// generic enum's type arguments are inferred from the payload arguments
+    /// (R24), so `Some(7)` has the type `Option[i32]`; a parameter the payload
+    /// does not mention stays uninferred and the constructor keeps the bare
+    /// declaration's type.
     fn checkEnumVariantCall(self: *TypeChecker, node_idx: NodeIdx, vi: ast.EnumVariantInfo, args: NodeList) TypeIdx {
         const variant = self.arena.get(vi.variant_node);
         const fields = variant.enum_variant.fields;
@@ -3205,10 +3287,24 @@ pub const TypeChecker = struct {
                 self.nameSlice(variant.enum_variant.name), fields.indices.len, args.indices.len,
             });
         }
+        const gparams = self.arena.get(vi.enum_decl).enum_decl.generic_params;
+
+        // The payload types as templates: a payload typed by one of the
+        // enum's generic parameters stays a placeholder until the instance's
+        // type arguments are known.
+        const templates = self.allocator.alloc(TypeIdx, fields.indices.len) catch @panic("OOM");
+        defer self.allocator.free(templates);
+        for (fields.indices, 0..) |field_idx, i| {
+            templates[i] = self.resolveTemplateType(gparams, field_idx);
+        }
+
         for (args.indices, 0..) |arg, i| {
             if (i < fields.indices.len) {
-                const field_ty = self.inferExprType(fields.indices[i]);
-                if (field_ty != self.void_ty) {
+                const field_ty = templates[i];
+                // A payload that mentions a generic parameter cannot be
+                // checked against an argument yet: its type is only known
+                // once the instance's type arguments are.
+                if (field_ty != self.void_ty and !self.mentionsGenericParam(field_ty)) {
                     const got = self.inferExprTypeExpected(arg, field_ty);
                     if (!self.typesEqual(field_ty, got)) {
                         self.errorAt(node_idx, "variant field {d} expects '{s}' but got '{s}'", .{
@@ -3222,7 +3318,103 @@ pub const TypeChecker = struct {
                 _ = self.inferExprType(arg);
             }
         }
+
+        if (gparams.indices.len == 0) {
+            return self.type_pool.add(.{ .enum_type = vi.enum_decl }) catch self.void_ty;
+        }
+        const values = self.allocator.alloc(TypeIdx, args.indices.len) catch @panic("OOM");
+        defer self.allocator.free(values);
+        for (args.indices, 0..) |arg_idx, i| {
+            values[i] = self.inferExprType(arg_idx);
+        }
+        if (self.inferTypeArgs(node_idx, vi.enum_decl, gparams, templates, values)) |type_args| {
+            defer self.allocator.free(type_args);
+            return self.appliedType(vi.enum_decl, type_args);
+        }
         return self.type_pool.add(.{ .enum_type = vi.enum_decl }) catch self.void_ty;
+    }
+
+    /// Infer a generic declaration's type arguments from the types of the
+    /// values that mention them (R24/R25).
+    ///
+    /// Each template is the declared type of a field or payload with the
+    /// declaration's generic parameters left as placeholders; each value type
+    /// is the type of the expression that fills it. A parameter that no value
+    /// mentions cannot be inferred, so the caller keeps the declaration's
+    /// bare type.
+    fn inferTypeArgs(
+        self: *TypeChecker,
+        node_idx: NodeIdx,
+        decl_node: NodeIdx,
+        gparams: NodeList,
+        templates: []const TypeIdx,
+        value_types: []const TypeIdx,
+    ) ?[]TypeIdx {
+        const decl = self.arena.get(decl_node);
+        const decl_name = switch (decl.*) {
+            .struct_decl => |s| self.nameSlice(s.name),
+            .enum_decl => |e| self.nameSlice(e.name),
+            else => "",
+        };
+
+        var bindings = generics_mod.Bindings.init(self.allocator, gparams.indices.len) catch @panic("OOM");
+        defer bindings.deinit(self.allocator);
+
+        for (templates, value_types) |t, v| {
+            generics_mod.unifyTemplate(self.type_pool, t, v, &bindings);
+        }
+        if (bindings.conflict) {
+            const pname = if (bindings.conflict_index < gparams.indices.len)
+                self.nameSlice(self.arena.get(gparams.indices[bindings.conflict_index]).identifier)
+            else
+                decl_name;
+            self.errorAt(node_idx, "conflicting types for generic parameter '{s}' of '{s}'", .{
+                pname, decl_name,
+            });
+            return null;
+        }
+
+        const out = self.allocator.alloc(TypeIdx, gparams.indices.len) catch @panic("OOM");
+        for (gparams.indices, 0..) |_, i| {
+            const bound = bindings.bound[i] orelse {
+                self.allocator.free(out);
+                return null;
+            };
+            if (!self.isConcrete(bound)) {
+                self.allocator.free(out);
+                return null;
+            }
+            out[i] = bound;
+        }
+        return out;
+    }
+
+    /// Whether a type mentions a generic parameter, so that its concrete
+    /// value is not known yet.
+    fn mentionsGenericParam(self: *const TypeChecker, ty: TypeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .generic_param => true,
+            .pointer => |elem| self.mentionsGenericParam(elem),
+            .function => |f| blk: {
+                for (f.param_types) |p| {
+                    if (self.mentionsGenericParam(p)) break :blk true;
+                }
+                break :blk self.mentionsGenericParam(f.return_type);
+            },
+            .applied_struct => |a| blk: {
+                for (a.args) |x| {
+                    if (self.mentionsGenericParam(x)) break :blk true;
+                }
+                break :blk false;
+            },
+            .applied_enum => |a| blk: {
+                for (a.args) |x| {
+                    if (self.mentionsGenericParam(x)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     fn checkMatchStmt(self: *TypeChecker, stmt_idx: NodeIdx, m: anytype) anyerror!void {
@@ -3231,12 +3423,13 @@ pub const TypeChecker = struct {
         if (scrut_sem == .enum_type) {
             const enum_node = scrut_sem.enum_type;
             for (m.arms.indices) |arm_idx| {
-                _ = try self.checkEnumArm(arm_idx, enum_node);
+                _ = try self.checkEnumArm(arm_idx, enum_node, &.{});
             }
         } else if (scrut_sem == .applied_enum) {
             const enum_node = scrut_sem.applied_enum.decl;
+            const args = scrut_sem.applied_enum.args;
             for (m.arms.indices) |arm_idx| {
-                _ = try self.checkEnumArm(arm_idx, enum_node);
+                _ = try self.checkEnumArm(arm_idx, enum_node, args);
             }
         } else {
             for (m.arms.indices) |arm_idx| {
@@ -3254,10 +3447,29 @@ pub const TypeChecker = struct {
     /// Check one enum match arm: verify the pattern names a variant of
     /// `enum_node`, bind its payload identifiers in an arm-local scope, and
     /// type the body. Returns the body's type (for expression-position
-    /// matches).
-    fn checkEnumArm(self: *TypeChecker, arm_idx: NodeIdx, enum_node: NodeIdx) anyerror!TypeIdx {
+    /// matches). `args` are the scrutinee's type arguments, substituted into
+    /// the payload types (R25/R27b).
+    fn checkEnumArm(
+        self: *TypeChecker,
+        arm_idx: NodeIdx,
+        enum_node: NodeIdx,
+        args: []const TypeIdx,
+    ) anyerror!TypeIdx {
         const arm = self.arena.get(arm_idx);
         const pattern = self.arena.get(arm.match_arm.pattern);
+        // The `_` wildcard matches every variant and binds no payload.
+        if (self.isWildcardPattern(pattern)) {
+            _ = try self.scopes.pushScope(self.scopes.currentScope());
+            defer self.scopes.popScope();
+            _ = self.inferExprType(arm.match_arm.pattern);
+            if (arm.match_arm.guard) |guard| {
+                const guard_ty = self.inferExprType(guard);
+                if (!self.typesEqual(guard_ty, self.bool_ty)) {
+                    self.errorAt(arm_idx, "match guard must be bool, got '{s}'", .{self.typeName(guard_ty)});
+                }
+            }
+            return self.inferExprType(arm.match_arm.body);
+        }
         const variant = self.enumVariantFor(enum_node, pattern) orelse {
             self.errorAt(arm_idx, "match arm pattern must be a variant of this enum", .{});
             _ = self.inferExprType(arm.match_arm.pattern);
@@ -3266,12 +3478,13 @@ pub const TypeChecker = struct {
 
         _ = try self.scopes.pushScope(self.scopes.currentScope());
         const variant_node = self.arena.get(variant.variant_node);
+        const gparams = self.arena.get(enum_node).enum_decl.generic_params;
         if (pattern.* == .call) {
             for (pattern.call.args.indices, 0..) |arg_idx, i| {
                 if (i >= variant_node.enum_variant.fields.indices.len) break;
                 const arg = self.arena.get(arg_idx);
                 if (arg.* != .identifier) continue;
-                const field_ty = self.inferExprType(variant_node.enum_variant.fields.indices[i]);
+                const field_ty = self.enumPayloadType(gparams, args, variant_node.enum_variant.fields.indices[i]);
                 self.scopes.insert(self.nameSlice(arg.identifier), .{
                     .name = arg.identifier,
                     .kind = .local,
@@ -3290,6 +3503,11 @@ pub const TypeChecker = struct {
         const body_ty = self.inferExprType(arm.match_arm.body);
         self.scopes.popScope();
         return body_ty;
+    }
+
+    /// Whether a match pattern is the `_` wildcard.
+    fn isWildcardPattern(self: *const TypeChecker, pattern: *const Node) bool {
+        return pattern.* == .identifier and std.mem.eql(u8, self.nameSlice(pattern.identifier), "_");
     }
 
     /// Match a pattern node against the variants of `enum_node`.
@@ -3503,10 +3721,10 @@ pub const TypeChecker = struct {
             .pointer => "pointer",
             .function => "function",
             .string_type => "String",
-            .struct_type => "struct",
-            .applied_struct => "struct",
-            .enum_type => "enum",
-            .applied_enum => "enum",
+            .struct_type => |decl| self.declName(decl),
+            .applied_struct => |a| self.declName(a.decl),
+            .enum_type => |decl| self.declName(decl),
+            .applied_enum => |a| self.declName(a.decl),
             .applied_fn => "function",
             .array => "array",
             .slice => "slice",

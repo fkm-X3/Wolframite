@@ -1,30 +1,28 @@
-fn abs(x: i32) -> i32 {
-    // if/else as expression
-    return if x > 0 { x } else { -x }
-}
-
-fn sum_to(n: i32) -> i32 {
-    mut s: i32 = 0
-    while s < n {
-        s = s + 1
+fn classify(x: i32) -> i32 {
+    return if x < 0 {
+        0
+    } else if x == 0 {
+        1
+    } else {
+        2
     }
-    return s
 }
 
-fn sum_range() -> i32 {
-    mut s: i32 = 0
-    for i in 0..10 {
-        s = s + i
+fn sum_up_to(n: i32) -> i32 {
+    mut total: i32 = 0
+    mut i: i32 = 0
+    while i <= n {
+        total = total + i
+        i = i + 1
     }
-    return s
-}
-
-fn defer_demo() -> String {
-    let f := acquire()
-    defer f.close()
-    return f.read_all()
+    return total
 }
 
 fn main() -> i32 {
-    return sum_range()
+    mut result: i32 = 0
+    result = result + classify(-1)
+    result = result + classify(0)
+    result = result + classify(5)
+    result = result + sum_up_to(3)
+    return result
 }

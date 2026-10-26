@@ -108,7 +108,7 @@ fn cmdInit(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     writeFile(io, main_file,
         \\fn main() -> i32 {
         \\    print("Hello, world!")
-        \\    return 42
+        \\    return 0
         \\}
         \\
     ) catch {
