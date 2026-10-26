@@ -5,8 +5,8 @@ if ($arch -ne "AMD64") {
     exit 1
 }
 
-# Set target installation directory
-$installDir = "$HOME\.local\bin"
+# Set target installation directory to wolframite/bin
+$installDir = "$HOME\wolframite\bin"
 
 if (!(Test-Path -Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
