@@ -3,3 +3,4 @@
 zig-out/bin/
 wolframite-vscode/
 .zig-cache/
+zig-out/
