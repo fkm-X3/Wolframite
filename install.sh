@@ -13,11 +13,11 @@ fi
 
 URL="https://github.com/fkm-X3/Wolframite/releases/download/dev/ore-linux-x86_64"
 
-# Determine install target directory
+# Determine install target directory (wolframite/bin)
 if [ "$EUID" -eq 0 ]; then
-    INSTALL_DIR="/usr/local/bin"
+    INSTALL_DIR="/usr/local/wolframite/bin"
 else
-    INSTALL_DIR="$HOME/.local/bin"
+    INSTALL_DIR="$HOME/wolframite/bin"
     mkdir -p "$INSTALL_DIR"
 fi
 
@@ -31,9 +31,29 @@ chmod +x "$TARGET"
 
 echo "Successfully installed 'ore' to $TARGET"
 
-# Check if INSTALL_DIR is in PATH
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo -e "\n\033[33mWarning: $INSTALL_DIR is not in your PATH.\033[0m"
-    echo "Add the following line to your ~/.bashrc or ~/.zshrc:"
-    echo "  export PATH=\"\$PATH:$INSTALL_DIR\""
+# Automatically add INSTALL_DIR to environment PATH
+if [ "$EUID" -eq 0 ]; then
+    export PATH="$PATH:$INSTALL_DIR"
+    echo "Added $INSTALL_DIR to current session PATH."
+else
+    # Determine default shell configuration file
+    SHELL_RC=""
+    if [[ "$SHELL" == */zsh ]]; then
+        SHELL_RC="$HOME/.zshrc"
+    elif [[ "$SHELL" == */bash ]]; then
+        SHELL_RC="$HOME/.bashrc"
+    else
+        SHELL_RC="$HOME/.profile"
+    fi
+
+    if [ -f "$SHELL_RC" ] && ! grep -q "wolframite/bin" "$SHELL_RC"; then
+        echo -e "\n# Added by Wolframite installer" >> "$SHELL_RC"
+        echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$SHELL_RC"
+        echo "Added $INSTALL_DIR to $SHELL_RC"
+    fi
+
+    # Export for current session
+    export PATH="$PATH:$INSTALL_DIR"
 fi
+
+echo "Installation complete! Restart your terminal or run 'source $SHELL_RC' to update your current session."
