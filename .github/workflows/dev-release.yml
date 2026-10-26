@@ -40,8 +40,11 @@ jobs:
       - name: Stage release assets
         run: |
           mkdir -p dist
-          cp zig-out/bin/ore dist/ore-linux-x86_64
-          cp zig-out-win/bin/ore.exe dist/ore-windows-x86_64.exe
+          # Package Linux output (bin/ and lib/) into tar.gz
+          tar -czf dist/ore-linux-x86_64.tar.gz -C zig-out .
+          
+          # Package Windows output (bin/ and lib/) into zip
+          (cd zig-out-win && zip -r ../dist/ore-windows-x86_64.zip .)
 
       - name: Clobber dev release
         env:
@@ -56,4 +59,4 @@ jobs:
             --prerelease \
             --title "dev build (${{ github.sha }})" \
             --notes "Automated development build from commit \`${{ github.sha }}\`. Install or update with: \`ore update\`" \
-            dist/ore-linux-x86_64 dist/ore-windows-x86_64.exe
+            dist/ore-linux-x86_64.tar.gz dist/ore-windows-x86_64.zip
