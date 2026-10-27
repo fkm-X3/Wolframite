@@ -66,7 +66,19 @@ const std_lib_names = [_][]const u8{
 };
 
 /// Locate the Wolframite runtime archive, or fail with `StdLibMissing`.
+///
+/// `ore` first tries the project-local `zig-out/` layout (where `zig build`
+/// installs the runtime), then falls back to the system-wide install location
+/// used when `ore` is installed outside the repository (`/usr/local/wolframite`
+/// on Linux, `%USERPROFILE%\wolframite` on Windows). The install location is
+/// resolved two ways:
+///
+///   From the running `ore` executable: `<exedir>/../lib` (the install
+///      scripts mirror the zig-out/ layout, i.e. `<install>/bin/ore` and
+///      `<install>/lib/wfr_std.lib`).
+///   The POSIX system path `/usr/local/wolframite/lib`.
 fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
+    // Project-local layouts (zig-out/), tried first.
     for (std_lib_dirs) |dir| {
         for (std_lib_names) |name| {
             const candidate = std.fs.path.join(gpa, &.{ dir, name }) catch continue;
@@ -74,6 +86,40 @@ fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
             gpa.free(candidate);
         }
     }
+
+    // Install location derived from the running `ore` executable:
+    //    <exedir>/../lib. Mirrors the zig-out/ layout used by install scripts.
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = std.process.executablePath(io, &exe_buf) catch 0;
+    if (exe_len > 0) {
+        const exe_path = exe_buf[0..exe_len];
+        if (fileExists(io, exe_path)) {
+            const bindir = std.fs.path.dirname(exe_path);
+            if (bindir) |b| {
+                const installdir = std.fs.path.dirname(b);
+                if (installdir) |i| {
+                    const lib_dir = std.fs.path.join(gpa, &.{ i, "lib" }) catch return error.StdLibMissing;
+                    defer gpa.free(lib_dir);
+                    for (std_lib_names) |name| {
+                        const candidate = std.fs.path.join(gpa, &.{ lib_dir, name }) catch continue;
+                        if (fileExists(io, candidate)) return candidate;
+                        gpa.free(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // POSIX system install location, e.g. /usr/local/wolframite/lib.
+    const posix_install_dir: []const u8 = "/usr/local/wolframite/lib";
+    if (std.fs.path.isAbsolute(posix_install_dir)) {
+        for (std_lib_names) |name| {
+            const candidate = std.fs.path.join(gpa, &.{ posix_install_dir, name }) catch continue;
+            if (fileExists(io, candidate)) return candidate;
+            gpa.free(candidate);
+        }
+    }
+
     return error.StdLibMissing;
 }
 
