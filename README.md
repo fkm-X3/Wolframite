@@ -4,6 +4,21 @@
 
 Wolframite, the lang built on top of Tungsten
 
+Wolframite is a **functional-imperative** systems language. It is deliberately
+not object-oriented: there are no classes, interfaces, `impl` blocks, `self`, or
+vtables. Code is organized around pure-data `struct`s, free functions, `enum`
+sum types with `match`, and first-class closures/function values that
+monomorphize to stack-allocated capture records or direct calls.
+
+Key features:
+
+- Immutable by default (`let`/`mut`), explicit ownership via `move`
+- Comptime generics with monomorphization — no runtime type information
+- Zero-cost closures plus the `compose`/`curry`/`id`/`pipe` prelude and the
+  `|>` pipeline operator
+- Value-oriented error handling: `Result`/`Option` with postfix `?`
+- Deterministic RAII/region memory management, no garbage collector
+
 ## Quick Install
 
 ### Linux

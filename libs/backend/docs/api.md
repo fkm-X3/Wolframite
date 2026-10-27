@@ -35,7 +35,7 @@ const api = tungsten.api;
 │                   Context                       │
 │                                                 │
 │  ┌──────────────┐   ┌────────────────────────┐  │
-│  │    Module     │◄──│       Builder          │  │
+│  │    Module    │◄──│       Builder          │  │
 │  │              │   │                        │  │
 │  │  functions   │   │  current_func          │  │
 │  │  types       │   │  current_block         │  │
@@ -812,3 +812,13 @@ future IR version.
 All `build*` methods return error unions (`!Value`). In the current
 implementation, errors occur only when the underlying `ArrayList` allocation
 fails (e.g. out of memory). Using `try` is required.
+
+### API status
+
+This API reflects the post-de-OOP Tungsten model. The first-class function
+surface — `fnValueType`, `buildFnValue`, `buildCallPtr` (indirect calls through
+a fn value with the hidden env-first argument), and `buildEnvRecord` /
+`envRecordSize` for stack-allocated capture records — is implemented and
+stable. There is no vtable, interface-dispatch, or `fn_array` machinery in this
+API: all calls go through `buildCall` (named functions) or `buildCallPtr` (fn
+values), and structs are plain aggregates with no class preamble.
