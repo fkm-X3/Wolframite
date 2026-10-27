@@ -1636,11 +1636,11 @@ pub const Lowerer = struct {
             },
             .field_access => {
                 // A struct field of fn type is an ordinary fn value; anything
-                // else that reached here as a callee is old method syntax.
+                // else that reached here as a callee is a non-callable field.
                 const sem = self.type_pool.get(self.exprType(func));
                 if (sem == .function) return self.lowerCallIndirect(node_idx, func, args, piped, hole);
                 const fa = self.arena.get(func).field_access;
-                self.codegenError(node_idx, "there are no methods; call the free function, or the fn value held in '{s}'", .{
+                self.codegenError(node_idx, "'{s}' is not callable; call a free function or use a fn value", .{
                     self.nameSlice(fa.field),
                 });
                 return self.ctx.buildIntConst(self.i64_ty, 0);
