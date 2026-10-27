@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/fkm-X3/Wolframite/actions/workflows/ci.yml/badge.svg)](https://github.com/fkm-X3/Wolframite/actions/workflows/ci.yml)
 
-Wolframite, the lang built on top of Tungsten
-
 Wolframite is a **functional-imperative** systems language. It is deliberately
 not object-oriented: there are no classes, interfaces, `impl` blocks, `self`, or
 vtables. Code is organized around pure-data `struct`s, free functions, `enum`
