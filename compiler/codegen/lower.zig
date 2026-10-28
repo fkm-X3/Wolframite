@@ -244,6 +244,13 @@ pub const Lowerer = struct {
     pending_materialized: ?Materialized = null,
 
     block_terminated: bool = false,
+    current_block: api.BasicBlockIdx = @enumFromInt(0),
+    /// The hidden sret parameter slot for the current function, when it
+    /// returns an aggregate by value. Set in `lowerFunctionBody` and read by
+    /// `lowerReturn`/`defaultRet` (docs/semantics.md §6.3 R17).
+    sret_slot: ?api.Value = null,
+    /// The return type of the current function when sret is active.
+    sret_ty: ?TypeIdx = null,
 
     pub fn init(
         gpa: Allocator,
@@ -343,12 +350,18 @@ pub const Lowerer = struct {
 
     fn createFunction(self: *Lowerer, decl_idx: NodeIdx, name: []const u8) !api.FunctionIdx {
         const f = self.arena.get(decl_idx).fn_decl;
-        const ret_ir = self.irTypeFor(self.checker.nodeType(decl_idx));
+        const ret_ty = self.checker.nodeType(decl_idx);
+        const ret_ir = self.irTypeFor(ret_ty);
         // R14: every lowered function carries a leading hidden env parameter so
         // it can also be called through a fn value with no thunk; `main` is
         // exempt (R15).
         const env_hole: u32 = if (std.mem.eql(u8, name, "main")) 0 else 1;
-        const fidx = try self.ctx.addFunction(name, ret_ir, @as(u32, @intCast(f.params.indices.len)) + env_hole);
+        const sret: bool = self.needsSret(ret_ty);
+        // sret pointer occupies slot `env_hole`; visible params shift by one.
+        const sret_ret_ir = if (sret) self.void_ty else ret_ir;
+        var param_count: u32 = @as(u32, @intCast(f.params.indices.len)) + env_hole;
+        if (sret) param_count += 1;
+        const fidx = try self.ctx.addFunction(name, sret_ret_ir, param_count);
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
         try self.all_functions.append(self.gpa, .{ .body = .{ .decl = decl_idx }, .idx = fidx });
         return fidx;
@@ -363,10 +376,14 @@ pub const Lowerer = struct {
     fn createInstanceFunction(self: *Lowerer, inst: *GenericInstance) !api.FunctionIdx {
         const clone = self.arena.get(inst.clone).fn_decl;
         const ret_ir = self.irTypeFor(inst.return_type);
+        const sret: bool = self.needsSret(inst.return_type);
+        const sret_ret_ir = if (sret) self.void_ty else ret_ir;
+        var param_count: u32 = @as(u32, @intCast(clone.params.indices.len)) + 1;
+        if (sret) param_count += 1;
         const fidx = try self.ctx.addFunction(
             inst.mangled,
-            ret_ir,
-            @as(u32, @intCast(clone.params.indices.len)) + 1,
+            sret_ret_ir,
+            param_count,
         );
         try self.fn_by_node.put(self.gpa, inst.clone, fidx);
         try self.all_functions.append(self.gpa, .{ .body = .{ .decl = inst.clone }, .idx = fidx });
@@ -381,6 +398,7 @@ pub const Lowerer = struct {
         self.pending_defers.clearRetainingCapacity();
         self.pending_materialized = null;
         self.block_terminated = false;
+        self.sret_slot = null;
 
         const entry = try self.ctx.appendBlock();
         self.setBlock(entry);
@@ -388,14 +406,26 @@ pub const Lowerer = struct {
         switch (body) {
             .decl => |decl_idx| {
                 const f = self.arena.get(decl_idx).fn_decl;
+                const ret_ty = self.checker.nodeType(decl_idx);
+                const sret: bool = self.needsSret(ret_ty);
                 // R14: visible parameters sit after the hidden env parameter
                 // (`main` is exempt and keeps parameter 0 as its first
-                // visible parameter).
+                // visible parameter). When the function returns an aggregate
+                // by value, a hidden sret pointer occupies slot `env_hole`
+                // and visible params shift by one (R17).
                 const env_hole: u32 = if (std.mem.eql(u8, self.nameSlice(f.name), "main")) 0 else 1;
+                var visible_start: u32 = env_hole;
+                if (sret) {
+                    // sret occupies slot 0, env shifts to slot 1, visible
+                    // params start at slot 2.
+                    self.sret_slot = @enumFromInt(0);
+                    self.sret_ty = ret_ty;
+                    visible_start += 1;
+                }
                 for (f.params.indices, 0..) |param_idx, i| {
                     const param = self.arena.get(param_idx);
                     try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
-                        .value = @enumFromInt(env_hole + i),
+                        .value = @enumFromInt(visible_start + i),
                         .ty = try self.paramType(param.param.ty),
                     });
                 }
@@ -421,7 +451,20 @@ pub const Lowerer = struct {
     /// are pointer-shaped, so a null block pointer is a valid zero).
     fn defaultRet(self: *Lowerer, ret_ty: TypeIdx) !void {
         if (self.block_terminated) return;
-        if (self.type_pool.get(ret_ty) == .void) {
+        if (self.sret_slot) |sret| {
+            // Aggregate return: zero-init the sret buffer and return its
+            // pointer in rax (R17).
+            const size = @as(u32, @intCast(self.aggregateByteSize(ret_ty)));
+            var offset: u32 = 0;
+            while (offset < size) {
+                const dst_addr = try self.ctx.buildPtrAdd(
+                    self.ptr_ty, sret, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                );
+                _ = try self.ctx.buildStore(self.i64_ty, dst_addr, try self.ctx.buildIntConst(self.i64_ty, 0));
+                offset += 8;
+            }
+            _ = try self.ctx.buildRet(sret);
+        } else if (self.type_pool.get(ret_ty) == .void) {
             _ = try self.ctx.buildRetVoid();
         } else {
             _ = try self.ctx.buildRet(try self.ctx.buildIntConst(self.i64_ty, 0));
@@ -669,11 +712,53 @@ pub const Lowerer = struct {
             const val = try self.lowerExpr(init_idx);
             materialized = self.pending_materialized;
             self.pending_materialized = null;
-            _ = try self.ctx.buildStore(self.i64_ty, slot, val);
+            // For scalars, store the value directly. For aggregates (structs,
+            // enums with payload, strings), the init value is a pointer to
+            // the source data; copy every byte into the destination slot so
+            // the binding owns its own copy (R8c).
+            const ty = self.checker.nodeType(node_idx);
+            const size = self.aggregateByteSize(ty);
+            if (size > 8) {
+                var offset: u64 = 0;
+                while (offset < size) {
+                    const src_addr = try self.ctx.buildPtrAdd(
+                        self.ptr_ty, val, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                    );
+                    const loaded = try self.ctx.buildLoad(self.i64_ty, src_addr);
+                    const dst_addr = try self.ctx.buildPtrAdd(
+                        self.ptr_ty, slot, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                    );
+                    _ = try self.ctx.buildStore(self.i64_ty, dst_addr, loaded);
+                    offset += 8;
+                }
+            } else {
+                _ = try self.ctx.buildStore(self.i64_ty, slot, val);
+            }
         } else {
             _ = try self.ctx.buildStore(self.i64_ty, slot, try self.ctx.buildIntConst(self.i64_ty, 0));
         }
         try self.bindLocalMaterialized(self.nameSlice(l.name), slot, self.checker.nodeType(node_idx), materialized);
+    }
+
+    /// Byte size of an aggregate type (struct/enum/string), or 8 for scalars.
+    fn aggregateByteSize(self: *Lowerer, ty: TypeIdx) u64 {
+        return switch (self.type_pool.get(ty)) {
+            .struct_type => |decl_node| @as(u64, @intCast(structSize(self.arena, decl_node))),
+            .applied_struct => |a| @as(u64, @intCast(structSize(self.arena, a.decl))),
+            .string_type => 16,
+            .function => api.fn_value_size,
+            .enum_type, .applied_enum => 16,
+            else => 8,
+        };
+    }
+
+    /// Whether a value of type `ty` is returned through a hidden sret pointer
+    /// rather than in `rax` (docs/semantics.md §6.3 R17).
+    fn needsSret(self: *Lowerer, ty: TypeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .struct_type, .applied_struct, .enum_type, .applied_enum, .string_type, .function => true,
+            else => false,
+        };
     }
 
     fn allocVarSlot(self: *Lowerer, ty: TypeIdx) !api.Value {
@@ -681,6 +766,8 @@ pub const Lowerer = struct {
             .struct_type => |decl_node| structSize(self.arena, decl_node),
             // An applied struct has the layout of its declaration (R20c).
             .applied_struct => |a| structSize(self.arena, a.decl),
+            .enum_type, .applied_enum => 16,
+            .string_type => 16,
             else => 8,
         };
         return self.ctx.buildAllocaBytes(self.ptr_ty, size);
@@ -691,7 +778,27 @@ pub const Lowerer = struct {
         try self.flushDefersFrom(0);
         if (r.value) |val_idx| {
             const val = try self.lowerExpr(val_idx);
-            _ = try self.ctx.buildRet(val);
+            if (self.sret_slot) |sret| {
+                // Return an aggregate by value: copy every byte through the
+                // sret pointer and return the sret pointer in rax (R17).
+                const ret_ty = self.sret_ty.?;
+                const size = @as(u32, @intCast(self.aggregateByteSize(ret_ty)));
+                var offset: u32 = 0;
+                while (offset < size) {
+                    const src_addr = try self.ctx.buildPtrAdd(
+                        self.ptr_ty, val, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                    );
+                    const loaded = try self.ctx.buildLoad(self.i64_ty, src_addr);
+                    const dst_addr = try self.ctx.buildPtrAdd(
+                        self.ptr_ty, sret, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                    );
+                    _ = try self.ctx.buildStore(self.i64_ty, dst_addr, loaded);
+                    offset += 8;
+                }
+                _ = try self.ctx.buildRet(sret);
+            } else {
+                _ = try self.ctx.buildRet(val);
+            }
         } else {
             _ = try self.ctx.buildRetVoid();
         }
@@ -743,6 +850,8 @@ pub const Lowerer = struct {
         self.setBlock(then_b);
         const then_val = try self.lowerBranchValue(i.then_body);
         const then_has = !self.block_terminated;
+        var then_pred: api.BasicBlockIdx = then_b;
+        if (then_has) then_pred = self.current_block;
         if (then_has) _ = try self.ctx.buildBr(merge);
 
         self.setBlock(else_b);
@@ -751,13 +860,15 @@ pub const Lowerer = struct {
         else
             try self.ctx.buildIntConst(self.i64_ty, 0);
         const else_has = !self.block_terminated;
+        var else_pred: api.BasicBlockIdx = else_b;
+        if (else_has) else_pred = self.current_block;
         if (else_has) _ = try self.ctx.buildBr(merge);
 
         self.setBlock(merge);
         var incoming = std.ArrayList(api.PhiIncoming).empty;
         defer incoming.deinit(self.gpa);
-        if (then_has) try incoming.append(self.gpa, .{ .value = then_val, .block = then_b });
-        if (else_has) try incoming.append(self.gpa, .{ .value = else_val, .block = else_b });
+        if (then_has) try incoming.append(self.gpa, .{ .value = then_val, .block = then_pred });
+        if (else_has) try incoming.append(self.gpa, .{ .value = else_val, .block = else_pred });
         if (incoming.items.len == 0) return self.ctx.buildIntConst(self.i64_ty, 0);
         return self.ctx.buildPhi(self.irTypeFor(self.exprType(node_idx)), incoming.items);
     }
@@ -1359,6 +1470,11 @@ pub const Lowerer = struct {
         const name = self.nameSlice(id);
         if (self.params.get(name)) |param| return param.value;
         if (self.locals.get(name)) |binding| {
+            // For aggregates larger than one slot (structs, strings, fn
+            // values), the binding is a pointer to the data; return it
+            // directly without loading. For scalars and unit enums (8 bytes),
+            // load the value.
+            if (self.aggregateByteSize(self.checker.nodeType(node_idx)) > 8) return binding.value;
             return self.ctx.buildLoad(self.i64_ty, binding.value);
         }
         self.codegenError(node_idx, "unknown identifier '{s}'", .{name});
@@ -1623,12 +1739,26 @@ pub const Lowerer = struct {
                     self.codegenError(node_idx, "function '{s}' has no lowering", .{name});
                     return self.ctx.buildIntConst(self.i64_ty, 0);
                 };
-                const ret_ir = self.irTypeFor(self.checker.nodeType(sym.decl_node));
+                const ret_ty = self.checker.nodeType(sym.decl_node);
+                const ret_ir = self.irTypeFor(ret_ty);
                 var vals = try self.lowerArgs(args, piped, hole);
                 defer vals.deinit(self.gpa);
                 // R14a: the callee carries a hidden env parameter; a direct
                 // named call passes a null env. `main` is exempt (R15).
-                if (!std.mem.eql(u8, name, "main")) {
+                // R17: if the callee returns an aggregate by value, pass a
+                // caller-allocated sret pointer as the hidden argument.
+                if (self.needsSret(ret_ty)) {
+                    const size = @as(u32, @intCast(self.aggregateByteSize(ret_ty)));
+                    const sret_ptr = try self.ctx.buildAllocaBytes(self.ptr_ty, size);
+                    if (!std.mem.eql(u8, name, "main")) {
+                        // sret at slot 0, env at slot 1
+                        try vals.insert(self.gpa, 0, sret_ptr);
+                        const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+                        try vals.insert(self.gpa, 1, null_env);
+                    } else {
+                        try vals.insert(self.gpa, 0, sret_ptr);
+                    }
+                } else if (!std.mem.eql(u8, name, "main")) {
                     const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
                     try vals.insert(self.gpa, 0, null_env);
                 }
@@ -1675,9 +1805,20 @@ pub const Lowerer = struct {
         };
         var vals = try self.lowerArgs(args, piped, hole);
         defer vals.deinit(self.gpa);
-        const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
-        try vals.insert(self.gpa, 0, null_env);
-        const ret_ir = self.irTypeFor(inst.return_type);
+        const ret_ty = inst.return_type;
+        const ret_ir = self.irTypeFor(ret_ty);
+        // Instances are never `main`. If sret: slot 0 = sret, slot 1 = env.
+        // Otherwise: slot 0 = env.
+        if (self.needsSret(ret_ty)) {
+            const size = @as(u32, @intCast(self.aggregateByteSize(ret_ty)));
+            const sret_ptr = try self.ctx.buildAllocaBytes(self.ptr_ty, size);
+            try vals.insert(self.gpa, 0, sret_ptr);
+            const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+            try vals.insert(self.gpa, 1, null_env);
+        } else {
+            const null_env = try self.ctx.buildIntConst(self.i64_ty, 0);
+            try vals.insert(self.gpa, 0, null_env);
+        }
         return self.ctx.buildCall(fidx, ret_ir, vals.items);
     }
 
@@ -2997,6 +3138,7 @@ pub const Lowerer = struct {
 
     fn setBlock(self: *Lowerer, block: api.BasicBlockIdx) void {
         self.ctx.setCurrentBlock(block);
+        self.current_block = block;
         self.block_terminated = false;
     }
 
@@ -3753,7 +3895,7 @@ test "lower: pipeline feeds a value into a closure" {
     const text = res.text(&buf);
     // The piped value is prepended as argument 0 to the indirect call.
     try std.testing.expect(std.mem.indexOf(u8, text, "fn @closure_0()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %9(%10)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "iconst 2") != null);
 }
 

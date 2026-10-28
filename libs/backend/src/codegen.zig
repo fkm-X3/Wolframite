@@ -125,10 +125,6 @@ pub const CodeGen = struct {
         const raw_size: u32 = 32 + (value_slots + alloca_data_slots) * 8;
         const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15);
 
-        if (frame_size > 0) {
-            try self.emit("\n    sub     rsp, {d}\n", .{frame_size});
-        }
-
         var offset: i32 = 0;
 
         {
@@ -136,6 +132,32 @@ pub const CodeGen = struct {
             while (i < self.param_count) : (i += 1) {
                 offset -= 8;
                 try self.value_offsets.put(self.gpa, @enumFromInt(i), offset);
+            }
+        }
+
+        // Stack-passed parameters (index >= 4) must be loaded from the caller's
+        // stack frame BEFORE we adjust rsp for our own frame. From callee's rsp
+        // right after `push rbp`, param i sits at [rsp + 48 + (i-4)*8] (saved rbp
+        // at +0, return address at +8, 32 bytes shadow space, then args).
+        {
+            var i: u32 = 4;
+            while (i < self.param_count) : (i += 1) {
+                const off = self.value_offsets.get(@enumFromInt(i)).?;
+                try self.emit("\n    mov     rax, qword [rsp + {d}]\n", .{ 48 + (i - 4) * 8 });
+                try self.emit("\n    mov     [rbp{d}], rax\n", .{ off });
+            }
+        }
+
+        if (frame_size > 0) {
+            try self.emit("\n    sub     rsp, {d}\n", .{frame_size});
+        }
+
+        const reg_names = [_][]const u8{ "rcx", "rdx", "r8", "r9" };
+        {
+            var i: u32 = 0;
+            while (i < self.param_count and i < 4) : (i += 1) {
+                const off = self.value_offsets.get(@enumFromInt(i)).?;
+                try self.emit("\n    mov     [rbp{d}], {s}\n", .{ off, reg_names[i] });
             }
         }
 
@@ -156,15 +178,6 @@ pub const CodeGen = struct {
                     offset -= 8;
                     try self.value_offsets.put(self.gpa, @enumFromInt(value_idx), offset);
                 }
-            }
-        }
-
-        const reg_names = [_][]const u8{ "rcx", "rdx", "r8", "r9" };
-        {
-            var i: u32 = 0;
-            while (i < self.param_count and i < 4) : (i += 1) {
-                const off = self.value_offsets.get(@enumFromInt(i)).?;
-                try self.emit("\n    mov     [rbp{d}], {s}\n", .{ off, reg_names[i] });
             }
         }
 
@@ -241,7 +254,7 @@ pub const CodeGen = struct {
                 const arg_off = self.value_offsets.get(@enumFromInt(ops[1 + i])).?;
                 const stack_pos: i32 = 32 + @as(i32, @intCast(i - 4)) * 8;
                 try self.emit("    mov     rax, [rbp{d}]\n", .{arg_off});
-                try self.emit("    mov     [rsp{d}], rax\n", .{stack_pos});
+                try self.emit("    mov     [rsp + {d}], rax\n", .{stack_pos});
             }
         }
 
@@ -510,7 +523,7 @@ pub const CodeGen = struct {
                             const stack_pos: i32 = 32 + @as(i32, @intCast(arg_slot - 4)) * 8;
                             const arg_off = self.value_offsets.get(@enumFromInt(ops[1 + i])).?;
                             try self.emit("    mov     rax, [rbp{d}]\n", .{arg_off});
-                            try self.emit("    mov     [rsp{d}], rax\n", .{stack_pos});
+                            try self.emit("    mov     [rsp + {d}], rax\n", .{stack_pos});
                         }
                     }
                 }
@@ -733,6 +746,6 @@ test "fn value call_ptr marshals stack args after the hidden env" {
     // Four register slots: env in rcx, visible args in rdx/r8/r9. The fifth
     // visible arg goes to stack slot 1 (offset 40 = 32 shadow + 8).
     try std.testing.expect(std.mem.indexOf(u8, text, "mov     r9, [rbp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "mov     [rsp40], rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov     [rsp + 40], rax") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "call    rax") != null);
 }

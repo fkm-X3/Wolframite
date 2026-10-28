@@ -402,8 +402,8 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     // slots 32 and 40 (after the 32-byte shadow space).
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rcx, qword [r10+8]") != null);
     try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     r9, [rbp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp32], rax") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp40], rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp + 32], rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp + 40], rax") != null);
 }
 
 test "nested closure: inner closure created and called inside an outer closure body" {
