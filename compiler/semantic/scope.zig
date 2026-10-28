@@ -6,8 +6,9 @@ const types = @import("types.zig");
 const TypeIdx = types.TypeIdx;
 
 /// `function` is a value symbol: a `fn` name used in expression position is a
-/// first-class function value, not a namespace entry. There is no `class`/
-/// `interface` kind — polymorphism is comptime generics.
+/// first-class function value, not a namespace entry. Symbol kinds cover
+/// values, types, modules, and prelude fns only — polymorphism is comptime
+/// generics rather than subtype dispatch.
 ///
 /// `prelude_fn` is a name the resolver predeclares from `compiler/prelude.zig`.
 /// It is never bound by a declaration, has no `decl_node` pointing into the

@@ -14,9 +14,9 @@ pub const FloatKind = enum {
     f64,
 };
 
-/// The semantic type of a value or a named type. There is no `class_type` or
-/// `interface_type`: polymorphism is comptime generics (R19), so a `struct` is a
-/// plain aggregate (`struct_type`) and there is no vtable/interface type.
+/// The semantic type of a value or a named type. Polymorphism is comptime
+/// generics (R19): a `struct` is a plain aggregate (`struct_type`), and the
+/// type model has no object-variant types.
 ///
 /// `function` is the first-class fn type `fn(A, B) -> R` (R4). Its captured set
 /// is **not** part of the type — two closures with the same visible signature

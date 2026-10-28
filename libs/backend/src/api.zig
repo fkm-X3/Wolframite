@@ -201,8 +201,8 @@ pub const Context = struct {
         return self.builder.addStringGlobal(name, data);
     }
 
-    /// Add a vtable global: an array of function pointers, one per virtual
-    /// method, in declaration order.
+    /// Add a function-array global: an array of function pointers, in
+    /// declaration order.
     pub fn addFnArrayGlobal(self: *Context, name: []const u8, funcs: []const FunctionIdx) !GlobalIdx {
         return self.builder.addFnArrayGlobal(name, funcs);
     }
@@ -702,7 +702,7 @@ test "extended opcodes" {
     _ = try ctx.buildRetVoid();
 
     const str_global = try ctx.addStringGlobal("greeting", "hello world");
-    const vt_global = try ctx.addFnArrayGlobal("vtable", &.{helper});
+    const fn_array_global = try ctx.addFnArrayGlobal("fn_array", &.{helper});
 
     const func = try ctx.addFunction("float_main", i32_ty, 3);
     ctx.setCurrentFunction(func);
@@ -734,7 +734,7 @@ test "extended opcodes" {
     _ = try ctx.buildRet(ptr);
 
     try std.testing.expectEqual(@as(usize, 2), ctx.getGlobalCount());
-    _ = vt_global;
+    _ = fn_array_global;
 }
 
 test "emit assembly with globals floats and heap" {
@@ -753,7 +753,7 @@ test "emit assembly with globals floats and heap" {
     _ = try ctx.buildRetVoid();
 
     const str_global = try ctx.addStringGlobal("greeting", "hi");
-    _ = try ctx.addFnArrayGlobal("vtable", &.{helper});
+    _ = try ctx.addFnArrayGlobal("fn_array", &.{helper});
 
     const func = try ctx.addFunction("main", i64_ty, 0);
     ctx.setCurrentFunction(func);

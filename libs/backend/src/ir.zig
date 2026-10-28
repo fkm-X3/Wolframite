@@ -220,7 +220,7 @@ pub const Global = struct {
 pub const GlobalKind = union(enum) {
     /// NUL-terminated byte string (a string literal).
     string: StringRef,
-    /// Array of function pointers, one per virtual method (a vtable).
+    /// Array of function pointers, one per entry, in declaration order.
     /// Entries are indices into `Module.functions`.
     fn_array: []const u32,
 };
@@ -459,8 +459,8 @@ pub const Builder = struct {
         return self.module.addGlobal(self.gpa, name, .{ .string = data_ref });
     }
 
-    /// Add a vtable global: an array of function pointers, one per virtual
-    /// method, in declaration order.
+    /// Add a function-array global: an array of function pointers, in
+    /// declaration order.
     pub fn addFnArrayGlobal(self: *Builder, name: []const u8, funcs: []const FunctionIdx) !GlobalIdx {
         const owned = try self.gpa.alloc(u32, funcs.len);
         for (funcs, 0..) |func, i| owned[i] = @intFromEnum(func);
@@ -1091,7 +1091,7 @@ test "extended opcodes and globals" {
     _ = try builder.buildRetVoid();
 
     const str_global = try builder.addStringGlobal("greeting", "hello");
-    _ = try builder.addFnArrayGlobal("vtable", &.{helper});
+    _ = try builder.addFnArrayGlobal("fn_array", &.{helper});
 
     const main = try builder.addFunction("main", i64_ty, 3);
     builder.setCurrentFunction(main);
@@ -1131,7 +1131,7 @@ test "extended opcodes and globals" {
     const text = buf[0..w.end];
 
     try std.testing.expect(std.mem.indexOf(u8, text, "global @greeting = string \"hello\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "global @vtable = fn_array [@fn0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "global @fn_array = fn_array [@fn0]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret_void") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "iconst 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "fconst 1.5") != null);
