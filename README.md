@@ -21,12 +21,12 @@ Key features:
 
 ### Linux
 ```sh
-curl -sSL https://fkm.is-a.dev/Wolframite/install.sh | sh
+curl -sSL https://fkm.is-a.dev/Wolframite/dev-install.sh | sh
 ```
 
 ### Windows
 ```ps1
-irm https://fkm.is-a.dev/Wolframite/install.ps1 | iex
+irm https://fkm.is-a.dev/Wolframite/dev-install.ps1 | iex
 ```
 
 ## Building from source

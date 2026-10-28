@@ -1,0 +1,1 @@
+echo "No stable release yet, use 'curl -sSL https://fkm.is-a.dev/Wolframite/dev-install.sh | sh' to install the dev release"

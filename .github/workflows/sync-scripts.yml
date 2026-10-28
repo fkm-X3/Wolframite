@@ -1,0 +1,59 @@
+name: Sync Scripts to gh-pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/install.ps1'
+      - 'scripts/install.sh'
+      - 'scripts/dev-install.ps1'
+      - 'scripts/dev-install.sh'
+
+jobs:
+  sync-to-gh-pages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup changed scripts
+        run: |
+          mkdir -p /tmp/scripts-backup
+          # Copy whichever scripts exist from the scripts/ directory
+          for script in install.ps1 install.sh dev-install.ps1 dev-install.sh; do
+            if [ -f "scripts/$script" ]; then
+              cp "scripts/$script" /tmp/scripts-backup/
+            fi
+          done
+
+      - name: Switch to gh-pages branch
+        run: |
+          # Fetch and checkout gh-pages, or create it as an orphan if it doesn't exist yet
+          git fetch origin gh-pages:gh-pages || true
+          git checkout gh-pages || git checkout --orphan gh-pages
+
+          # Remove tracking of files not needed in gh-pages root if starting fresh, 
+          # or simply overwrite the target scripts in the root directory.
+          cp /tmp/scripts-backup/* ./ 2>/dev/null || true
+
+          # Stage the scripts
+          git add install.ps1 install.sh dev-install.ps1 dev-install.sh 2>/dev/null || true
+
+      - name: Commit and push changes
+        run: |
+          if git diff --cached --quiet; then
+            echo "No script changes to sync."
+          else
+            git commit -m "Sync updated installation scripts from main branch"
+            git push origin gh-pages
+          fi

@@ -1,0 +1,1 @@
+Write-Output "No stable release yet, use 'irm https://fkm.is-a.dev/Wolframite/dev-install.ps1 | iex' to install the dev release"
