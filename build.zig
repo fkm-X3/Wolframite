@@ -282,11 +282,11 @@ pub fn build(b: *std.Build) void {
     build_step.dependOn(build_done);
     b.default_step = build_step;
 
-    // Compiles the toolchain and installs it to the system bin directory:
-    // `%USERPROFILE%\.local\bin` on Windows, `/usr/local/bin` on Linux with a
-    // `$HOME/.local/bin` fallback when that location is not writable.
-    const install_compiler_step = b.step("install-compiler", "Install Wolframite and ore to the system bin directory");
-    install_compiler_step.dependOn(addInstallCompilerStep(b, &.{ exe, ore_exe }));
+    // Compiles the toolchain and installs it to the install directory:
+    // `%USERPROFILE%\wolframite\bin` (ore/Wolframite) and `%USERPROFILE%\wolframite\lib`
+    // (wfr_std) on Windows, `/usr/local/bin` + `/usr/local/wolframite/lib` on Linux.
+    const install_compiler_step = b.step("install-compiler", "Install Wolframite, ore, and the wfr_std runtime");
+    install_compiler_step.dependOn(addInstallCompilerStep(b, &.{ exe, ore_exe }, wfr_std_lib));
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
@@ -342,36 +342,50 @@ const PrintStep = struct {
     }
 };
 
-/// Compiles `artifacts` and installs the emitted binaries into the platform's
-/// bin directory:
-/// * Windows: `%USERPROFILE%\.local\bin` (`%HOME%` is used when set)
-/// * Linux: `/usr/local/bin`, falling back to `$HOME/.local/bin` when that
-///   location cannot be written to (e.g. running unprivileged)
+/// Compiles `bin_artifacts` and installs the emitted binaries into the platform's
+/// install directory:
+/// * Windows: `<%USERPROFILE%>\wolframite\bin` (ore/Wolframite) and
+///   `<%USERPROFILE%>\wolframite\lib` (wfr_std) (`%HOME%` is used when set)
+/// * Linux: `/usr/local/wolframite/bin` + `/usr/local/wolframite/lib`, falling back to
+///   `$HOME/wolframite/bin` + `$HOME/wolframite/lib` when those locations cannot
+///   be written to (e.g. running unprivileged)
+///
+/// `lib_artifact`, when provided, is installed into the `lib` directory next to
+/// `bin` so `ore` (which resolves `<exedir>/../lib`) can find `wfr_std`.
 ///
 /// Returns the step performing the installation; wire it up with
 /// `step.dependOn(...)`.
-fn addInstallCompilerStep(b: *std.Build, artifacts: []const *std.Build.Step.Compile) *std.Build.Step {
+fn addInstallCompilerStep(
+    b: *std.Build,
+    bin_artifacts: []const *std.Build.Step.Compile,
+    lib_artifact: ?*std.Build.Step.Compile,
+) *std.Build.Step {
     const install = b.allocator.create(InstallCompilerStep) catch @panic("OOM");
     install.* = .{
         .step = std.Build.Step.init(.{
             .id = .custom,
-            .name = "install toolchain to system bin directory",
+            .name = "install toolchain to install directory",
             .owner = b,
             .makeFn = InstallCompilerStep.make,
         }),
-        .artifacts = b.allocator.dupe(*std.Build.Step.Compile, artifacts) catch @panic("OOM"),
+        .bin_artifacts = b.allocator.dupe(*std.Build.Step.Compile, bin_artifacts) catch @panic("OOM"),
+        .lib_artifact = lib_artifact,
     };
     // Requesting the emitted binaries is what pulls the compilation of each
     // artifact into the graph.
-    for (install.artifacts) |artifact| {
+    for (install.bin_artifacts) |artifact| {
         artifact.getEmittedBin().addStepDependencies(&install.step);
+    }
+    if (install.lib_artifact) |lib| {
+        lib.getEmittedBin().addStepDependencies(&install.step);
     }
     return &install.step;
 }
 
 const InstallCompilerStep = struct {
     step: std.Build.Step,
-    artifacts: []const *std.Build.Step.Compile,
+    bin_artifacts: []const *std.Build.Step.Compile,
+    lib_artifact: ?*std.Build.Step.Compile,
 
     fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
         const self: *InstallCompilerStep = @fieldParentPtr("step", step);
@@ -386,40 +400,69 @@ const InstallCompilerStep = struct {
                 "cannot determine the home directory: neither HOME nor USERPROFILE is set",
                 .{},
             );
-            const dest_dir = try std.fmt.allocPrint(b.allocator, "{s}{c}.local{c}bin", .{ home_dir, sep, sep });
-            self.installAll(step, dest_dir) catch |err|
-                return step.fail("unable to install to '{s}': {t}", .{ dest_dir, err });
-            std.debug.print("[wolframite] toolchain installed to {s}\n", .{dest_dir});
+            const bin_dir = try std.fmt.allocPrint(b.allocator, "{s}{c}wolframite{c}bin", .{ home_dir, sep, sep });
+            const lib_dir = try std.fmt.allocPrint(b.allocator, "{s}{c}wolframite{c}lib", .{ home_dir, sep, sep });
+            self.installBinaries(step, bin_dir) catch |err|
+                return step.fail("unable to install binaries to '{s}': {t}", .{ bin_dir, err });
+            if (self.lib_artifact) |lib| {
+                self.installLibrary(lib, lib_dir) catch |err|
+                    return step.fail("unable to install runtime to '{s}': {t}", .{ lib_dir, err });
+            }
+            std.debug.print("[wolframite] toolchain installed to {s}\n", .{ home_dir });
             return;
         }
 
-        // Prefer the system-wide location and fall back to the user's own bin
-        // directory when it is not writable. A partially failed first attempt
-        // is harmless: re-running the step overwrites any duplicates.
-        const fallback: ?[]const u8 = if (home) |home_dir|
-            try std.fmt.allocPrint(b.allocator, "{s}{c}.local{c}bin", .{ home_dir, sep, sep })
+        // Prefer the system-wide location and fall back to the user's own
+        // directories when they are not writable. A partially failed first
+        // attempt is harmless: re-running the step overwrites any duplicates.
+        // Both install scripts (install.sh / install.ps1) use a single
+        // `wolframite` base dir with bin/ next to it, matching ore's
+        // `<exedir>/../lib` runtime lookup.
+        const fallback_bin: ?[]const u8 = if (home) |home_dir|
+            try std.fmt.allocPrint(b.allocator, "{s}{c}wolframite{c}bin", .{ home_dir, sep, sep })
         else null;
-        const system_dir = "/usr/local/bin";
-        if (self.installAll(step, system_dir)) {
-            std.debug.print("[wolframite] toolchain installed to {s}\n", .{system_dir});
+        const fallback_lib: ?[]const u8 = if (home) |home_dir|
+            try std.fmt.allocPrint(b.allocator, "{s}{c}wolframite{c}lib", .{ home_dir, sep, sep })
+        else null;
+        const system_bin = "/usr/local/wolframite/bin";
+        const system_lib = "/usr/local/wolframite/lib";
+        if (self.installBinaries(step, system_bin)) {
+            std.debug.print("[wolframite] toolchain installed to {s}\n", .{system_bin});
         } else |err| {
-            const dest_dir = fallback orelse return step.fail(
+            const dest_dir = fallback_bin orelse return step.fail(
                 "unable to write to '{s}' ({t}) and no home directory is available for the fallback",
-                .{ system_dir, err },
+                .{ system_bin, err },
             );
             std.debug.print("[wolframite] unable to write to {s} ({t}); falling back to {s}\n", .{
-                system_dir, err, dest_dir,
+                system_bin, err, dest_dir,
             });
-            self.installAll(step, dest_dir) catch |fallback_err|
+            self.installBinaries(step, dest_dir) catch |fallback_err|
                 return step.fail("unable to install to '{s}': {t}", .{ dest_dir, fallback_err });
             std.debug.print("[wolframite] toolchain installed to {s}\n", .{dest_dir});
         }
+        if (self.lib_artifact) |lib| {
+            if (self.installLibrary(step, lib, system_lib)) {
+                std.debug.print("[wolframite] runtime installed to {s}\n", .{system_lib});
+            } else |err| {
+                const dest_dir = fallback_lib orelse return step.fail(
+                    "unable to write to '{s}' ({t}) and no home directory is available for the fallback",
+                    .{ system_lib, err },
+                );
+                std.debug.print("[wolframite] unable to write to {s} ({t}); falling back to {s}\n", .{
+                    system_lib, err, dest_dir,
+                });
+                self.installLibrary(lib, dest_dir) catch |fallback_err|
+                    return step.fail("unable to install runtime to '{s}': {t}", .{ dest_dir, fallback_err });
+                std.debug.print("[wolframite] runtime installed to {s}\n", .{dest_dir});
+            }
+        }
     }
 
-    fn installAll(self: *InstallCompilerStep, step: *std.Build.Step, dest_dir: []const u8) anyerror!void {
+    /// Install executable binaries (ore, Wolframite) into `dest_dir`.
+    fn installBinaries(self: *InstallCompilerStep, step: *std.Build.Step, dest_dir: []const u8) anyerror!void {
         const b = step.owner;
         const io = b.graph.io;
-        for (self.artifacts) |artifact| {
+        for (self.bin_artifacts) |artifact| {
             const src = artifact.getEmittedBin().getPath3(b, step);
             const dest = try std.fmt.allocPrint(b.allocator, "{s}{c}{s}", .{
                 dest_dir, std.fs.path.sep, artifact.out_filename,
@@ -427,5 +470,17 @@ const InstallCompilerStep = struct {
             _ = try std.Io.Dir.updateFile(src.root_dir.handle, io, src.sub_path, .cwd(), dest, .{});
             std.debug.print("[wolframite] installed {s} -> {s}\n", .{ artifact.name, dest });
         }
+    }
+
+    /// Install the runtime library into `dest_dir`.
+    fn installLibrary(self: *InstallCompilerStep, lib: *std.Build.Step.Compile, dest_dir: []const u8) anyerror!void {
+        const b = lib.step.owner;
+        const io = b.graph.io;
+        const src = lib.getEmittedBin().getPath3(b, &self.step);
+        const dest = try std.fmt.allocPrint(b.allocator, "{s}{c}{s}", .{
+            dest_dir, std.fs.path.sep, lib.out_filename,
+        });
+        _ = try std.Io.Dir.updateFile(src.root_dir.handle, io, src.sub_path, .cwd(), dest, .{});
+        std.debug.print("[wolframite] installed {s} -> {s}\n", .{ lib.name, dest });
     }
 };

@@ -3,9 +3,6 @@
 zig-out/
 *.o
 
-# Coming to a repo near you soon
-wolframite-vscode/
-
 # Tungsten's objects
 *.ir
 *.asm

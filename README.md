@@ -49,7 +49,7 @@ Builds and test runs print progress and a success line (e.g. `[wolframite] all t
 
 Compiles `Wolframite` and `ore` and installs them into the system bin directory:
 
-- **Windows**: `%USERPROFILE%\.local\bin` (`%HOME%\.local\bin` if `HOME` is set)
+- **Windows**: `%USERPROFILE%\wolframite` (`%HOME%\wolframite` if `HOME` is set)
 - **Linux**: `/usr/local/bin`, falling back to `$HOME/.local/bin` if that location is not writable (e.g. unprivileged user)
 
 ### Embedding the git SHA
