@@ -58,17 +58,46 @@ pub const UpdateError = error{
 
 /// Asset file name for the current build target, or `null` when ore does
 /// not publish a binary for this platform.
+///
+/// The dev release publishes archives (zip on Windows, tar.gz on Linux)
+/// containing the same `bin/` + `lib/` layout as `zig-out/`.
 pub fn assetName() ?[]const u8 {
     return switch (builtin.os.tag) {
         .windows => switch (builtin.cpu.arch) {
-            .x86_64 => "ore-windows-x86_64.exe",
+            .x86_64 => "ore-windows-x86_64.zip",
             else => null,
         },
         .linux => switch (builtin.cpu.arch) {
-            .x86_64 => "ore-linux-x86_64",
+            .x86_64 => "ore-linux-x86_64.tar.gz",
             else => null,
         },
         else => null,
+    };
+}
+
+/// Archive file extension for the current platform.
+pub fn archiveSuffix() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => ".zip",
+        .linux => ".tar.gz",
+        else => "",
+    };
+}
+
+/// Executable extension for the current platform.
+pub fn exeExt() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => ".exe",
+        else => "",
+    };
+}
+
+/// Runtime library file name for the current platform.
+pub fn wfrStdName() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "wfr_std.lib",
+        .linux => "libwfr_std.a",
+        else => "",
     };
 }
 
@@ -107,14 +136,80 @@ pub fn run(gpa: Allocator, io: Io, opts: Options) UpdateError!Report {
         };
     }
 
-    const size = if (builtin.os.tag == .windows)
-        try stageForSwap(gpa, io, &client, url)
-    else
-        try swapInPlace(gpa, io, &client, url);
+    const exe_path = try std.process.executablePathAlloc(io, gpa);
+    defer gpa.free(exe_path);
+    const paths = try siblingPaths(gpa, exe_path);
+    defer {
+        // paths.dir is a sub-slice of exe_path (freed above); only the
+        // allocPrint-allocated strings need individual freeing.
+        gpa.free(paths.staged);
+        gpa.free(paths.updater);
+        gpa.free(paths.old);
+    }
+
+    // Download the archive (zip on Windows, tar.gz on Linux) next to the exe.
+    const archive_path = try std.fmt.allocPrint(
+        gpa,
+        "{s}{c}ore-update{s}",
+        .{ paths.dir, std.fs.path.sep, archiveSuffix() },
+    );
+    defer std.Io.Dir.deleteFileAbsolute(io, archive_path) catch {};
+    const download_size = try downloadTo(io, &client, url, archive_path);
+
+    // Extract the archive into a staging directory next to the exe.
+    const staging_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}{c}ore-update-staging",
+        .{ paths.dir, std.fs.path.sep },
+    );
+    std.Io.Dir.deleteFileAbsolute(io, staging_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, staging_dir) catch {};
+    try extractArchive(io, archive_path, staging_dir);
+
+    // Copy the ore binary from the archive to paths.staged for the swap.
+    const ore_in_archive = try std.fmt.allocPrint(
+        gpa,
+        "{s}{c}bin{c}ore{s}",
+        .{ staging_dir, std.fs.path.sep, std.fs.path.sep, exeExt() },
+    );
+    defer gpa.free(ore_in_archive);
+    std.Io.Dir.copyFileAbsolute(ore_in_archive, paths.staged, io, .{ .replace = true }) catch {
+        std.Io.Dir.deleteFileAbsolute(io, paths.staged) catch {};
+        return error.IOException;
+    };
+
+    // Copy the runtime library from the archive to the install lib dir.
+    // The install layout mirrors zig-out/: <exedir>/../lib/wfr_std(.lib|.a)
+    const exe_dir = std.fs.path.dirname(paths.dir) orelse return error.UnsupportedPlatform;
+    defer gpa.free(exe_dir);
+    const lib_dir = try std.fmt.allocPrint(gpa, "{s}{c}lib", .{ exe_dir, std.fs.path.sep });
+    defer gpa.free(lib_dir);
+    const wfr_in_archive = try std.fmt.allocPrint(
+        gpa,
+        "{s}{c}lib{c}{s}",
+        .{ staging_dir, std.fs.path.sep, std.fs.path.sep, wfrStdName() },
+    );
+    defer gpa.free(wfr_in_archive);
+    const wfr_dest = try std.fmt.allocPrint(
+        gpa,
+        "{s}{c}{s}",
+        .{ lib_dir, std.fs.path.sep, wfrStdName() },
+    );
+    defer gpa.free(wfr_dest);
+    std.Io.Dir.copyFileAbsolute(wfr_in_archive, wfr_dest, io, .{ .replace = true }) catch {
+        // Non-fatal: the ore binary itself was still updated.
+        std.debug.print("[wolframite] warning: could not install runtime to {s}\n", .{ wfr_dest });
+    };
+
+    if (builtin.os.tag == .windows) {
+        try stageForSwap(gpa, io, exe_path, paths);
+    } else {
+        try swapInPlace(io, exe_path, paths);
+    }
 
     return .{
         .url = url,
-        .size = size,
+        .size = download_size,
         .installed = builtin.os.tag != .windows,
         .staged = builtin.os.tag == .windows,
         .latest_sha = latest_sha,
@@ -145,12 +240,14 @@ fn fetchRefSha(gpa: Allocator, client: *http.Client, release: []const u8) ![]con
 }
 
 /// Sibling file names next to the running executable.
-fn siblingPaths(gpa: Allocator, exe_path: []const u8) !struct {
+pub const SiblingPaths = struct {
     dir: []const u8,
     staged: []u8,
     updater: []u8,
     old: []u8,
-} {
+};
+
+fn siblingPaths(gpa: Allocator, exe_path: []const u8) !SiblingPaths {
     const dir = std.fs.path.dirname(exe_path).?;
     return .{
         .dir = dir,
@@ -194,13 +291,33 @@ fn downloadTo(io: Io, client: *http.Client, url: []const u8, path: []const u8) U
     return stat.size;
 }
 
+/// Extract a downloaded archive (zip on Windows, tar.gz on Linux) into
+/// `dest_dir`. The archive contains the same `bin/` + `lib/` layout as
+/// `zig-out/`. `dest_dir` must already exist.
+fn extractArchive(io: Io, archive_path: []const u8, dest_dir: []const u8) UpdateError!void {
+    const dest = std.Io.Dir.openDirAbsolute(io, dest_dir, .{}) catch return error.IOException;
+    defer std.Io.Dir.close(dest, io);
+
+    const file = std.Io.Dir.cwd().openFile(io, archive_path, .{}) catch return error.IOException;
+    defer file.close(io);
+    var buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &buf);
+
+    if (std.mem.endsWith(u8, archive_path, ".zip")) {
+        std.zip.extract(dest, &reader, .{}) catch return error.IOException;
+        return;
+    }
+
+    // .tar.gz: decompress gzip then extract tar
+    var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress = std.compress.flate.Decompress.init(&reader.interface, .gzip, &flate_buffer);
+    std.tar.extract(io, dest, &decompress.reader, .{}) catch return error.IOException;
+}
+
 /// Swap in-place: allowed on POSIX, where a running executable may be
 /// renamed. The running image keeps executing; the next launch is the new one.
-fn swapInPlace(gpa: Allocator, io: Io, client: *http.Client, url: []const u8) UpdateError!u64 {
-    const exe_path = try std.process.executablePathAlloc(io, gpa);
-    const paths = try siblingPaths(gpa, exe_path);
-    const size = try downloadTo(io, client, url, paths.staged);
-
+/// Assumes `paths.staged` already contains the new binary.
+fn swapInPlace(io: Io, exe_path: []const u8, paths: SiblingPaths) UpdateError!void {
     std.Io.Dir.deleteFileAbsolute(io, paths.old) catch {};
     std.Io.Dir.renameAbsolute(exe_path, paths.old, io) catch {
         std.Io.Dir.deleteFileAbsolute(io, paths.staged) catch {};
@@ -212,19 +329,14 @@ fn swapInPlace(gpa: Allocator, io: Io, client: *http.Client, url: []const u8) Up
         return error.ReplaceFailed;
     };
     std.Io.Dir.deleteFileAbsolute(io, paths.old) catch {};
-
-    return size;
 }
 
-/// Stage the update for a helper process: download to `<exe>.staged`, copy
-/// the current binary to `<exe>.updater`, and spawn it with `--apply-update`.
-fn stageForSwap(gpa: Allocator, io: Io, client: *http.Client, url: []const u8) UpdateError!u64 {
-    const exe_path = try std.process.executablePathAlloc(io, gpa);
-    const paths = try siblingPaths(gpa, exe_path);
-
+/// Stage the update for a helper process: copy the current binary to
+/// `<exe>.updater`, and spawn it with `--apply-update`. Assumes `paths.staged`
+/// already contains the new binary.
+fn stageForSwap(gpa: Allocator, io: Io, exe_path: []const u8, paths: SiblingPaths) UpdateError!void {
     // The updater from a previous update may still be lying around.
     std.Io.Dir.deleteFileAbsolute(io, paths.updater) catch {};
-    const size = try downloadTo(io, client, url, paths.staged);
     std.Io.Dir.copyFileAbsolute(exe_path, paths.updater, io, .{ .replace = true }) catch {
         std.Io.Dir.deleteFileAbsolute(io, paths.staged) catch {};
         return error.IOException;
@@ -246,8 +358,6 @@ fn stageForSwap(gpa: Allocator, io: Io, client: *http.Client, url: []const u8) U
         std.Io.Dir.deleteFileAbsolute(io, paths.staged) catch {};
         return error.IOException;
     };
-
-    return size;
 }
 
 /// Helper entrypoint: retries renaming the (no longer running) ore executable
@@ -291,8 +401,8 @@ test "update: asset names are platform specific" {
     const b = @import("builtin");
     const name = assetName().?;
     switch (b.os.tag) {
-        .windows => try std.testing.expect(std.mem.endsWith(u8, name, ".exe")),
-        .linux => try std.testing.expect(!std.mem.endsWith(u8, name, ".exe")),
+        .windows => try std.testing.expect(std.mem.endsWith(u8, name, ".zip")),
+        .linux => try std.testing.expect(std.mem.endsWith(u8, name, ".tar.gz")),
         else => unreachable,
     }
 }
