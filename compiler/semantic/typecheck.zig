@@ -4919,3 +4919,43 @@ test "typecheck: pipe with prelude identifier" {
     defer deinitCheck(&res);
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
+
+// --- de-OOP regression tests: removed OOP syntax must fail with diagnostics
+// referencing the function model, not methods/interfaces/Self. ---
+
+test "typecheck: calling a struct field like a method is rejected" {
+    // Dot is field access only now; `b.value()` must not lower to a method call.
+    var res = try runCheck(std.testing.allocator,
+        \\struct Box { value: i32 }
+        \\fn main() -> i32 {
+        \\    let b = Box{ .value = 7 }
+        \\    b.value()
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot call a value of type 'i32'"));
+}
+
+test "typecheck: calling a bare value like a function is rejected" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x = 5
+        \\    x()
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot call a value of type 'i32'"));
+}
+
+test "typecheck: Self is not a usable type" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn f(self: Self) { }
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "undefined identifier 'Self'"));
+}
