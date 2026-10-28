@@ -441,7 +441,7 @@ const InstallCompilerStep = struct {
             std.debug.print("[wolframite] toolchain installed to {s}\n", .{dest_dir});
         }
         if (self.lib_artifact) |lib| {
-            if (self.installLibrary(step, lib, system_lib)) {
+            if (self.installLibrary(lib, system_lib)) {
                 std.debug.print("[wolframite] runtime installed to {s}\n", .{system_lib});
             } else |err| {
                 const dest_dir = fallback_lib orelse return step.fail(
