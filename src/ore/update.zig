@@ -162,8 +162,19 @@ pub fn run(gpa: Allocator, io: Io, opts: Options) UpdateError!Report {
         "{s}{c}ore-update-staging",
         .{ paths.dir, std.fs.path.sep },
     );
-    std.Io.Dir.deleteFileAbsolute(io, staging_dir) catch {};
-    std.Io.Dir.cwd().createDirPath(io, staging_dir) catch {};
+    // Remove any leftover staging directory from a previous (possibly
+    // interrupted) update before recreating it.
+    if (std.fs.path.dirname(staging_dir)) |parent_path| {
+        if (std.Io.Dir.openDirAbsolute(io, parent_path, .{})) |parent_dir| {
+            defer std.Io.Dir.close(parent_dir, io);
+            const base = std.fs.path.basename(staging_dir);
+            parent_dir.deleteTree(io, base) catch {};
+        } else |_| {}
+    }
+    std.Io.Dir.createDirAbsolute(io, staging_dir, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return error.IOException,
+    };
     try extractArchive(io, archive_path, staging_dir);
 
     // Copy the ore binary from the archive to paths.staged for the swap.
@@ -184,6 +195,7 @@ pub fn run(gpa: Allocator, io: Io, opts: Options) UpdateError!Report {
     defer gpa.free(exe_dir);
     const lib_dir = try std.fmt.allocPrint(gpa, "{s}{c}lib", .{ exe_dir, std.fs.path.sep });
     defer gpa.free(lib_dir);
+    std.Io.Dir.createDirAbsolute(io, lib_dir, .default_dir) catch {};
     const wfr_in_archive = try std.fmt.allocPrint(
         gpa,
         "{s}{c}lib{c}{s}",
@@ -198,8 +210,17 @@ pub fn run(gpa: Allocator, io: Io, opts: Options) UpdateError!Report {
     defer gpa.free(wfr_dest);
     std.Io.Dir.copyFileAbsolute(wfr_in_archive, wfr_dest, io, .{ .replace = true }) catch {
         // Non-fatal: the ore binary itself was still updated.
-        std.debug.print("[wolframite] warning: could not install runtime to {s}\n", .{ wfr_dest });
+        std.debug.print("[wolframite] warning: could not install runtime to {s}\n", .{wfr_dest});
     };
+
+    // The staging directory is no longer needed once the binary and runtime
+    // library have been copied out of it.
+    if (std.fs.path.dirname(staging_dir)) |parent_path| {
+        if (std.Io.Dir.openDirAbsolute(io, parent_path, .{})) |parent_dir| {
+            defer std.Io.Dir.close(parent_dir, io);
+            parent_dir.deleteTree(io, std.fs.path.basename(staging_dir)) catch {};
+        } else |_| {}
+    }
 
     if (builtin.os.tag == .windows) {
         try stageForSwap(gpa, io, exe_path, paths);
