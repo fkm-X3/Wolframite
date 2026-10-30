@@ -1,6 +1,6 @@
 # Tungsten
 
-Use Zig 0.16.0 for this project
+Use Zig 0.17.0 for this project
 
 ## Are there even any projects using Tungsten:
 Yes, the in-house lang project [Wolframite](https://github.com/fkm-X3/Wolframite) uses Tungsten.

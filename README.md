@@ -35,7 +35,7 @@ For the 0.1.0 to release the Tungsten backend compiler will have to emit binary 
 
 ## Building from source
 
-Requires Zig **0.16.0**. NASM and `zig cc` must be on PATH to *run* compiled programs (`ore run` / `ore build --emit-bin` shell out to them) — building and testing don't need them.
+Requires Zig **0.17.0**. NASM and `zig cc` must be on PATH to *run* compiled programs (`ore run` / `ore build --emit-bin` shell out to them) — building and testing don't need them.
 
 ```sh
 zig build                    # build everything into zig-out/ (default step)
