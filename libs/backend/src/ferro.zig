@@ -89,6 +89,68 @@ pub fn defaultLinkOptions(target: Target) LinkOptions {
 }
 
 // ============================================================================
+// Link description — the Wolframite-facing input to Ferro
+// ============================================================================
+
+/// The Wolframite-facing link description, parsed from a Wolframite source
+/// module compiled through the normal compiler pipeline (lexer → parser →
+/// resolver → typecheck → lower → Tungsten IR). Ferro turns this into the
+/// `linkObject` arguments below.
+///
+/// Fields are string slices borrowed from the compiler arena; they must not
+/// outlive it.
+pub const LinkDescription = struct {
+    target: []const u8,      // "linux" | "windows"
+    output: []const u8,      // executable output path
+    entry: []const u8,       // entry symbol (default "_main")
+    subsystem: []const u8,   // "console" | "gui" (windows only)
+    runtime_lib: []const u8, // path to the wfr_std archive
+    input: []const u8,       // program object file to link
+    debug: bool,
+};
+
+/// Errors raised while parsing or validating a `LinkDescription`.
+pub const LinkDescriptionError = error{
+    /// `target` was not "linux" or "windows".
+    InvalidTarget,
+    /// `subsystem` was not "console" or "gui".
+    InvalidSubsystem,
+    /// A required link field was missing or not a string literal.
+    MissingField,
+};
+
+/// Parse `s` ("linux" | "windows", case-insensitive) into a `Target`.
+pub fn parseTarget(s: []const u8) LinkDescriptionError !Target {
+    if (std.ascii.eqlIgnoreCase(s, "linux")) return .linux_x86_64;
+    if (std.ascii.eqlIgnoreCase(s, "windows")) return .windows_x86_64;
+    return error.InvalidTarget;
+}
+
+/// Parse `s` ("console" | "gui", case-insensitive) into a `Subsystem`.
+pub fn parseSubsystem(s: []const u8) LinkDescriptionError !Subsystem {
+    if (std.ascii.eqlIgnoreCase(s, "console")) return .console;
+    if (std.ascii.eqlIgnoreCase(s, "gui")) return .gui;
+    return error.InvalidSubsystem;
+}
+
+/// Convert a `LinkDescription` into validated `LinkOptions`. The object path,
+/// runtime lib, output path, and entry symbol pass through verbatim; `target`
+/// and `subsystem` are parsed from their string forms here.
+///
+/// This is the "compile Wolframite → feed Ferro" mapping: the compiler fills a
+/// `LinkDescription` from source and Ferro turns it into `linkObject` args.
+pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError !LinkOptions {
+    const target = try parseTarget(desc.target);
+    const subsystem = try parseSubsystem(desc.subsystem);
+    return .{
+        .target = target,
+        .entry_symbol = desc.entry,
+        .subsystem = subsystem,
+        .debug = desc.debug,
+    };
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -310,5 +372,58 @@ test "readObject reports ObjectMissing before touching the object reader" {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.ObjectMissing, err);
+    }
+}
+
+test "parseTarget accepts linux and windows (case-insensitive)" {
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("linux"));
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("Linux"));
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("LINUX"));
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("windows"));
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("Windows"));
+    if (parseTarget("osx")) |_| try std.testing.expect(false) else |err| {
+        try std.testing.expectEqual(LinkDescriptionError.InvalidTarget, err);
+    }
+}
+
+test "parseSubsystem accepts console and gui (case-insensitive)" {
+    try std.testing.expectEqual(.console, try parseSubsystem("console"));
+    try std.testing.expectEqual(.console, try parseSubsystem("Console"));
+    try std.testing.expectEqual(.gui, try parseSubsystem("gui"));
+    try std.testing.expectEqual(.gui, try parseSubsystem("GUI"));
+    if (parseSubsystem("kernel")) |_| try std.testing.expect(false) else |err| {
+        try std.testing.expectEqual(LinkDescriptionError.InvalidSubsystem, err);
+    }
+}
+
+test "linkOptionsFromDescription maps a link description to LinkOptions" {
+    const desc = LinkDescription{
+        .target = "windows",
+        .output = "hello.exe",
+        .entry = "_main",
+        .subsystem = "console",
+        .runtime_lib = "wfr_std.lib",
+        .input = "hello.o",
+        .debug = false,
+    };
+    const opts = try linkOptionsFromDescription(desc);
+    try std.testing.expectEqual(.windows_x86_64, opts.target);
+    try std.testing.expectEqualStrings("_main", opts.entry_symbol);
+    try std.testing.expectEqual(.console, opts.subsystem);
+    try std.testing.expectEqual(false, opts.debug);
+}
+
+test "linkOptionsFromDescription rejects a bad target" {
+    const desc = LinkDescription{
+        .target = "osx",
+        .output = "hello",
+        .entry = "_main",
+        .subsystem = "console",
+        .runtime_lib = "wfr_std.lib",
+        .input = "hello.o",
+        .debug = false,
+    };
+    if (linkOptionsFromDescription(desc)) |_| try std.testing.expect(false) else |err| {
+        try std.testing.expectEqual(LinkDescriptionError.InvalidTarget, err);
     }
 }

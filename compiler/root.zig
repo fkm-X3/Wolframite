@@ -10,6 +10,7 @@ pub const resolve = @import("semantic/resolve.zig");
 pub const generics = @import("semantic/generics.zig");
 pub const typecheck = @import("semantic/typecheck.zig");
 pub const codegen = @import("codegen/lower.zig");
+pub const link_description = @import("link_description.zig");
 
 test {
     _ = @import("diagnostics.zig");
@@ -24,4 +25,5 @@ test {
     _ = @import("semantic/generics.zig");
     _ = @import("semantic/typecheck.zig");
     _ = @import("codegen/lower.zig");
+    _ = @import("link_description.zig");
 }
