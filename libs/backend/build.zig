@@ -109,11 +109,9 @@ pub fn build(b: *std.Build) void {
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    // Pass through any arguments provided after `--` on the `zig build` CLI
+    // (e.g. `zig build run -- arg1 arg2`).
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
