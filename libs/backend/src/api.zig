@@ -33,6 +33,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const codegen = @import("codegen.zig");
+const ferro = @import("ferro.zig");
 const Allocator = std.mem.Allocator;
 
 // ============================================================================
@@ -69,6 +70,9 @@ pub const fn_value_size = ir.fn_value_size;
 /// The context is heap-allocated via `init` and freed via `deinit`.
 pub const Context = struct {
     gpa: Allocator,
+    /// Target platform this context is emitting for. Determines the object
+    /// format (ELF64 on Linux, PE/COFF on Windows) that `emitObject` writes.
+    target: ferro.Target,
     module: ir.Module,
     builder: ir.Builder,
 
@@ -81,10 +85,13 @@ pub const Context = struct {
     /// Allocates the context on the heap so that internal pointers (e.g. the
     /// builder's reference to the module) remain stable.
     /// The caller must free via `deinit`.
-    pub fn init(gpa: Allocator) !*Context {
+    ///
+    /// `target` determines the object format used by `emitObject`.
+    pub fn init(gpa: Allocator, target: ferro.Target) !*Context {
         const ctx = try gpa.create(Context);
         ctx.* = .{
             .gpa = gpa,
+            .target = target,
             .module = .empty,
             .builder = undefined,
         };
@@ -505,6 +512,24 @@ pub const Context = struct {
         try cg.emitModule();
         return self.gpa.dupe(u8, cg.buf.items);
     }
+
+    /// Emit a relocatable object file (ELF64 on Linux, PE/COFF on Windows)
+    /// for `self.target`.
+    ///
+    /// Stub: returns `ObjectEmissionUnimplemented`. Real emission is
+    /// implemented separately.
+    ///
+    /// Returns an allocated byte slice that the caller must free with
+    /// `ctx.gpa.free(result)`.
+    pub fn emitObject(_: *Context) ![]u8 {
+        return error.ObjectEmissionUnimplemented;
+    }
+};
+
+/// Errors raised by object emission.
+pub const ObjectEmissionError = error{
+    /// Object emission is not yet implemented (stub).
+    ObjectEmissionUnimplemented,
 };
 
 // ============================================================================
@@ -512,14 +537,14 @@ pub const Context = struct {
 // ============================================================================
 
 test "context lifecycle" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), ctx.getFunctionCount());
 }
 
 test "type creation" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const void_ty = try ctx.voidType();
@@ -541,7 +566,7 @@ test "type creation" {
 }
 
 test "function and instruction building" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -566,7 +591,7 @@ test "function and instruction building" {
 }
 
 test "fibonacci with control flow" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -597,7 +622,7 @@ test "fibonacci with control flow" {
 }
 
 test "print textual IR" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -620,7 +645,7 @@ test "print textual IR" {
 }
 
 test "all binary opcodes compile" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(false, 32);
@@ -658,7 +683,7 @@ test "all binary opcodes compile" {
 }
 
 test "memory and call instructions" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -687,7 +712,7 @@ test "memory and call instructions" {
 }
 
 test "extended opcodes" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const f64_ty = try ctx.floatType(.f64);
@@ -738,7 +763,7 @@ test "extended opcodes" {
 }
 
 test "emit assembly with globals floats and heap" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const void_ty = try ctx.voidType();
@@ -795,7 +820,7 @@ test "emit assembly with globals floats and heap" {
 }
 
 test "function type creation" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -810,7 +835,7 @@ test "function type creation" {
 }
 
 test "function value model" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -850,7 +875,7 @@ test "function value model" {
 }
 
 test "call through fn value with env record" {
-    const ctx = try Context.init(std.testing.allocator);
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);

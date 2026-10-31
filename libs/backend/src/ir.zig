@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ferro = @import("ferro.zig");
 
 // ============================================================================
 // Handles - compact, typed, 32-bit integer indices into flat arrays
@@ -311,6 +312,9 @@ pub const ExternFunc = struct {
 // ============================================================================
 
 pub const Module = struct {
+    /// Target platform this module is being lowered for. Determines the
+    /// object format (ELF64 vs PE/COFF) at emission time.
+    target: ferro.Target,
     functions: std.ArrayList(Function),
     types: std.ArrayList(IrType),
     strings: StringPool,
@@ -318,6 +322,7 @@ pub const Module = struct {
     externs: std.ArrayList(ExternFunc),
 
     pub const empty: Module = .{
+        .target = .linux_x86_64,
         .functions = .empty,
         .types = .empty,
         .strings = StringPool.empty,

@@ -159,7 +159,7 @@ const Interpreter = struct {
 // ============================================================================
 
 test "env record layout: scalar slots and inline fn-value records" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -246,7 +246,7 @@ test "env record layout: scalar slots and inline fn-value records" {
 }
 
 test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -317,7 +317,7 @@ test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
 }
 
 test "capture-only closure: zero visible args marshals env alone" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -356,7 +356,7 @@ test "capture-only closure: zero visible args marshals env alone" {
 }
 
 test "multi-arg closure: hidden env plus stack-spilled visible args" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -407,7 +407,7 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
 }
 
 test "nested closure: inner closure created and called inside an outer closure body" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
@@ -477,7 +477,7 @@ test "nested closure: inner closure created and called inside an outer closure b
 }
 
 test "closure-in-closure: fn-value capture copied inline into the env record" {
-    const ctx = try api.Context.init(std.testing.allocator);
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);

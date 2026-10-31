@@ -11,6 +11,7 @@
 const std = @import("std");
 const compiler = @import("compiler");
 const api = @import("Tungsten").api;
+const ferro = @import("Tungsten").ferro;
 
 const Allocator = std.mem.Allocator;
 const lexer_mod = compiler.lexer;
@@ -43,7 +44,7 @@ pub const Result = struct {
 
 /// Compile `source` as a single module. All allocations come from `arena`,
 /// which must outlive the returned `text` slice.
-pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode) !Result {
+pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: ferro.Target) !Result {
     var diagnostics = diag_mod.Diagnostics.init(arena);
     diagnostics.owns_messages = true;
 
@@ -78,7 +79,7 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode) !Result {
         return .{ .ok = true, .text = null, .diagnostics = diagnostics };
     }
 
-    const ctx = try api.Context.init(arena);
+    const ctx = try api.Context.init(arena, target);
     try lower_mod.lowerAll(arena, &arena_obj, source, &type_pool, &diagnostics, &checker, ctx);
 
     if (diagnostics.hasErrors()) {

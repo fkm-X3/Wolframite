@@ -164,7 +164,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, mode) catch |err| {
+    const result = compile_mod.compile(gpa, source, mode, .linux_x86_64) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -257,7 +257,7 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, .@"asm") catch |err| {
+    const result = compile_mod.compile(gpa, source, .@"asm", .linux_x86_64) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };

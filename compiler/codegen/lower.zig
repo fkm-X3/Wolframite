@@ -3278,7 +3278,7 @@ fn runLower(allocator: Allocator, source: []const u8) !TestResult {
         checker = typecheck_mod.TypeChecker.init(allocator, &arena, source, &type_pool, &diags, &resolver.scopes, module_node);
         try checker.check();
     }
-    const ctx = try api.Context.init(allocator);
+    const ctx = try api.Context.init(allocator, .linux_x86_64);
     errdefer ctx.deinit();
     try lowerAll(allocator, &arena, source, &type_pool, &diags, &checker, ctx);
     checker.deinit();
