@@ -30,8 +30,7 @@ irm https://fkm.is-a.dev/Wolframite/dev-install.ps1 | iex
 ```
 
 ## When 0.1.0?
-For the 0.1.0 to release the Tungsten backend compiler will have to emit binary objects directly then it will invoke the linker Ferro (short for Ferrotungsten) which isn't front facing in the way lld or gnu ld is, its internal but can be accessed by args in the Wolframite syntax. There will also have to be good enough documentation so that someone that knows basic programming principles can pick up the language (like the rust book. I'll probably just use mdbook as its what the rust book uses).
-
+Check versions/0.1.0.md
 
 ## Building from source
 
