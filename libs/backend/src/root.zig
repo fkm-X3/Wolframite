@@ -4,6 +4,7 @@ const std = @import("std");
 pub const ir = @import("ir.zig");
 pub const codegen = @import("codegen.zig");
 pub const obj_elf = @import("obj_elf.zig");
+pub const obj_pe = @import("obj_pe.zig");
 pub const api = @import("api.zig");
 pub const ferro = @import("ferro.zig");
 
@@ -11,6 +12,7 @@ test {
     _ = @import("ir.zig");
     _ = @import("codegen.zig");
     _ = @import("obj_elf.zig");
+    _ = @import("obj_pe.zig");
     _ = @import("api.zig");
     _ = @import("closure_tests.zig");
     _ = @import("ferro.zig");
