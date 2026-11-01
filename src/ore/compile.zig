@@ -31,6 +31,8 @@ pub const EmitMode = enum {
     ir,
     /// NASM x86-64 assembly (single-file compile).
     @"asm",
+    /// Relocatable object file (ELF64 on Linux, PE/COFF on Windows).
+    @"obj",
 };
 
 pub const Result = struct {
@@ -96,6 +98,10 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: fer
         .@"asm" => {
             const text = try ctx.emitAssembly();
             return .{ .ok = true, .text = text, .diagnostics = diagnostics };
+        },
+        .@"obj" => {
+            const bytes = try ctx.emitObject();
+            return .{ .ok = true, .text = bytes, .diagnostics = diagnostics };
         },
         .none => unreachable,
     }

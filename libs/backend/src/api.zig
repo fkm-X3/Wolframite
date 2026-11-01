@@ -33,6 +33,8 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const codegen = @import("codegen.zig");
+const obj_elf = @import("obj_elf.zig");
+const obj_pe = @import("obj_pe.zig");
 const ferro = @import("ferro.zig");
 const Allocator = std.mem.Allocator;
 
@@ -516,13 +518,24 @@ pub const Context = struct {
     /// Emit a relocatable object file (ELF64 on Linux, PE/COFF on Windows)
     /// for `self.target`.
     ///
-    /// Stub: returns `ObjectEmissionUnimplemented`. Real emission is
-    /// implemented separately.
-    ///
     /// Returns an allocated byte slice that the caller must free with
     /// `ctx.gpa.free(result)`.
-    pub fn emitObject(_: *Context) ![]u8 {
-        return error.ObjectEmissionUnimplemented;
+    pub fn emitObject(self: *Context) ![]u8 {
+        var cg = codegen.CodeGen.init(self.gpa, &self.module);
+        defer cg.deinit();
+        const input = try cg.emitObjectModule();
+        return switch (self.target) {
+            .linux_x86_64 => {
+                var w = obj_elf.Writer.init(self.gpa);
+                defer w.deinit();
+                try w.writeObject(input);
+            },
+            .windows_x86_64 => {
+                var w = obj_pe.Writer.init(self.gpa);
+                defer w.deinit();
+                try w.writeObject(input);
+            },
+        };
     }
 };
 
