@@ -143,6 +143,8 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             out_path = args[i];
         } else if (std.mem.eql(u8, arg, "--ir")) {
             mode = .ir;
+        } else if (std.mem.eql(u8, arg, "--obj")) {
+            mode = .@"obj";
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -156,8 +158,8 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         }
     }
 
-    if (mode == .ir and emit_bin) {
-        reportErr(io, "error: --emit-bin cannot be combined with --ir\n", .{});
+    if ((mode == .ir or mode == .@"obj") and emit_bin) {
+        reportErr(io, "error: --emit-bin cannot be combined with --ir or --obj\n", .{});
         return 2;
     }
 
@@ -188,6 +190,12 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             const ir_path = out_path orelse try replaceExt(gpa, source_path, "ir");
             if ((try writeTextFile(io, ir_path, result.text.?)) != 0) return 1;
             printOut(io, "wrote {s}\n", .{ir_path});
+            return 0;
+        },
+        .@"obj" => {
+            const obj_path = out_path orelse try replaceExt(gpa, source_path, "o");
+            if ((try writeBinaryFile(io, obj_path, result.text.?)) != 0) return 1;
+            printOut(io, "wrote {s}\n", .{obj_path});
             return 0;
         },
     }
@@ -479,6 +487,21 @@ fn writeTextFile(io: Io, path: []const u8, text: []const u8) !u8 {
     return 0;
 }
 
+/// Write raw bytes (`data`) to `path` — used for binary output such as
+/// object files (`.o` / `.obj`).
+fn writeBinaryFile(io: Io, path: []const u8, data: []const u8) !u8 {
+    const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        reportErr(io, "error: could not write '{s}': {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    defer f.close(io);
+    writeFile(io, f, data) catch |err| {
+        reportErr(io, "error: could not write '{s}': {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    return 0;
+}
+
 /// Replace the extension of `path` with `.new_ext` (allocated).
 fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
     const dir = std.fs.path.dirname(path) orelse "";
@@ -560,20 +583,26 @@ fn printBuildHelp(io: Io) void {
         \\Usage:
         \\  ore build [options] [file]
         \\
-        \\Compile a single Wolframite source file to NASM x86-64 assembly.
+        \\Compile a single Wolframite source file. Default output is NASM
+        \\x86-64 assembly; use --obj to write a relocatable object file
+        \\instead.
+        \\
         \\When no file is given, the entry from ore.toml is used.
         \\
         \\Options:
-        \\  -o, --output <path>  Write output to <path> (default: <input>.asm)
+        \\  -o, --output <path>  Write output to <path> (default: <input>.asm
+        \\                       or <input>.o with --obj)
         \\      --ir             Emit textual Tungsten IR instead of assembly
-        \\      --emit-bin       Also assemble and link into an executable (needs nasm)
+        \\      --obj            Emit a relocatable object file (.o on Linux,
+        \\                       .obj on Windows) instead of assembly
+        \\      --emit-bin       Also assemble and link into an executable
+        \\                       (needs nasm; incompatible with --ir / --obj)
         \\  -h, --help           Show this help
         \\
         \\Exit codes:
         \\  0  success
         \\  1  compilation or I/O failure
         \\  2  usage error
-        \\
     , .{});
 }
 

@@ -524,18 +524,33 @@ pub const Context = struct {
         var cg = codegen.CodeGen.init(self.gpa, &self.module);
         defer cg.deinit();
         const input = try cg.emitObjectModule();
-        return switch (self.target) {
+        var bytes: []u8 = undefined;
+        switch (self.target) {
             .linux_x86_64 => {
                 var w = obj_elf.Writer.init(self.gpa);
                 defer w.deinit();
-                try w.writeObject(input);
+                bytes = try w.writeObject(input);
             },
             .windows_x86_64 => {
                 var w = obj_pe.Writer.init(self.gpa);
                 defer w.deinit();
-                try w.writeObject(input);
-            },
-        };
+                // obj_pe.ObjectInput is layout-identical to obj_elf.ObjectInput;
+                // reconstruct it field-by-field so codegen output feeds both writers.
+                const pe_syms_ptr: [*]const obj_pe.Symbol = @ptrCast(input.symbols.ptr);
+                const pe_syms = pe_syms_ptr[0..input.symbols.len];
+                const pe_relocs_ptr: [*]const obj_pe.Reloc = @ptrCast(input.relocs.ptr);
+                const pe_relocs = pe_relocs_ptr[0..input.relocs.len];
+                const pe_input = obj_pe.ObjectInput{
+                    .text = input.text,
+                    .data = input.data,
+                    .bss_size = input.bss_size,
+                    .symbols = pe_syms,
+                    .relocs = pe_relocs,
+                };
+                bytes = try w.writeObject(pe_input);
+            }
+        }
+        return bytes;
     }
 };
 
