@@ -42,4 +42,4 @@ let link = LinkerArgs {
     .runtime_lib = "wfr_std.lib",
     .input = "hello.obj",
     .debug = false,
-};
+}

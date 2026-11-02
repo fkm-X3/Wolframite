@@ -1850,6 +1850,97 @@ test "resolveSymbols reports UndefinedSymbol when the runtime does not define it
     }
 }
 
+test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_elf = @import("obj_elf.zig");
+
+    // Program object: _main in .text calls `puts` (extern, PC32 reloc at offset 0)
+    // and references string literal `__g0` (ADDR64 reloc at data offset 0).
+    // `__g0` is defined in the program object; `puts` is undefined here and
+    // resolved against the runtime archive.
+    const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 }; // mov rax, rdi; ret
+    const prog_data = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // 8-byte placeholder for __g0 address
+    const prog_symbols = &.{
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
+            .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 8,
+            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_relocs = &.{
+        obj_elf.Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
+        obj_elf.Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
+    };
+    const prog_input = obj_elf.ObjectInput{
+        .text = &prog_text,
+        .data = &prog_data,
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = prog_relocs,
+    };
+    var prog_w = obj_elf.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "ferro_apply_prog.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    // Runtime object: puts defined at .text offset 0.
+    const rt_text = [_]u8{ 0x90, 0x90 };
+    const rt_symbols = &.{
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_elf.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var rt_w = obj_elf.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "ferro_apply_rt.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    var program = try readObject(io, gpa, prog_path);
+    defer program.deinit(gpa);
+    var runtime = try readObject(io, gpa, rt_path);
+    defer runtime.deinit(gpa);
+
+    var resolved = try resolveSymbols(&program, &runtime, "_main", gpa);
+    defer resolved.deinit(gpa);
+
+    var image = try applyRelocations(&program, &runtime, &resolved, gpa);
+    defer image.deinit(gpa);
+
+    // Merged layout: .text = prog(4) + rt(2) = 6 bytes; .data = prog(8) + rt(0) = 8 bytes.
+    // data_base = 6.
+    try std.testing.expectEqual(6, image.text.len);
+    try std.testing.expectEqual(8, image.data.len);
+
+    // puts is runtime .text offset 0 => merged address 4 (prog_text_size). call site is .text offset 0.
+    // PC32: S(4) + A(-4) - P(0) = 0 => disp32 = 0.
+    try std.testing.expectEqualSlices(u8, image.text[0..4], &[_]u8{ 0x00, 0x00, 0x00, 0x00 });
+
+    // __g0 ADDR64: S(data_base(6) + 0) + A(0) = 6 at .data offset 0 (little-endian u64).
+    try std.testing.expectEqualSlices(u8, image.data[0..8], &[_]u8{ 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+
+    // __g0 symbol resolves to merged address 6 in .data.
+    if (image.symbols.get("__g0")) |addr| {
+        try std.testing.expectEqualStrings(".data", addr.section);
+        try std.testing.expectEqual(6, addr.value);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "writeExecutableElf produces an ELF executable whose _start calls _main" {
     const gpa = std.testing.allocator;
 
