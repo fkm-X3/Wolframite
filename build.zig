@@ -255,6 +255,10 @@ pub fn build(b: *std.Build) void {
     const test_compiler_step = b.step("test-compiler", "Run compiler tests");
     test_compiler_step.dependOn(compiler_tests_done);
 
+    const backend_tests_done = addPrintStep(b, "print backend tests done", "backend tests passed", &.{&run_backend_tests.step});
+    const test_backend_step = b.step("test-backend", "Run backend (Tungsten) tests");
+    test_backend_step.dependOn(backend_tests_done);
+
     // Wolframite runtime tests
     const std_tests = b.addTest(.{
         .root_module = wfr_std_mod,

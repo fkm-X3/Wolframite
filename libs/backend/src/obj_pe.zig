@@ -14,21 +14,21 @@ const ferro = @import("ferro.zig");
 // PE/COFF constants
 // ============================================================================
 
-const CoffMachineAmd64: u16 = 0x8664; // IMAGE_FILE_MACHINE_AMD64
+pub const CoffMachineAmd64: u16 = 0x8664; // IMAGE_FILE_MACHINE_AMD64
 
-const CoffRelocRel32: u16 = 4;  // IMAGE_REL_AMD64_REL32
-const CoffRelocAddr64: u16 = 1; // IMAGE_REL_AMD64_ADDR64
+pub const CoffRelocRel32: u16 = 4;  // IMAGE_REL_AMD64_REL32
+pub const CoffRelocAddr64: u16 = 1; // IMAGE_REL_AMD64_ADDR64
 
-const ScnCntCode: u32 = 0x00000020;        // IMAGE_SCN_CNT_CODE
-const ScnCntInitializedData: u32 = 0x00000040; // IMAGE_SCN_CNT_INITIALIZED_DATA
-const ScnCntUninitializedData: u32 = 0x00000080; // IMAGE_SCN_CNT_UNINITIALIZED_DATA
-const ScnMemExecute: u32 = 0x20000000;     // IMAGE_SCN_MEM_EXECUTE
-const ScnMemRead: u32 = 0x40000000;        // IMAGE_SCN_MEM_READ
-const ScnMemWrite: u32 = 0x80000000;       // IMAGE_SCN_MEM_WRITE
+pub const ScnCntCode: u32 = 0x00000020;        // IMAGE_SCN_CNT_CODE
+pub const ScnCntInitializedData: u32 = 0x00000040; // IMAGE_SCN_CNT_INITIALIZED_DATA
+pub const ScnCntUninitializedData: u32 = 0x00000080; // IMAGE_SCN_CNT_UNINITIALIZED_DATA
+pub const ScnMemExecute: u32 = 0x20000000;     // IMAGE_SCN_MEM_EXECUTE
+pub const ScnMemRead: u32 = 0x40000000;        // IMAGE_SCN_MEM_READ
+pub const ScnMemWrite: u32 = 0x80000000;       // IMAGE_SCN_MEM_WRITE
 
-const SymClassExternal: u8 = 2; // IMAGE_SYM_CLASS_EXTERNAL
-const SymTypeNull: u16 = 0;
-const SymTypeFunction: u16 = 0x0020; // IMAGE_SYM_TYPE_FUNCTION
+pub const SymClassExternal: u8 = 2; // IMAGE_SYM_CLASS_EXTERNAL
+pub const SymTypeNull: u16 = 0;
+pub const SymTypeFunction: u16 = 0x0020; // IMAGE_SYM_TYPE_FUNCTION
 
 const CoffSymSize: u64 = 18;
 const CoffAuxSectionSize: u64 = 18;
@@ -112,9 +112,9 @@ pub const Writer = struct {
         var num_text_relocs: u32 = 0;
         var num_data_relocs: u32 = 0;
         for (input.relocs) |r| {
-            if (r.section_idx == 1) {
-                num_text_relocs += 1; // .text
-            } else if (r.section_idx == 2) {
+            if (r.section_idx == 0) {
+                num_text_relocs += 1; // .text (codegen emits 0-based section indices)
+            } else if (r.section_idx == 1) {
                 num_data_relocs += 1; // .data
             }
         }
@@ -323,11 +323,11 @@ pub const Writer = struct {
                 .addr64 => CoffRelocAddr64,
             };
             // For PE/COFF, addend is implicit at the site; r.addend is ignored.
-            var reloc_cursor = if (r.section_idx == 1) text_reloc_cursor else data_reloc_cursor;
+            var reloc_cursor = if (r.section_idx == 0) text_reloc_cursor else data_reloc_cursor;
             try putU32(final_buf, &reloc_cursor, @as(u32, @intCast(r.offset)));   // virtual_address
             try putU32(final_buf, &reloc_cursor, sym_index);             // symbol_table_index
             try putU16(final_buf, &reloc_cursor, r_type);                // type
-            if (r.section_idx == 1) {
+            if (r.section_idx == 0) {
                 text_reloc_cursor += CoffRelocSize;
             } else {
                 data_reloc_cursor += CoffRelocSize;
@@ -466,8 +466,8 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     };
 
     const relocs = &.{
-        Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
-        Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
+        Reloc{ .section_idx = 0, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 }, // .text
+        Reloc{ .section_idx = 1, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 }, // .data
     };
 
     const input = ObjectInput{

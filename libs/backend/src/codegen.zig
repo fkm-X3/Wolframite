@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const obj_elf = @import("obj_elf.zig");
+const obj_pe = @import("obj_pe.zig");
 const ferro = @import("ferro.zig");
 const Allocator = std.mem.Allocator;
 
@@ -1723,6 +1724,327 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
     try std.testing.expectEqual(1, r_type); // R_X86_64_64
 }
 
+test "object emission: function call between two functions (ELF64)" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i32_ty = try builder.addIntType(true, 32);
+
+    // callee(i32) -> i32 { return n; }
+    const callee = try builder.addFunction("callee", i32_ty, 1);
+    builder.setCurrentFunction(callee);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const n = @as(ir.Value, @enumFromInt(0));
+    _ = try builder.buildRet(n);
+
+    // main(i32) -> i32 { return callee(n); }
+    const main = try builder.addFunction("main", i32_ty, 1);
+    builder.setCurrentFunction(main);
+    const m_entry = try builder.appendBlock();
+    builder.setCurrentBlock(m_entry);
+    const n2 = @as(ir.Value, @enumFromInt(0));
+    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{ n2 });
+    const zero = try builder.buildIntConst(i32_ty, 0);
+    _ = try builder.buildRet(zero);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+
+    var w = obj_elf.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const bytes = try w.writeObject(input);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expectEqualSlices(u8, bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+    try std.testing.expectEqual(1, readU16(bytes, 16)); // ET_REL
+    try std.testing.expectEqual(62, readU16(bytes, 18)); // EM_X86_64
+
+    const e_shoff = readU64(bytes, 40);
+    const e_shnum = readU16(bytes, 60);
+    try std.testing.expectEqual(8, e_shnum);
+
+    // .text section with code.
+    const sh_text_off = e_shoff + 0 * 64;
+    try std.testing.expectEqual(1, readU32(bytes, sh_text_off + 4)); // SHT_PROGBITS
+    const text_off = readU64(bytes, sh_text_off + 24);
+    const text_size = readU64(bytes, sh_text_off + 32);
+    try std.testing.expect(text_size > 0);
+    var found_ret = false;
+    for (bytes[text_off..], 0..) |b, i| {
+        if (i < text_size and b == 0xc3) found_ret = true;
+    }
+    try std.testing.expect(found_ret);
+
+    // Two function symbols in .text: _callee (idx 1) then _main (idx 2).
+    const sh_symtab_off = e_shoff + 3 * 64;
+    const symtab_offset = readU64(bytes, sh_symtab_off + 24);
+    const sym_callee = symtab_offset + 24 * 1;
+    const sym_main = symtab_offset + 24 * 2;
+    try std.testing.expectEqual(0, readU16(bytes, sym_callee + 6)); // st_shndx = .text
+    try std.testing.expectEqual(0, readU16(bytes, sym_main + 6)); // st_shndx = .text
+    // st_info: global binding (1) << 4 | func type (2) = 0x12
+    try std.testing.expectEqual(0x12, bytes[sym_callee + 4]);
+    try std.testing.expectEqual(0x12, bytes[sym_main + 4]);
+
+    // .rela.text: one PC32 relocation for _callee (symtab index 1).
+    const sh_rela_off = e_shoff + 5 * 64;
+    try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
+    const rela_size = readU64(bytes, sh_rela_off + 32);
+    try std.testing.expectEqual(24, rela_size);
+    const rela_off = readU64(bytes, sh_rela_off + 24);
+    const r_info = readU64(bytes, rela_off + 8);
+    const r_sym: u32 = @truncate(r_info >> 32);
+    const r_type: u32 = @truncate(r_info & 0xFFFF_FFFF);
+    try std.testing.expectEqual(1, r_sym); // _callee
+    try std.testing.expectEqual(2, r_type); // R_X86_64_PC32
+    try std.testing.expectEqual(-4, readI64(bytes, rela_off + 16));
+}
+
+test "object emission: closure env + call_ptr (ELF64)" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    // __closure_0(i64 env, i64 x) -> i64 { return *env + x; }
+    const lifted = try builder.addFunction("__closure_0", i64_ty, 2);
+    builder.setCurrentFunction(lifted);
+    const l_entry = try builder.appendBlock();
+    builder.setCurrentBlock(l_entry);
+    const env_param = @as(ir.Value, @enumFromInt(0));
+    const x_param = @as(ir.Value, @enumFromInt(1));
+    const captured = try builder.buildLoad(i64_ty, env_param);
+    _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
+
+    // caller(i64) -> i64 { fv = func_addr(__closure_0) + env{40}; return call_ptr fv(x); }
+    const sig = try builder.addFunctionType(i64_ty, &.{i64_ty});
+    const fv_ty = try builder.addFunctionValueType(sig);
+    const caller = try builder.addFunction("caller", i64_ty, 1);
+    builder.setCurrentFunction(caller);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const x_arg = @as(ir.Value, @enumFromInt(0));
+
+    const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
+    const forty = try builder.buildIntConst(i64_ty, 40);
+    const env = try builder.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
+    const fv = try builder.buildFnValue(fv_ty, fn_addr, env);
+    const result = try builder.buildCallPtr(i64_ty, fv, &.{x_arg});
+    _ = try builder.buildRet(result);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+
+    var w = obj_elf.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const bytes = try w.writeObject(input);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expectEqualSlices(u8, bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+
+    const e_shoff = readU64(bytes, 40);
+    const sh_text_off = e_shoff + 0 * 64;
+    const text_off = readU64(bytes, sh_text_off + 24);
+    const text_size = readU64(bytes, sh_text_off + 32);
+
+    // Indirect call through the register: "call rax" = 0xff 0xd0.
+    var found_call_rax = false;
+    for (bytes[text_off..], 0..) |b, i| {
+        if (i < text_size and i + 1 < text_size and b == 0xff and bytes[text_off + i + 1] == 0xd0) {
+            found_call_rax = true;
+        }
+    }
+    try std.testing.expect(found_call_rax);
+
+    // _lifted and _caller are defined function symbols in .text.
+    const sh_symtab_off = e_shoff + 3 * 64;
+    const symtab_offset = readU64(bytes, sh_symtab_off + 24);
+    const sym_lifted = symtab_offset + 24 * 1;
+    const sym_caller = symtab_offset + 24 * 2;
+    try std.testing.expectEqual(0, readU16(bytes, sym_lifted + 6)); // st_shndx = .text
+    try std.testing.expectEqual(0, readU16(bytes, sym_caller + 6)); // st_shndx = .text
+
+    // func_addr emitted an ADDR64 relocation for "_lifted" in .text.
+    const sh_rela_off = e_shoff + 5 * 64;
+    try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
+    const rela_size = readU64(bytes, sh_rela_off + 32);
+    try std.testing.expect(rela_size >= 24);
+    const rela_off = readU64(bytes, sh_rela_off + 24);
+    var found_addr64 = false;
+    const entries = rela_size / 24;
+    var e: u64 = 0;
+    while (e < entries) : (e += 1) {
+        const r_info = readU64(bytes, rela_off + e * 24 + 8);
+        const r_type: u32 = @truncate(r_info & 0xFFFF_FFFF);
+        if (r_type == 1) { // R_X86_64_64
+            found_addr64 = true;
+        }
+    }
+    try std.testing.expect(found_addr64);
+}
+
+test "object emission: function call between two functions (PE/COFF)" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i32_ty = try builder.addIntType(true, 32);
+
+    const callee = try builder.addFunction("callee", i32_ty, 1);
+    builder.setCurrentFunction(callee);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const n = @as(ir.Value, @enumFromInt(0));
+    _ = try builder.buildRet(n);
+
+    const main = try builder.addFunction("main", i32_ty, 1);
+    builder.setCurrentFunction(main);
+    const m_entry = try builder.appendBlock();
+    builder.setCurrentBlock(m_entry);
+    const n2 = @as(ir.Value, @enumFromInt(0));
+    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{ n2 });
+    const zero = try builder.buildIntConst(i32_ty, 0);
+    _ = try builder.buildRet(zero);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+    const pe_syms_ptr: [*]const obj_pe.Symbol = @ptrCast(input.symbols.ptr);
+    const pe_syms = pe_syms_ptr[0..input.symbols.len];
+    const pe_relocs_ptr: [*]const obj_pe.Reloc = @ptrCast(input.relocs.ptr);
+    const pe_relocs = pe_relocs_ptr[0..input.relocs.len];
+    const pe_input = obj_pe.ObjectInput{
+        .text = input.text,
+        .data = input.data,
+        .bss_size = input.bss_size,
+        .symbols = pe_syms,
+        .relocs = pe_relocs,
+    };
+
+    var w = obj_pe.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const bytes = try w.writeObject(pe_input);
+    defer std.testing.allocator.free(bytes);
+
+    // COFF file header.
+    try std.testing.expectEqual(0x8664, readU16(bytes, 0)); // machine = AMD64
+    try std.testing.expectEqual(3, readU16(bytes, 2)); // 3 sections
+    try std.testing.expectEqual(0x0001, readU16(bytes, 18)); // characteristics
+
+    // Section table (40 bytes each, starting at 20): .text, .data, .bss.
+    const sh_text_off = 20 + 0 * 40;
+    try std.testing.expectEqual(obj_pe.ScnCntCode | obj_pe.ScnMemExecute | obj_pe.ScnMemRead,
+        readU32(bytes, sh_text_off + 36));
+    const text_size = readU32(bytes, sh_text_off + 16);
+    try std.testing.expect(text_size > 0);
+    const text_ptr = readU32(bytes, sh_text_off + 20);
+    try std.testing.expectEqual(text_ptr, 20 + 40 * 3); // raw data after headers
+    var found_ret = false;
+    for (bytes[text_ptr..text_ptr + text_size]) |b| { if (b == 0xc3) found_ret = true; }
+    try std.testing.expect(found_ret);
+
+    const sh_data_off = 20 + 1 * 40;
+    try std.testing.expectEqual(obj_pe.ScnCntInitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite,
+        readU32(bytes, sh_data_off + 36));
+    const sh_bss_off = 20 + 2 * 40;
+    try std.testing.expectEqual(obj_pe.ScnCntUninitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite,
+        readU32(bytes, sh_bss_off + 36));
+
+    // .text relocation: PC32 (REL32 = 4) for _callee.
+    const data_size = readU32(bytes, sh_data_off + 16);
+    const reloc_start = text_ptr + text_size + data_size;
+    try std.testing.expect(reloc_start < bytes.len);
+    const r_type: u16 = @as(u16, bytes[reloc_start + 8]) | (@as(u16, bytes[reloc_start + 9]) << 8);
+    try std.testing.expectEqual(obj_pe.CoffRelocRel32, r_type); // IMAGE_REL_AMD64_REL32
+}
+
+test "object emission: closure env + call_ptr (PE/COFF)" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i64_ty = try builder.addIntType(true, 64);
+
+    const lifted = try builder.addFunction("__closure_0", i64_ty, 2);
+    builder.setCurrentFunction(lifted);
+    const l_entry = try builder.appendBlock();
+    builder.setCurrentBlock(l_entry);
+    const env_param = @as(ir.Value, @enumFromInt(0));
+    const x_param = @as(ir.Value, @enumFromInt(1));
+    const captured = try builder.buildLoad(i64_ty, env_param);
+    _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
+
+    const sig = try builder.addFunctionType(i64_ty, &.{i64_ty});
+    const fv_ty = try builder.addFunctionValueType(sig);
+    const caller = try builder.addFunction("caller", i64_ty, 1);
+    builder.setCurrentFunction(caller);
+    const c_entry = try builder.appendBlock();
+    builder.setCurrentBlock(c_entry);
+    const x_arg = @as(ir.Value, @enumFromInt(0));
+
+    const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
+    const forty = try builder.buildIntConst(i64_ty, 40);
+    const env = try builder.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = forty }});
+    const fv = try builder.buildFnValue(fv_ty, fn_addr, env);
+    const result = try builder.buildCallPtr(i64_ty, fv, &.{x_arg});
+    _ = try builder.buildRet(result);
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+    const pe_syms_ptr: [*]const obj_pe.Symbol = @ptrCast(input.symbols.ptr);
+    const pe_syms = pe_syms_ptr[0..input.symbols.len];
+    const pe_relocs_ptr: [*]const obj_pe.Reloc = @ptrCast(input.relocs.ptr);
+    const pe_relocs = pe_relocs_ptr[0..input.relocs.len];
+    const pe_input = obj_pe.ObjectInput{
+        .text = input.text,
+        .data = input.data,
+        .bss_size = input.bss_size,
+        .symbols = pe_syms,
+        .relocs = pe_relocs,
+    };
+
+    var w = obj_pe.Writer.init(std.testing.allocator);
+    defer w.deinit();
+    const bytes = try w.writeObject(pe_input);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expectEqual(0x8664, readU16(bytes, 0)); // machine = AMD64
+    try std.testing.expectEqual(3, readU16(bytes, 2)); // 3 sections
+
+    const sh_text_off = 20 + 0 * 40;
+    const text_size = readU32(bytes, sh_text_off + 16);
+    const text_ptr = readU32(bytes, sh_text_off + 20);
+    const text_reloc_count = readU16(bytes, sh_text_off + 32); // number_of_relocations
+
+    // Indirect call through the register: "call rax" = 0xff 0xd0.
+    var found_call_rax = false;
+    for (bytes[text_ptr..], 0..) |b, i| {
+        if (i < text_size and i + 1 < text_size and b == 0xff and bytes[text_ptr + i + 1] == 0xd0) {
+            found_call_rax = true;
+        }
+    }
+    try std.testing.expect(found_call_rax);
+
+    // ADDR64 relocation (type 1) present for the func_addr'd lifted function.
+    const data_size = readU32(bytes, 20 + 1 * 40 + 16);
+    const reloc_start = text_ptr + text_size + data_size;
+    var found_addr64 = false;
+    var r: u64 = 0;
+    while (r < @as(u64, @intCast(text_reloc_count)) and reloc_start + r * 10 + 10 <= bytes.len) : (r += 1) {
+        const r_type: u16 = @as(u16, bytes[reloc_start + r * 10 + 8]) | (@as(u16, bytes[reloc_start + r * 10 + 9]) << 8);
+        if (r_type == obj_pe.CoffRelocAddr64) { // IMAGE_REL_AMD64_ADDR64
+            found_addr64 = true;
+        }
+    }
+    try std.testing.expect(found_addr64);
+}
+
 fn readU16(bytes: []const u8, off: usize) u16 {
     return @as(u16, bytes[off]) | (@as(u16, bytes[off + 1]) << 8);
 }
@@ -1741,4 +2063,8 @@ fn readU64(bytes: []const u8, off: usize) u64 {
         v |= @as(u64, bytes[off + @as(usize, i)]) << i * 8;
     }
     return v;
+}
+
+fn readI64(bytes: []const u8, off: usize) i64 {
+    return @bitCast(readU64(bytes, off));
 }
