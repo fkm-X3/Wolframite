@@ -41,8 +41,19 @@ pub const CodeGen = struct {
         self.alloca_offsets.deinit(self.gpa);
         self.obj_text.deinit(self.gpa);
         self.obj_data.deinit(self.gpa);
-        self.obj_relocs.deinit(self.gpa);
+
+        // Symbol names and relocation symbol names are individually
+        // gpa-allocated (dupe/allocPrint) — free them before dropping the
+        // ArrayList buffers.
+        for (self.obj_symbols.items) |sym| {
+            self.gpa.free(sym.name);
+        }
         self.obj_symbols.deinit(self.gpa);
+
+        for (self.obj_relocs.items) |rel| {
+            self.gpa.free(rel.symbol);
+        }
+        self.obj_relocs.deinit(self.gpa);
     }
 
     fn emit(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
@@ -138,7 +149,7 @@ pub const CodeGen = struct {
                         try self.obj_data.appendSlice(self.gpa, bytes);
                         try self.obj_data.append(self.gpa, 0);
                         try self.obj_symbols.append(self.gpa, .{
-                            .name = gname,
+                            .name = try self.gpa.dupe(u8, gname),
                             .section_idx = data_section,
                             .value = data_off,
                             .size = @as(u64, @intCast(bytes.len)) + 1,
@@ -150,12 +161,13 @@ pub const CodeGen = struct {
                         for (funcs, 0..) |func_idx, j| {
                             const fname = self.module.strings.get(self.module.functions.items[func_idx].name);
                             const symbol = try std.fmt.allocPrint(self.gpa, "_{s}", .{fname});
+                            defer self.gpa.free(symbol);
                             try self.obj_data.appendSlice(self.gpa, &[_]u8{0,0,0,0,0,0,0,0});
                             const entry_off = data_off + @as(u64, @intCast(j)) * 8;
                             try self.relocData(entry_off, symbol, .addr64, 0);
                         }
                         try self.obj_symbols.append(self.gpa, .{
-                            .name = gname,
+                            .name = try self.gpa.dupe(u8, gname),
                             .section_idx = data_section,
                             .value = data_off,
                             .size = @as(u64, @intCast(funcs.len)) * 8,
@@ -655,6 +667,7 @@ pub const CodeGen = struct {
                 const target_func = &self.module.functions.items[ops[0]];
                 const target_name = self.module.strings.get(target_func.name);
                 const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{target_name});
+                defer self.gpa.free(fname);
                 // lea rax, [rel _{name}] (relocation)
                 try self.o8(0x48);
                 try self.o8(0x8d);
@@ -671,6 +684,7 @@ pub const CodeGen = struct {
                 const target_func = &self.module.functions.items[ops[0]];
                 const target_name = self.module.strings.get(target_func.name);
                 const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{target_name});
+                defer self.gpa.free(fname);
                 const arg_count: u32 = @intCast(ops.len - 1);
                 const extra_stack = try self.emitCallSetupObject(ops, arg_count);
                 // call _{name} (relocation)

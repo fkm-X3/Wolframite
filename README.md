@@ -41,7 +41,7 @@ zig build                    # build everything into zig-out/ (default step)
 zig build run                # build and run the app
 zig build ore -- <args>      # run the ore CLI
 zig build test               # run all tests
-zig build test-compiler      # run compiler-only tests (fast; this is all CI runs)
+zig build test-compiler      # run compiler-only tests (fast)
 zig build test-std           # run Wolframite runtime tests
 zig build install-compiler   # install Wolframite + ore to the system bin dir
 ```

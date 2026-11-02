@@ -251,9 +251,9 @@ pub const Writer = struct {
         // .strtab content
         try self.buf.appendSlice(self.gpa, self.strtab.items);
         // .rela.text entries
-        try self.writeRela(input.relocs, 0, input.symbols); // .text = section 0
+        try self.writeRela(input.relocs, 1, input.symbols); // .text = section 1
         // .rela.data entries
-        try self.writeRela(input.relocs, 1, input.symbols); // .data = section 1
+        try self.writeRela(input.relocs, 2, input.symbols); // .data = section 2
         // .shstrtab content
         try self.buf.appendSlice(self.gpa, self.shstrtab.items);
 
@@ -617,7 +617,7 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     // --- Symbol table: parse symbols from .symtab content ---
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);   // sh_offset
     try std.testing.expectEqual(74, symtab_offset);
-    try std.testing.expectEqual(854, bytes.len);
+    try std.testing.expectEqual(878, bytes.len);
     // .text section header at index 1: sh_offset tells us where .text content is
     const text_off = readU64(bytes, sh_text_off + 24);
     try std.testing.expectEqual(64, text_off);
