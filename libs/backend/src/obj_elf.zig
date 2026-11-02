@@ -53,7 +53,7 @@ const StTypeNotype: u8 = 0;
 const StTypeObject: u8 = 1;
 const StTypeFunc: u8 = 2;
 
-const ShnUndef: u16 = 0;
+pub const ShnUndef: u16 = 0;
 
 const RelocX86_64_64: u32 = 1;
 const RelocX86_64_PC32: u32 = 2;
@@ -149,7 +149,7 @@ pub const Writer = struct {
             .e_phnum = 0,
             .e_shentsize = @intCast(@sizeOf(Elf64Shdr)),
             .e_shnum = @intCast(self.sec_type.items.len),
-            .e_shstrndx = 7, // .shstrtab
+            .e_shstrndx = 8, // .shstrtab
         };
         const ehdr_bytes = std.mem.asBytes(&ehdr);
         var final_buf: []u8 = try self.gpa.alloc(u8, 64 + self.buf.items.len);
@@ -169,10 +169,10 @@ pub const Writer = struct {
         try self.strtab.append(self.gpa, 0); // index 0 = NUL
         try self.shstrtab.append(self.gpa, 0); // index 0 = NUL
 
-        // Record shstrtab offset for each section name (8 sections).
-        const sec_names = [_][]const u8{ ".text", ".data", ".bss", ".symtab",
+        // Record shstrtab offset for each section name (9 sections: NULL + 8 real).
+        const sec_names = [_][]const u8{ "", ".text", ".data", ".bss", ".symtab",
             ".strtab", ".rela.text", ".rela.data", ".shstrtab" };
-        var shstr_offsets: [8]u32 = undefined;
+        var shstr_offsets: [9]u32 = undefined;
         for (sec_names, 0..) |name, i| {
             shstr_offsets[i] = @intCast(self.shstrtab.items.len);
             try self.shstrtab.appendSlice(self.gpa, name);
@@ -189,22 +189,22 @@ pub const Writer = struct {
         var num_text_relocs: u32 = 0;
         var num_data_relocs: u32 = 0;
         for (input.relocs) |r| {
-            if (r.section_idx == 0) {
-                num_text_relocs += 1; // .text is section 0
-            } else if (r.section_idx == 1) {
-                num_data_relocs += 1; // .data is section 1
+            if (r.section_idx == 1) {
+                num_text_relocs += 1; // .text is section 1
+            } else if (r.section_idx == 2) {
+                num_data_relocs += 1; // .data is section 2
             }
         }
 
         const sym_count = input.symbols.len;
         const symtab_size: u64 = 24 * @as(u64, @intCast(1 + sym_count));
 
-        // ---- Phase 3: register all section metas (indices 0..7) ----
-        // Section index constants.
-        const S_TEXT: u16 = 0;
-        const S_DATA: u16 = 1;
-        const S_SYMTAB: u16 = 3;
-        const S_STRTAB: u16 = 4;
+        // ---- Phase 3: register all section metas (indices 0..8) ----
+        // Section index 0 is the ELF NULL section (SHT_NULL).
+        const S_TEXT: u16 = 1;
+        const S_DATA: u16 = 2;
+        const S_SSYMTAB: u16 = 4;
+        const S_STRTAB: u16 = 5;
 
         const text_size: u64 = @as(u64, @intCast(input.text.len));
         const data_size: u64 = @as(u64, @intCast(input.data.len));
@@ -213,22 +213,24 @@ pub const Writer = struct {
         const rela_text_size = 24 * num_text_relocs;
         const rela_data_size = 24 * num_data_relocs;
 
+        try self.addSecMeta(.null, 0,
+            0, 0, 0, 0, 0, 0);        // 0: NULL section
         try self.addSecMeta(.progbits, ShfAlloc | ShfExecInstr,
-            0, text_size, 0, 0, 16, 0);        // .text
+            0, text_size, 0, 0, 16, 0);        // 1: .text
         try self.addSecMeta(.progbits, ShfAlloc | ShfWrite,
-            0, data_size, 0, 0, 8, 0);          // .data
+            0, data_size, 0, 0, 8, 0);          // 2: .data
         try self.addSecMeta(.nobits, ShfAlloc | ShfWrite,
-            0, input.bss_size, 0, 0, 8, 0);     // .bss
+            0, input.bss_size, 0, 0, 8, 0);     // 3: .bss
         try self.addSecMeta(.symtab, 0,
-            0, symtab_size, @intCast(S_STRTAB), 1, 8, 24); // .symtab
+            0, symtab_size, @intCast(S_STRTAB), 1, 8, 24); // 4: .symtab
         try self.addSecMeta(.strtab, 0,
-            0, strtab_size, 0, 0, 1, 0);        // .strtab
+            0, strtab_size, 0, 0, 1, 0);        // 5: .strtab
         try self.addSecMeta(.rela, 0,
-            0, rela_text_size, @intCast(S_SYMTAB), @intCast(S_TEXT), 8, 24); // .rela.text
+            0, rela_text_size, @intCast(S_SSYMTAB), @intCast(S_TEXT), 8, 24); // 6: .rela.text
         try self.addSecMeta(.rela, 0,
-            0, rela_data_size, @intCast(S_SYMTAB), @intCast(S_DATA), 8, 24); // .rela.data
+            0, rela_data_size, @intCast(S_SSYMTAB), @intCast(S_DATA), 8, 24); // 7: .rela.data
         try self.addSecMeta(.strtab, 0,
-            0, shstrtab_size, 0, 0, 1, 0);      // .shstrtab
+            0, shstrtab_size, 0, 0, 1, 0);      // 8: .shstrtab
 
         // ---- Phase 4: assign sequential file offsets ----
         var cursor: u64 = 64; // after ELF header
@@ -522,8 +524,8 @@ test "writeObject produces a valid minimal ELF64 object header" {
     try std.testing.expectEqual(0, readU16(bytes, 54));      // e_phentsize
     try std.testing.expectEqual(0, readU16(bytes, 56));      // e_phnum
     try std.testing.expectEqual(64, readU16(bytes, 58));     // e_shentsize
-    try std.testing.expectEqual(8, readU16(bytes, 60));      // e_shnum = 8 sections
-    try std.testing.expectEqual(7, readU16(bytes, 62));      // e_shstrndx = .shstrtab
+    try std.testing.expectEqual(9, readU16(bytes, 60));      // e_shnum = 9 sections
+    try std.testing.expectEqual(8, readU16(bytes, 62));      // e_shstrndx = .shstrtab
     try std.testing.expect(e_shoff >= 64 and e_shoff < bytes.len);
 }
 
@@ -536,17 +538,17 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     const data_bytes = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0 };
 
     const symbols = &.{
-        Symbol{ .name = "_main", .section_idx = 0, .value = 0, .size = 4,
+        Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
             .binding = .global, .is_func = true },
-        Symbol{ .name = "__g0", .section_idx = 1, .value = 0, .size = 6,
+        Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6,
             .binding = .global, .is_func = false },
         Symbol{ .name = "puts", .section_idx = ShnUndef, .value = 0, .size = 0,
             .binding = .global, .is_func = false },
     };
 
     const relocs = &.{
-        Reloc{ .section_idx = 0, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
-        Reloc{ .section_idx = 1, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
+        Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
+        Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
     };
 
     const input = ObjectInput{
@@ -566,7 +568,8 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     const e_shoff = readU64(bytes, 40);
     const e_shnum = readU16(bytes, 60);
     const e_shstrndx = readU16(bytes, 62);
-    try std.testing.expectEqual(8, e_shnum);
+    try std.testing.expectEqual(9, e_shnum);
+    try std.testing.expectEqual(8, e_shstrndx);
 
     // --- Section headers: verify .text, .data, .bss, .symtab, .strtab ---
     // Elf64Shdr layout:
@@ -574,43 +577,48 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     //   +16 sh_addr (u64)   +24 sh_offset (u64) +32 sh_size (u64)
     //   +40 sh_link (u32)   +44 sh_info (u32)   +48 sh_addralign (u64)
     //   +56 sh_entsize (u64)
-    // Section index 0 = .text
-    const sh_text_off = e_shoff + 0 * 64;
+    // Section index 0 = NULL (SHT_NULL, no content)
+    const sh_null_off = e_shoff + 0 * 64;
+    try std.testing.expectEqual(0, readU32(bytes, sh_null_off + 4));    // sh_type = SHT_NULL
+    try std.testing.expectEqual(0, readU64(bytes, sh_null_off + 32));    // sh_size = 0
+
+    // Section index 1 = .text
+    const sh_text_off = e_shoff + 1 * 64;
     try std.testing.expectEqual(1, readU32(bytes, sh_text_off + 4));    // sh_type = SHT_PROGBITS
     try std.testing.expectEqual(ShfAlloc | ShfExecInstr, readU64(bytes, sh_text_off + 8));
     try std.testing.expectEqual(64, readU64(bytes, sh_text_off + 24));  // sh_offset (after ELF hdr)
     try std.testing.expectEqual(4, readU64(bytes, sh_text_off + 32));   // sh_size
 
-    // Section index 1 = .data
-    const sh_data_off = e_shoff + 1 * 64;
+    // Section index 2 = .data
+    const sh_data_off = e_shoff + 2 * 64;
     try std.testing.expectEqual(1, readU32(bytes, sh_data_off + 4));    // sh_type
     try std.testing.expectEqual(ShfAlloc | ShfWrite, readU64(bytes, sh_data_off + 8));
     try std.testing.expectEqual(68, readU64(bytes, sh_data_off + 24));  // sh_offset (64+4)
     try std.testing.expectEqual(6, readU64(bytes, sh_data_off + 32));   // sh_size
 
-    // Section index 2 = .bss (NOBITS, no file content)
-    const sh_bss_off = e_shoff + 2 * 64;
+    // Section index 3 = .bss (NOBITS, no file content)
+    const sh_bss_off = e_shoff + 3 * 64;
     try std.testing.expectEqual(8, readU32(bytes, sh_bss_off + 4));     // sh_type = SHT_NOBITS
     try std.testing.expectEqual(0, readU64(bytes, sh_bss_off + 32));    // sh_size = 0
 
-    // Section index 3 = .symtab
-    const sh_symtab_off = e_shoff + 3 * 64;
+    // Section index 4 = .symtab
+    const sh_symtab_off = e_shoff + 4 * 64;
     try std.testing.expectEqual(2, readU32(bytes, sh_symtab_off + 4));  // sh_type = SHT_SYMTAB
-    try std.testing.expectEqual(4, readU32(bytes, sh_symtab_off + 40)); // sh_link = .strtab (idx 4)
+    try std.testing.expectEqual(5, readU32(bytes, sh_symtab_off + 40)); // sh_link = .strtab (idx 5)
     try std.testing.expectEqual(1, readU32(bytes, sh_symtab_off + 44)); // sh_info = 1
 
-    // Section index 4 = .strtab
-    const sh_strtab_off = e_shoff + 4 * 64;
+    // Section index 5 = .strtab
+    const sh_strtab_off = e_shoff + 5 * 64;
     try std.testing.expectEqual(3, readU32(bytes, sh_strtab_off + 4));  // sh_type = SHT_STRTAB
 
-    // e_shstrndx should point to .shstrtab (section index 7)
-    try std.testing.expectEqual(7, e_shstrndx);
+    // e_shstrndx should point to .shstrtab (section index 8)
+    try std.testing.expectEqual(8, e_shstrndx);
 
     // --- Symbol table: parse symbols from .symtab content ---
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);   // sh_offset
     try std.testing.expectEqual(74, symtab_offset);
-    try std.testing.expectEqual(813, bytes.len);
-    // .text section header at index 0: sh_offset tells us where .text content is
+    try std.testing.expectEqual(854, bytes.len);
+    // .text section header at index 1: sh_offset tells us where .text content is
     const text_off = readU64(bytes, sh_text_off + 24);
     try std.testing.expectEqual(64, text_off);
     try std.testing.expectEqualSlices(u8, bytes[text_off..text_off+4], &[_]u8{ 0x48, 0x89, 0xf8, 0xc3 });
@@ -622,24 +630,24 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     const sym0_shndx = readU16(bytes, symtab_offset + 6);
     try std.testing.expectEqual(ShnUndef, sym0_shndx);
 
-    // _main: symbol index 1
+    // _main: symbol index 1, in .text (section 1)
     const sym_main = symtab_offset + 24;
-    try std.testing.expectEqual(0, readU16(bytes, sym_main + 6));  // st_shndx = .text (0)
+    try std.testing.expectEqual(1, readU16(bytes, sym_main + 6));  // st_shndx = .text (1)
     try std.testing.expectEqual(0, readU64(bytes, sym_main + 8));  // st_value = 0
 
-    // __g0: symbol index 2, in .data (section 1)
+    // __g0: symbol index 2, in .data (section 2)
     const sym_g0 = symtab_offset + 48;
-    try std.testing.expectEqual(1, readU16(bytes, sym_g0 + 6)); // st_shndx = .data (1)
+    try std.testing.expectEqual(2, readU16(bytes, sym_g0 + 6)); // st_shndx = .data (2)
 
     // puts: symbol index 3, undefined
     const sym_puts = symtab_offset + 72;
     try std.testing.expectEqual(ShnUndef, readU16(bytes, sym_puts + 6));
 
-    // --- Relocation table: .rela.text (section index 5) ---
-    const sh_rela_text_off = e_shoff + 5 * 64;
+    // --- Relocation table: .rela.text (section index 6) ---
+    const sh_rela_text_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_text_off + 4));  // sh_type = SHT_RELA
-    try std.testing.expectEqual(3, readU32(bytes, sh_rela_text_off + 40)); // sh_link = .symtab (idx 3)
-    try std.testing.expectEqual(0, readU32(bytes, sh_rela_text_off + 44)); // sh_info = .text (idx 0)
+    try std.testing.expectEqual(4, readU32(bytes, sh_rela_text_off + 40)); // sh_link = .symtab (idx 4)
+    try std.testing.expectEqual(1, readU32(bytes, sh_rela_text_off + 44)); // sh_info = .text (idx 1)
     const rela_text_offset = readU64(bytes, sh_rela_text_off + 24); // sh_offset
     const rela_text_entsize = readU64(bytes, sh_rela_text_off + 56); // sh_entsize
     try std.testing.expectEqual(24, rela_text_entsize);

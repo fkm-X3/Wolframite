@@ -125,7 +125,7 @@ pub const CodeGen = struct {
     /// `obj_symbols`/`obj_relocs`, producing an `obj_elf.ObjectInput` (the same
     /// input model feeds both the ELF64 and PE/COFF writers).
     pub fn emitObjectModule(self: *@This()) !obj_elf.ObjectInput {
-        const data_section: u16 = 1;
+        const data_section: u16 = 2;
 
         // Emit globals first so their addresses are known when referenced.
         if (self.module.globals.items.len > 0) {
@@ -206,7 +206,7 @@ pub const CodeGen = struct {
         const func_start = @as(u64, @intCast(self.obj_text.items.len));
         try self.obj_symbols.append(self.gpa, .{
             .name = fname,
-            .section_idx = 0,
+            .section_idx = 1, // .text (section 1; section 0 is ELF NULL / SHN_UNDEF)
             .value = func_start,
             .size = 0,
             .binding = .global,
@@ -343,7 +343,7 @@ pub const CodeGen = struct {
     fn relocText(self: *@This(), symbol: []const u8, kind: ferro.RelocKind, addend: i64) !void {
         const name = try self.gpa.dupe(u8, symbol);
         try self.obj_relocs.append(self.gpa, .{
-            .section_idx = 0,
+            .section_idx = 1, // .text (section 1)
             .offset = @as(u64, @intCast(self.obj_text.items.len)),
             .symbol = name,
             .kind = kind,
@@ -355,7 +355,7 @@ pub const CodeGen = struct {
     fn relocData(self: *@This(), offset: u64, symbol: []const u8, kind: ferro.RelocKind, addend: i64) !void {
         const name = try self.gpa.dupe(u8, symbol);
         try self.obj_relocs.append(self.gpa, .{
-            .section_idx = 1,
+            .section_idx = 2, // .data (section 2)
             .offset = offset,
             .symbol = name,
             .kind = kind,
@@ -1595,8 +1595,8 @@ test "object emission: trivial main returns 42 (ELF64)" {
     // .text section present with code.
     const e_shoff = readU64(bytes, 40);
     const e_shnum = readU16(bytes, 60);
-    try std.testing.expectEqual(8, e_shnum);
-    const sh_text_off = e_shoff + 0 * 64;
+    try std.testing.expectEqual(9, e_shnum);
+    const sh_text_off = e_shoff + 1 * 64;
     try std.testing.expectEqual(1, readU32(bytes, sh_text_off + 4)); // SHT_PROGBITS
     const text_off = readU64(bytes, sh_text_off + 24);
     const text_size = readU64(bytes, sh_text_off + 32);
@@ -1607,10 +1607,10 @@ test "object emission: trivial main returns 42 (ELF64)" {
     try std.testing.expect(found_ret);
 
     // _main symbol in .text.
-    const sh_symtab_off = e_shoff + 3 * 64;
+    const sh_symtab_off = e_shoff + 4 * 64;
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);
     const sym1 = symtab_offset + 24; // skip STN_UNDEF
-    try std.testing.expectEqual(0, readU16(bytes, sym1 + 6)); // st_shndx = .text (0)
+    try std.testing.expectEqual(1, readU16(bytes, sym1 + 6)); // st_shndx = .text (1)
 }
 
 test "object emission: extern call produces undefined symbol + PC32 relocation (ELF64)" {
@@ -1643,14 +1643,14 @@ test "object emission: extern call produces undefined symbol + PC32 relocation (
 
     // wfr_std_print is an undefined symbol resolved against wfr_std at link time.
     const e_shoff = readU64(bytes, 40);
-    const sh_symtab_off = e_shoff + 3 * 64;
+    const sh_symtab_off = e_shoff + 4 * 64;
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);
     // symbol order: 0=STN_UNDEF, 1=wfr_std_print (extern), 2=_main (function)
     const sym_print = symtab_offset + 24 * 1;
     try std.testing.expectEqual(0, readU16(bytes, sym_print + 6)); // st_shndx = SHN_UNDEF
 
     // .rela.text has a PC32 relocation for wfr_std_print.
-    const sh_rela_off = e_shoff + 5 * 64;
+    const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_off = readU64(bytes, sh_rela_off + 24);
     const rela_size = readU64(bytes, sh_rela_off + 32);
@@ -1693,7 +1693,7 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
 
     // .data section present.
     const e_shoff = readU64(bytes, 40);
-    const sh_data_off = e_shoff + 1 * 64;
+    const sh_data_off = e_shoff + 2 * 64;
     try std.testing.expectEqual(1, readU32(bytes, sh_data_off + 4)); // SHT_PROGBITS
     const data_off = readU64(bytes, sh_data_off + 24);
     const data_size = readU64(bytes, sh_data_off + 32);
@@ -1701,13 +1701,13 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
     try std.testing.expectEqualSlices(u8, bytes[data_off..data_off + 3], &[_]u8{ 'h', 'i', 0 });
 
     // __g0 symbol in .data.
-    const sh_symtab_off = e_shoff + 3 * 64;
+    const sh_symtab_off = e_shoff + 4 * 64;
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);
     const sym_g0 = symtab_offset + 24 * 1; // symbol 1 = __g0
-    try std.testing.expectEqual(1, readU16(bytes, sym_g0 + 6)); // st_shndx = .data (1)
+    try std.testing.expectEqual(2, readU16(bytes, sym_g0 + 6)); // st_shndx = .data (2)
 
     // .rela.text has ADDR64 relocation for __g0 (the lea instruction is in .text).
-    const sh_rela_off = e_shoff + 5 * 64;
+    const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_off = readU64(bytes, sh_rela_off + 24);
     const rela_size = readU64(bytes, sh_rela_off + 32);
@@ -1756,10 +1756,10 @@ test "object emission: function call between two functions (ELF64)" {
 
     const e_shoff = readU64(bytes, 40);
     const e_shnum = readU16(bytes, 60);
-    try std.testing.expectEqual(8, e_shnum);
+    try std.testing.expectEqual(9, e_shnum);
 
     // .text section with code.
-    const sh_text_off = e_shoff + 0 * 64;
+    const sh_text_off = e_shoff + 1 * 64;
     try std.testing.expectEqual(1, readU32(bytes, sh_text_off + 4)); // SHT_PROGBITS
     const text_off = readU64(bytes, sh_text_off + 24);
     const text_size = readU64(bytes, sh_text_off + 32);
@@ -1771,18 +1771,18 @@ test "object emission: function call between two functions (ELF64)" {
     try std.testing.expect(found_ret);
 
     // Two function symbols in .text: _callee (idx 1) then _main (idx 2).
-    const sh_symtab_off = e_shoff + 3 * 64;
+    const sh_symtab_off = e_shoff + 4 * 64;
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);
     const sym_callee = symtab_offset + 24 * 1;
     const sym_main = symtab_offset + 24 * 2;
-    try std.testing.expectEqual(0, readU16(bytes, sym_callee + 6)); // st_shndx = .text
-    try std.testing.expectEqual(0, readU16(bytes, sym_main + 6)); // st_shndx = .text
+    try std.testing.expectEqual(1, readU16(bytes, sym_callee + 6)); // st_shndx = .text (1)
+    try std.testing.expectEqual(1, readU16(bytes, sym_main + 6)); // st_shndx = .text (1)
     // st_info: global binding (1) << 4 | func type (2) = 0x12
     try std.testing.expectEqual(0x12, bytes[sym_callee + 4]);
     try std.testing.expectEqual(0x12, bytes[sym_main + 4]);
 
     // .rela.text: one PC32 relocation for _callee (symtab index 1).
-    const sh_rela_off = e_shoff + 5 * 64;
+    const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_size = readU64(bytes, sh_rela_off + 32);
     try std.testing.expectEqual(24, rela_size);
@@ -1840,7 +1840,7 @@ test "object emission: closure env + call_ptr (ELF64)" {
     try std.testing.expectEqualSlices(u8, bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
 
     const e_shoff = readU64(bytes, 40);
-    const sh_text_off = e_shoff + 0 * 64;
+    const sh_text_off = e_shoff + 1 * 64;
     const text_off = readU64(bytes, sh_text_off + 24);
     const text_size = readU64(bytes, sh_text_off + 32);
 
@@ -1854,15 +1854,15 @@ test "object emission: closure env + call_ptr (ELF64)" {
     try std.testing.expect(found_call_rax);
 
     // _lifted and _caller are defined function symbols in .text.
-    const sh_symtab_off = e_shoff + 3 * 64;
+    const sh_symtab_off = e_shoff + 4 * 64;
     const symtab_offset = readU64(bytes, sh_symtab_off + 24);
     const sym_lifted = symtab_offset + 24 * 1;
     const sym_caller = symtab_offset + 24 * 2;
-    try std.testing.expectEqual(0, readU16(bytes, sym_lifted + 6)); // st_shndx = .text
-    try std.testing.expectEqual(0, readU16(bytes, sym_caller + 6)); // st_shndx = .text
+    try std.testing.expectEqual(1, readU16(bytes, sym_lifted + 6)); // st_shndx = .text (1)
+    try std.testing.expectEqual(1, readU16(bytes, sym_caller + 6)); // st_shndx = .text (1)
 
     // func_addr emitted an ADDR64 relocation for "_lifted" in .text.
-    const sh_rela_off = e_shoff + 5 * 64;
+    const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_size = readU64(bytes, sh_rela_off + 32);
     try std.testing.expect(rela_size >= 24);

@@ -112,10 +112,10 @@ pub const Writer = struct {
         var num_text_relocs: u32 = 0;
         var num_data_relocs: u32 = 0;
         for (input.relocs) |r| {
-            if (r.section_idx == 0) {
-                num_text_relocs += 1; // .text (codegen emits 0-based section indices)
-            } else if (r.section_idx == 1) {
-                num_data_relocs += 1; // .data
+            if (r.section_idx == 1) {
+                num_text_relocs += 1; // .text (section 1)
+            } else if (r.section_idx == 2) {
+                num_data_relocs += 1; // .data (section 2)
             }
         }
 
@@ -323,11 +323,11 @@ pub const Writer = struct {
                 .addr64 => CoffRelocAddr64,
             };
             // For PE/COFF, addend is implicit at the site; r.addend is ignored.
-            var reloc_cursor = if (r.section_idx == 0) text_reloc_cursor else data_reloc_cursor;
+            var reloc_cursor = if (r.section_idx == 1) text_reloc_cursor else data_reloc_cursor;
             try putU32(final_buf, &reloc_cursor, @as(u32, @intCast(r.offset)));   // virtual_address
             try putU32(final_buf, &reloc_cursor, sym_index);             // symbol_table_index
             try putU16(final_buf, &reloc_cursor, r_type);                // type
-            if (r.section_idx == 0) {
+            if (r.section_idx == 1) {
                 text_reloc_cursor += CoffRelocSize;
             } else {
                 data_reloc_cursor += CoffRelocSize;
@@ -466,8 +466,8 @@ test "writeObject round-trip: sections, symbols, and relocations parse back" {
     };
 
     const relocs = &.{
-        Reloc{ .section_idx = 0, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 }, // .text
-        Reloc{ .section_idx = 1, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 }, // .data
+        Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 }, // .text
+        Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 }, // .data
     };
 
     const input = ObjectInput{

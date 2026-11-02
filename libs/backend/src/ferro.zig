@@ -247,14 +247,25 @@ pub const Object = struct {
     }
 };
 
+/// A symbol resolved against an object file: the section it lives in and its
+/// offset within that section.
+pub const ResolvedSymbol = struct {
+    section: []const u8,
+    value: u64,
+};
+
 /// Result of symbol resolution: the undefined symbols that must be satisfied
 /// by the runtime archive, plus a map from undefined symbol name to the
 /// defining archive symbol once resolved.
 pub const ResolvedSymbols = struct {
     undefined: std.ArrayList([]const u8),
+    /// Undefined program symbols resolved against the runtime archive:
+    /// symbol name → where it lives in the runtime object.
+    resolved: std.StringHashMap(ResolvedSymbol),
 
     pub fn deinit(self: *ResolvedSymbols, gpa: Allocator) void {
         self.undefined.deinit(gpa);
+        self.resolved.deinit();
     }
 };
 
@@ -469,9 +480,8 @@ fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
                 else => .local,
             };
             // Symbol 0 is STN_UNDEF (the null symbol) — it has no section.
-            // This codebase's writer places `.text` at section index 0, so any
-            // other symbol with st_shndx=0 resolves to `.text`.
-            const sec_name = if (s == 0) null else if (@as(u64, st_shndx) >= e_shnum) null else cstr(shstrtab, sec_hdrs.items[@intCast(st_shndx)].name_off);
+            // st_shndx == 0 (SHN_UNDEF) means the symbol is undefined.
+            const sec_name = if (@as(u64, st_shndx) == 0 or @as(u64, st_shndx) >= e_shnum) null else cstr(shstrtab, sec_hdrs.items[@intCast(st_shndx)].name_off);
             try obj.symbols.append(gpa, .{
                 .name = cstr(strtab, @intCast(st_name)),
                 .section = sec_name,
@@ -674,19 +684,69 @@ fn strtabName(strtab: []const u8, offset: u64) []const u8 {
     return strtab[offset..offset + end];
 }
 
-/// Resolve every undefined symbol in `program` against `runtime_lib`.
+/// Resolve every undefined symbol in `program` against `runtime`.
 ///
-/// Stub: returns `SymbolResolutionUnimplemented`. The real implementation
-/// collects defined/undefined symbols from both objects, resolves undefined
-/// references, and reports `UndefinedSymbol` with the symbol name for
-/// anything still unresolved.
+/// Collects all defined symbols from both objects, then walks `program`'s
+/// undefined symbols (those with `section == null`). For each one, looks it
+/// up in `runtime`'s defined symbols. Symbols still unresolved are recorded
+/// in `ResolvedSymbols.undefined`; if any remain, returns `LinkError.UndefinedSymbol`.
+///
+/// `entry_symbol` is reserved for entry-point wiring (implemented later); it
+/// is always defined in the program object and is not consulted here.
 pub fn resolveSymbols(
-    _: *Object,
-    _: *Object,
+    program: *Object,
+    runtime: *Object,
     _: []const u8,
-    _: Allocator,
-) !ResolvedSymbols {
-    return error.SymbolResolutionUnimplemented;
+    gpa: Allocator,
+) LinkError !ResolvedSymbols {
+    // Map of runtime-defined symbols: name → (section, value).
+    var runtime_defined: std.StringHashMap(ResolvedSymbol) =
+        std.StringHashMap(ResolvedSymbol).init(gpa);
+    defer runtime_defined.deinit();
+
+    for (runtime.symbols.items) |sym| {
+        if (sym.section != null) {
+            // First definition wins; Tungsten does not emit duplicate symbols.
+            if (runtime_defined.get(sym.name) == null) {
+                runtime_defined.put(sym.name, .{
+                    .section = sym.section.?,
+                    .value = sym.value,
+                }) catch |err| switch (err) {
+                    else => return LinkError.WriteFailed,
+                };
+            }
+        }
+    }
+
+    var result = ResolvedSymbols{
+        .undefined = .empty,
+        .resolved = std.StringHashMap(ResolvedSymbol).init(gpa),
+    };
+    errdefer result.deinit(gpa);
+
+    for (program.symbols.items) |sym| {
+        // Skip the ELF STN_UNDEF null symbol (index 0, empty name).
+        if (sym.name.len == 0) continue;
+        if (sym.section == null) {
+            if (runtime_defined.get(sym.name)) |addr| {
+                result.resolved.put(sym.name, addr) catch |err| switch (err) {
+                    else => return LinkError.WriteFailed,
+                };
+            } else {
+                result.undefined.append(gpa, sym.name) catch |err| switch (err) {
+                    else => return LinkError.WriteFailed,
+                };
+            }
+        }
+    }
+
+    if (result.undefined.items.len > 0) {
+        const name = result.undefined.items[0];
+        std.debug.print("Ferro: undefined symbol '{s}' not found in program or runtime archive\n", .{name});
+        return error.UndefinedSymbol;
+    }
+
+    return result;
 }
 
 /// Apply relocations and merge `.text`/`.data`/`.bss` from program object
@@ -862,17 +922,17 @@ test "readObject reads an ELF64 object Tungsten emitted (sections, symbols, relo
     const data_bytes = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0 };
 
     const symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 0, .value = 0, .size = 4,
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
             .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "__g0", .section_idx = 1, .value = 0, .size = 6,
+        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6,
             .binding = .global, .is_func = false },
         obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
             .binding = .global, .is_func = false },
     };
 
     const relocs = &.{
-        obj_elf.Reloc{ .section_idx = 0, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
-        obj_elf.Reloc{ .section_idx = 1, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
+        obj_elf.Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
+        obj_elf.Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
     };
 
     const input = obj_elf.ObjectInput{
@@ -897,19 +957,14 @@ test "readObject reads an ELF64 object Tungsten emitted (sections, symbols, relo
 
     try std.testing.expectEqual(ObjectFormat.elf64, object.format);
 
-    // Sections: .text, .data, .bss, .symtab, .strtab, .rela.text, .rela.data, .shstrtab
-    try std.testing.expectEqual(8, object.sections.items.len);
-    try std.testing.expectEqualStrings(".text", object.sections.items[0].name);
-    try std.testing.expectEqualSlices(u8, object.sections.items[0].content, &text_bytes);
-    try std.testing.expectEqualStrings(".data", object.sections.items[1].name);
-    try std.testing.expectEqualSlices(u8, object.sections.items[1].content, &data_bytes);
-    try std.testing.expectEqualStrings(".bss", object.sections.items[2].name);
-    try std.testing.expectEqual(0, object.sections.items[2].content.len);
+    // Sections: NULL, .text, .data, .bss, .symtab, .strtab, .rela.text, .rela.data, .shstrtab
+    try std.testing.expectEqual(9, object.sections.items.len);
+    try std.testing.expectEqualSlices(u8, object.sections.items[1].content, &text_bytes);
+    try std.testing.expectEqualSlices(u8, object.sections.items[2].content, &data_bytes);
+    try std.testing.expectEqual(0, object.sections.items[3].content.len);
 
     // Symbols: STN_UNDEF (index 0) + _main + __g0 + puts.
-    // This codebase's writer places `.text` at section index 0, so st_shndx=0
-    // resolves to `.text` for _main and puts alike (a pre-existing writer
-    // ambiguity: undefined externs also use index 0).
+    // `puts` is an undefined extern (SHN_UNDEF) so its section is null.
     try std.testing.expectEqual(4, object.symbols.items.len);
     // STN_UNDEF: null name, null section.
     try std.testing.expectEqualSlices(u8, object.symbols.items[0].name, &[_]u8{});
@@ -919,7 +974,7 @@ test "readObject reads an ELF64 object Tungsten emitted (sections, symbols, relo
     try std.testing.expectEqualStrings("__g0", object.symbols.items[2].name);
     try std.testing.expectEqualStrings(".data", object.symbols.items[2].section.?);
     try std.testing.expectEqualStrings("puts", object.symbols.items[3].name);
-    try std.testing.expectEqualStrings(".text", object.symbols.items[3].section.?);
+    try std.testing.expectEqual(null, object.symbols.items[3].section);
 
     // Relocations: one PC32 in .text (puts), one ADDR64 in .data (__g0)
     try std.testing.expectEqual(2, object.relocations.items.len);
@@ -951,8 +1006,8 @@ test "readObject reads a PE/COFF object (sections, symbols, relocations)" {
     };
 
     const relocs = &.{
-        obj_pe.Reloc{ .section_idx = 0, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
-        obj_pe.Reloc{ .section_idx = 1, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
+        obj_pe.Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
+        obj_pe.Reloc{ .section_idx = 2, .offset = 0, .symbol = "__g0", .kind = .addr64, .addend = 0 },
     };
 
     const input = obj_pe.ObjectInput{
@@ -1032,5 +1087,132 @@ test "readObject reports ObjectReadFailed for a non-ELF/non-COFF file" {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.ObjectReadFailed, err);
+    }
+}
+
+test "resolveSymbols resolves an undefined program symbol against the runtime" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_elf = @import("obj_elf.zig");
+
+    // Program object: _main defined in .text, puts undefined.
+    const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 };
+    const prog_symbols = &.{
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
+            .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_input = obj_elf.ObjectInput{
+        .text = &prog_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var prog_w = obj_elf.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "ferro_resolve_prog.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    // Runtime object: puts defined in .text (section 1).
+    const rt_text = [_]u8{ 0x90, 0x90 };
+    const rt_symbols = &.{
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_elf.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var rt_w = obj_elf.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "ferro_resolve_rt.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    var program = try readObject(io, gpa, prog_path);
+    defer program.deinit(gpa);
+    var runtime = try readObject(io, gpa, rt_path);
+    defer runtime.deinit(gpa);
+
+    var resolved = try resolveSymbols(&program, &runtime, "_main", gpa);
+    defer resolved.deinit(gpa);
+
+    try std.testing.expectEqual(0, resolved.undefined.items.len);
+    if (resolved.resolved.get("puts")) |addr| {
+        try std.testing.expectEqualStrings(".text", addr.section);
+        try std.testing.expectEqual(0, addr.value);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
+test "resolveSymbols reports UndefinedSymbol when the runtime does not define it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_elf = @import("obj_elf.zig");
+
+    // Program object: _main defined, nosuch_symbol undefined.
+    const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 };
+    const prog_symbols = &.{
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
+            .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "nosuch_symbol", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_input = obj_elf.ObjectInput{
+        .text = &prog_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var prog_w = obj_elf.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "ferro_resolve_missing_prog.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    // Runtime object: does not define nosuch_symbol.
+    const rt_text = [_]u8{ 0x90, 0x90 };
+    const rt_symbols = &.{
+        obj_elf.Symbol{ .name = "other", .section_idx = 0, .value = 0, .size = 2,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_elf.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var rt_w = obj_elf.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "ferro_resolve_missing_rt.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    var program = try readObject(io, gpa, prog_path);
+    defer program.deinit(gpa);
+    var runtime = try readObject(io, gpa, rt_path);
+    defer runtime.deinit(gpa);
+
+    if (resolveSymbols(&program, &runtime, "_main", gpa)) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(LinkError.UndefinedSymbol, err);
     }
 }
