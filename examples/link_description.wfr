@@ -1,0 +1,45 @@
+//! Link description — structured arguments for the Ferro linker.
+//!
+//! A link description is a normal Wolframite module (lexer → parser →
+//! resolver → typecheck) that binds a single linker-args struct literal to a
+//! top-level `let`. It defines no `fn main`. The compiler extracts it via
+//! `compiler.link_description.compileLinkDescription`, converts it to
+//! `ferro.LinkOptions` with `linkOptionsFromSource`, and feeds those options
+//! to `ferro.linkObject`.
+//!
+//! Required fields: `target`, `output`, `input`, `runtime_lib`.
+//! Optional: `entry` (defaults "_main"), `subsystem` (defaults "console"),
+//! `debug` (defaults false).
+//!
+//! Each field is one linker argument:
+//!
+//!   target      — "linux" or "windows"; picks ELF64 vs PE/COFF object format
+//!                 and the platform entry point (_start vs main).
+//!   output      — path of the executable Ferro writes.
+//!   entry       — symbol Tungsten names as program entry (_main by default);
+//!                 Ferro wires it to the platform entry point.
+//!   subsystem   — Windows only: "console" or "gui". Ignored on Linux.
+//!   runtime_lib — path to the wfr_std static archive Ferro links in.
+//!   input       — program object file Tungsten emitted (.o / .obj) for Ferro
+//!                 to link.
+//!   debug       — emit debug info / keep a PDB next to the executable.
+
+struct LinkerArgs {
+    target: String,
+    output: String,
+    entry: String,
+    subsystem: String,
+    runtime_lib: String,
+    input: String,
+    debug: bool,
+}
+
+let link = LinkerArgs {
+    .target = "windows",
+    .output = "hello.exe",
+    .entry = "_main",
+    .subsystem = "console",
+    .runtime_lib = "wfr_std.lib",
+    .input = "hello.obj",
+    .debug = false,
+};

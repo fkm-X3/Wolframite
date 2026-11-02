@@ -82,6 +82,22 @@ pub const Parser = struct {
         return self.tokens[self.tokens.len - 1];
     }
 
+    /// Like `peekNext`, but skips newline and semicolon tokens so a construct
+    /// like `LinkerArgs {\n    .field = value, ...}` is recognized even when the
+    /// struct body starts on a new line.
+    fn peekNextNonNewline(self: *const Parser) Token {
+        var i: usize = self.pos + 1;
+        while (i < self.tokens.len) {
+            const tok = self.tokens[i];
+            if (tok.tag == .newline or tok.tag == .semicolon) {
+                i += 1;
+                continue;
+            }
+            return tok;
+        }
+        return self.tokens[self.tokens.len - 1];
+    }
+
     fn advance(self: *Parser) Token {
         const tok = self.peek();
         if (self.pos < self.tokens.len) {
@@ -750,7 +766,7 @@ pub const Parser = struct {
             }
 
             if (tok.tag == .lbrace) {
-                if (self.peekNext().tag == .dot) {
+                if (self.peekNextNonNewline().tag == .dot) {
                     _ = self.advance();
                     left = self.parseStructInitBody(left);
                     continue;
