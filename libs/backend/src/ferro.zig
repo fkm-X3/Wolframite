@@ -967,19 +967,442 @@ pub fn applyRelocations(
     };
 }
 
+// ============================================================================
+// ELF64 executable writer (Linux)
+// ============================================================================
+
+const ElfIdent = packed struct {
+    magic0: u8 = 0x7f,
+    magic1: u8 = 'E',
+    magic2: u8 = 'L',
+    magic3: u8 = 'F',
+    class: u8 = 2,
+    data: u8 = 1,
+    version: u8 = 1,
+    os_abi: u8 = 0,
+    abi_version: u8 = 0,
+    pad0: u8 = 0,
+    pad1: u8 = 0,
+    pad2: u8 = 0,
+    pad3: u8 = 0,
+    pad4: u8 = 0,
+    pad5: u8 = 0,
+    pad6: u8 = 0,
+};
+
+const Elf64EhdrExec = packed struct {
+    e_ident: ElfIdent,
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+};
+comptime {
+    _ = @sizeOf(Elf64EhdrExec) == 64;
+}
+
+const Elf64Phdr = packed struct {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+};
+comptime {
+    _ = @sizeOf(Elf64Phdr) == 56;
+}
+
+const EtExec: u16 = 2;
+const PtLoad: u32 = 1;
+const PfR: u32 = 0x1;
+const PfW: u32 = 0x2;
+const PfX: u32 = 0x4;
+
+/// The Linux user-space entry point is `_start`, which Ferro synthesizes to
+/// call `_main` (the symbol Tungsten names as program entry). `_start` runs:
+///
+///     call _main          ; rel32 relocation against _main's merged address
+///     mov edi, eax        ; exit code = _main's return value
+///     mov eax, 60         ; sys_exit
+///     syscall
+///
+/// The `call _main` displacement is computed at write time against the stub's
+/// own address, so no external shim assembly is needed.
+fn buildLinuxStartStub(gpa: Allocator, main_addr: u64, stub_addr: u64) ![]u8 {
+    // call _main (E8 disp32) + mov edi,eax + mov eax,60 + syscall = 14 bytes.
+    var stub = try gpa.alloc(u8, 14);
+    stub[0] = 0xe8; // E8 = call rel32
+    const disp: i64 = @as(i64, @bitCast(main_addr)) - @as(i64, @bitCast(stub_addr)) - 5;
+    const disp_bytes = std.mem.asBytes(&disp);
+    for (0..4) |i| stub[1 + i] = disp_bytes[i];
+    stub[5] = 0x89; // mov edi, eax
+    stub[6] = 0xc7;
+    stub[7] = 0xb8; // mov eax, 60
+    stub[8] = 0x3c;
+    stub[9] = 0x00;
+    stub[10] = 0x00;
+    stub[11] = 0x00;
+    stub[12] = 0x0f; // syscall
+    stub[13] = 0x05;
+    return stub;
+}
+
+/// Write an ELF executable (ET_EXEC) whose entry `_start` calls `_main`.
+///
+/// Layout: ELF header (64) + 2x PT_LOAD program headers (.text R/X, .data R/W)
+/// + .text content (with `_start` appended) + .data content.
+///
+/// `entry_symbol_addr` is the merged-image address of `_main` (from
+/// `MergedImage.symbols`); `_start` is placed at the end of merged `.text`.
+fn writeExecutableElf(
+    image: *MergedImage,
+    entry_symbol_addr: u64,
+    gpa: Allocator,
+) ![]u8 {
+    const text = image.text;
+    const data = image.data;
+    const text_size = @as(u64, @intCast(text.len));
+    const data_size = @as(u64, @intCast(data.len));
+
+    // `_start` lives at the end of merged `.text` (relative offset `start_offset`);
+    // `_main` address comes from symbol resolution. Both are relative to image base
+    // 0, so the `call _main` displacement is `main_addr - start_offset - 5`; the
+    // vaddr base (0x400000) cancels at runtime.
+    const text_vaddr: u64 = 0x400000;
+    const start_offset = text_size;
+    const stub = try buildLinuxStartStub(gpa, entry_symbol_addr, start_offset);
+    defer gpa.free(stub);
+
+    const full_text_size = text_size + stub.len;
+    var full_text = try gpa.alloc(u8, full_text_size);
+    defer gpa.free(full_text);
+    for (text, 0..text.len) |b, i| full_text[i] = b;
+    for (stub, 0..stub.len) |b, i| full_text[text_size + i] = b;
+
+    const data_vaddr = text_vaddr + full_text_size;
+
+    const ehdr_size: u64 = 64;
+    const phdr_count: u64 = 2;
+    const phdr_size: u64 = 56 * phdr_count;
+    const text_file_off = ehdr_size + phdr_size;
+    const data_file_off = text_file_off + full_text_size;
+    const total_size = data_file_off + data_size;
+
+    var buf = try gpa.alloc(u8, total_size);
+    var pos: u64 = 0;
+
+    // ---- ELF header ----
+    const ehdr = Elf64EhdrExec{
+        .e_ident = .{},
+        .e_type = EtExec,
+        .e_machine = 62, // EM_X86_64
+        .e_version = 1,
+        .e_entry = text_vaddr + start_offset,
+        .e_phoff = ehdr_size,
+        .e_shoff = total_size, // section headers appended at end (optional)
+        .e_flags = 0,
+        .e_ehsize = 64,
+        .e_phentsize = 56,
+        .e_phnum = @intCast(phdr_count),
+        .e_shentsize = 64,
+        .e_shnum = 0,
+        .e_shstrndx = 0,
+    };
+    const ehdr_bytes = std.mem.asBytes(&ehdr);
+    for (0..ehdr_bytes.len) |i| {
+        buf[pos + @as(u64, i)] = ehdr_bytes[i];
+    }
+    pos += ehdr_size;
+
+    // ---- Program headers ----
+    // PT_LOAD .text: R+X
+    {
+        const ph = Elf64Phdr{
+            .p_type = PtLoad,
+            .p_flags = PfR | PfX,
+            .p_offset = text_file_off,
+            .p_vaddr = text_vaddr,
+            .p_paddr = text_vaddr,
+            .p_filesz = full_text_size,
+            .p_memsz = full_text_size,
+            .p_align = 0x1000,
+        };
+        const ph_bytes = std.mem.asBytes(&ph);
+        for (0..ph_bytes.len) |i| {
+            buf[pos + @as(u64, i)] = ph_bytes[i];
+        }
+        pos += 56;
+    }
+    // PT_LOAD .data: R+W (includes .bss in memsz)
+    {
+        const ph = Elf64Phdr{
+            .p_type = PtLoad,
+            .p_flags = PfR | PfW,
+            .p_offset = data_file_off,
+            .p_vaddr = data_vaddr,
+            .p_paddr = data_vaddr,
+            .p_filesz = data_size,
+            .p_memsz = data_size + image.bss_size,
+            .p_align = 0x1000,
+        };
+        const ph_bytes = std.mem.asBytes(&ph);
+        for (0..ph_bytes.len) |i| {
+            buf[pos + @as(u64, i)] = ph_bytes[i];
+        }
+        pos += 56;
+    }
+
+    // ---- .text content ----
+    for (full_text, 0..full_text.len) |b, i| {
+        buf[text_file_off + @as(u64, i)] = b;
+    }
+    // ---- .data content ----
+    for (data, 0..data.len) |b, i| {
+        buf[data_file_off + @as(u64, i)] = b;
+    }
+
+    return buf;
+}
+
+/// Write the buffer to `exe_path` (no extension on Linux).
+fn writeExecutableElfToFile(
+    io: std.Io,
+    exe_path: []const u8,
+    buf: []u8,
+) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = exe_path, .data = buf });
+}
+
+// ============================================================================
+// PE/COFF executable writer (Windows)
+// ============================================================================
+
+const PeMagic: u16 = 0x20b; // PE32+
+const PeSubsystemConsole: u16 = 3;
+const PeSubsystemGui: u16 = 2;
+const PeCharacteristicsExecImage: u16 = 0x0002;
+const PeCharacteristicsRelocsStripped: u16 = 0x0001;
+const PeSectionCount: u16 = 3; // .text, .data, .bss
+const PeSectionText: u16 = 0;
+const PeSectionData: u16 = 1;
+const PeSectionBss: u16 = 2;
+
+const PeFileAlign: u64 = 0x200;
+const PeSecAlign: u64 = 0x1000;
+const PeImageBase: u64 = 0x140000000;
+
+const PeSizeOfOptionalHeader: u16 = 240;
+const PeNumberOfRvaAndSizes: u32 = 16;
+const PeDataDirEntrySize: u64 = 8;
+
+fn alignUp(v: u64, aln: u64) u64 {
+    return (v + aln - 1) / aln * aln;
+}
+
+/// The Windows entry point `main` that Ferro synthesizes to call `_main`:
+///
+///     call _main      ; rel32 relocation against _main's merged address
+///     ret             ; return (clean exit handled by imports/runtime later)
+///
+/// `call _main`'s displacement is computed against the stub's own address, so
+/// no external shim assembly is needed. The image base cancels because both
+/// `_main` and the stub are relative to the same image base.
+fn buildWindowsMainStub(gpa: Allocator, main_rel_addr: u64, stub_rel_addr: u64) ![]u8 {
+    var stub = try gpa.alloc(u8, 6); // E8 disp32 + C3 ret
+    stub[0] = 0xe8; // E8 = call rel32
+    const disp: i64 = @as(i64, @bitCast(main_rel_addr)) - @as(i64, @bitCast(stub_rel_addr)) - 5;
+    const disp_bytes = std.mem.asBytes(&disp);
+    for (0..4) |i| stub[1 + i] = disp_bytes[i];
+    stub[5] = 0xc3; // ret
+    return stub;
+}
+
+fn putU16At(buf: []u8, pos: u64, v: u16) void {
+    buf[pos] = @truncate(v);
+    buf[pos + 1] = @truncate(v >> 8);
+}
+
+fn putU32At(buf: []u8, pos: u64, v: u32) void {
+    buf[pos] = @truncate(v);
+    buf[pos + 1] = @truncate(v >> 8);
+    buf[pos + 2] = @truncate(v >> 16);
+    buf[pos + 3] = @truncate(v >> 24);
+}
+
+fn putU64At(buf: []u8, pos: u64, v: u64) void {
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) {
+        buf[pos + @as(u64, i)] = @truncate(v >> (i * 8));
+    }
+}
+
+fn writeExecutablePe(
+    image: *MergedImage,
+    entry_symbol_addr: u64,
+    subsystem: Subsystem,
+    gpa: Allocator,
+) ![]u8 {
+    const text = image.text;
+    const data = image.data;
+    const text_size = @as(u64, @intCast(text.len));
+    const data_size = @as(u64, @intCast(data.len));
+
+    const text_sec_vaddr: u64 = PeSecAlign;
+    const stub_rel_addr = text_sec_vaddr + text_size;
+    const stub = try buildWindowsMainStub(gpa, entry_symbol_addr, stub_rel_addr);
+    defer gpa.free(stub);
+
+    const full_text_size = text_size + stub.len;
+
+    const headers_raw_size: u64 = 64 + 4 + 20 + @as(u64, PeSizeOfOptionalHeader) + @as(u64, PeSectionCount) * 40;
+    const size_of_headers = alignUp(headers_raw_size, PeFileAlign);
+
+    const text_file_off = size_of_headers;
+    const data_file_off = alignUp(text_file_off + full_text_size, PeFileAlign);
+    const total_file_size = alignUp(data_file_off + data_size, PeFileAlign);
+
+    const text_sec_vaddr_final = text_sec_vaddr;
+    const data_sec_vaddr = alignUp(text_sec_vaddr_final + full_text_size, PeSecAlign);
+    const bss_sec_vaddr = alignUp(data_sec_vaddr + data_size, PeSecAlign);
+    const size_of_image = alignUp(bss_sec_vaddr + image.bss_size, PeSecAlign);
+
+    const subsystem_val = if (subsystem == .gui) PeSubsystemGui else PeSubsystemConsole;
+    const address_of_entry_point = PeImageBase + stub_rel_addr;
+
+    var buf = try gpa.alloc(u8, total_file_size);
+    for (buf) |*b| b.* = 0;
+    var pos: u64 = 0;
+
+    buf[0] = 'M'; buf[1] = 'Z';
+    putU32At(buf, 60, 64); // e_lfanew = offset to PE signature
+    pos = 64;
+
+    // ---- PE signature "PE\0\0" ----
+    buf[pos] = 'P'; buf[pos + 1] = 'E'; buf[pos + 2] = 0; buf[pos + 3] = 0;
+    pos += 4;
+
+    // ---- COFF file header (20 bytes) ----
+    putU16At(buf, pos, 0x8664); pos += 2; // machine
+    putU16At(buf, pos, PeSectionCount); pos += 2;
+    putU32At(buf, pos, 0); pos += 4; // time_date_stamp
+    putU32At(buf, pos, 0); pos += 4; // pointer_to_symbol_table
+    putU32At(buf, pos, 0); pos += 4; // number_of_symbols
+    putU16At(buf, pos, PeSizeOfOptionalHeader); pos += 2;
+    putU16At(buf, pos, PeCharacteristicsExecImage | PeCharacteristicsRelocsStripped); pos += 2;
+
+    // ---- Optional header (PE32+, 240 bytes) ----
+    putU16At(buf, pos, PeMagic); pos += 2; // magic
+    pos += 2; // linker version (major/minor = 0)
+    putU32At(buf, pos, @as(u32, @intCast(full_text_size))); pos += 4; // size_of_code
+    putU32At(buf, pos, @as(u32, @intCast(data_size))); pos += 4; // size_of_initialized_data
+    putU32At(buf, pos, @intCast(image.bss_size)); pos += 4; // size_of_uninitialized_data
+    putU32At(buf, pos, @as(u32, @intCast(address_of_entry_point & 0xFFFF_FFFF))); pos += 4; // address_of_entry_point (low 32)
+    putU32At(buf, pos, @as(u32, @intCast(text_sec_vaddr_final))); pos += 4; // base_of_code
+    putU64At(buf, pos, PeImageBase); pos += 8; // image_base
+    putU32At(buf, pos, PeSecAlign); pos += 4; // section_alignment
+    putU32At(buf, pos, PeFileAlign); pos += 4; // file_alignment
+    pos += 6; // os version (major/minor) + image version (major/minor) = 0
+    pos += 4; // win32_version_value = 0
+    putU32At(buf, pos, @as(u32, @intCast(size_of_image))); pos += 4; // size_of_image
+    putU32At(buf, pos, @as(u32, @intCast(size_of_headers))); pos += 4; // size_of_headers
+    putU32At(buf, pos, 0); pos += 4; // checksum
+    putU16At(buf, pos, subsystem_val); pos += 2; // subsystem
+    putU16At(buf, pos, 0); pos += 2; // dll_characteristics
+    putU64At(buf, pos, 0x100000); pos += 8; // size_of_stack_reserve
+    putU64At(buf, pos, 0x1000); pos += 8; // size_of_stack_commit
+    putU64At(buf, pos, 0x100000); pos += 8; // size_of_heap_reserve
+    putU64At(buf, pos, 0x1000); pos += 8; // size_of_heap_commit
+    putU32At(buf, pos, 0); pos += 4; // loader_flags
+    putU32At(buf, pos, PeNumberOfRvaAndSizes); pos += 4; // number_of_rva_and_sizes
+    // data directories: 16 x 8 bytes = 128 bytes, all zero (already zeroed)
+    pos += PeNumberOfRvaAndSizes * PeDataDirEntrySize;
+
+    // ---- Section table (3 x 40 bytes) ----
+    const sec_names = [_][]const u8{ ".text", ".data", ".bss" };
+    const sec_characteristics = [_]u32{
+        0x60000020, // .text: CNT_CODE | MEM_EXECUTE | MEM_READ
+        0x60000040, // .data: CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+        0x80000080, // .bss: CNT_UNINITIALIZED_DATA | MEM_READ | MEM_WRITE
+    };
+    const sec_vaddrs = [_]u64{ text_sec_vaddr_final, data_sec_vaddr, bss_sec_vaddr };
+    const sec_vsizes = [_]u64{ full_text_size, data_size, image.bss_size };
+    const sec_file_offs = [_]u64{ text_file_off, data_file_off, 0 };
+    const sec_raw_sizes = [_]u64{ full_text_size, data_size, 0 };
+
+    var si: usize = 0;
+    while (si < @as(usize, @intCast(PeSectionCount))) : (si += 1) {
+        const soff = pos + @as(u64, si) * 40;
+        for (0..8) |k| {
+            buf[soff + @as(u64, k)] = if (k < sec_names[si].len) sec_names[si][k] else 0;
+        }
+        putU32At(buf, soff + 8, @as(u32, @intCast(sec_vsizes[si])));       // virtual_size
+        putU32At(buf, soff + 12, @as(u32, @intCast(sec_vaddrs[si])));      // virtual_address
+        putU32At(buf, soff + 16, @as(u32, @intCast(sec_raw_sizes[si])));   // size_of_raw_data
+        putU32At(buf, soff + 20, if (sec_raw_sizes[si] == 0) 0 else @as(u32, @intCast(sec_file_offs[si]))); // pointer_to_raw_data
+        putU32At(buf, soff + 24, 0); // pointer_to_relocations (unused)
+        putU32At(buf, soff + 28, 0); // pointer_to_line_numbers
+        putU16At(buf, soff + 32, 0); // number_of_relocations
+        putU16At(buf, soff + 34, 0); // number_of_line_numbers
+        putU32At(buf, soff + 36, sec_characteristics[si]); // characteristics
+    }
+    pos = headers_raw_size; // section table ends at headers_raw_size
+
+    // ---- .text raw data (program .text + main stub) ----
+    for (text, 0..text.len) |b, i| {
+        buf[text_file_off + @as(u64, i)] = b;
+    }
+    for (stub, 0..stub.len) |b, i| {
+        buf[text_file_off + text_size + @as(u64, i)] = b;
+    }
+    // ---- .data raw data ----
+    for (data, 0..data.len) |b, i| {
+        buf[data_file_off + @as(u64, i)] = b;
+    }
+
+    return buf;
+}
+
+// ============================================================================
+// Executable writer dispatch
+// ============================================================================
+
 /// Synthesize the platform entry point and write the final executable.
 ///
-/// Stub: returns `ExecutableWriterUnimplemented`. The real implementation
-/// writes an ELF executable (Linux, with program headers / interpreter) or a
-/// PE executable (Windows) whose entry calls `options.entry_symbol`.
+/// Linux: entry `_start` (at end of merged `.text`) calls `_main`.
+/// Windows: entry `main` (at end of merged `.text`) calls `_main` per subsystem.
 pub fn writeExecutable(
-    _: *MergedImage,
-    _: []const u8,
-    _: LinkOptions,
-    _: Allocator,
-    _: std.Io,
+    image: *MergedImage,
+    exe_path: []const u8,
+    options: LinkOptions,
+    gpa: Allocator,
+    io: std.Io,
 ) !void {
-    return error.ExecutableWriterUnimplemented;
+    const main_addr = image.symbols.get(options.entry_symbol) orelse return error.UndefinedSymbol;
+
+    switch (options.target) {
+        .linux_x86_64 => {
+            const buf = try writeExecutableElf(image, main_addr.value, gpa);
+            defer gpa.free(buf);
+            try writeExecutableElfToFile(io, exe_path, buf);
+        },
+        .windows_x86_64 => {
+            const buf = try writeExecutablePe(image, main_addr.value, options.subsystem, gpa);
+            defer gpa.free(buf);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = exe_path, .data = buf });
+        },
+    }
 }
 
 /// Link `object_path` (a Tungsten-emitted object) with the Wolframite runtime
@@ -1425,4 +1848,186 @@ test "resolveSymbols reports UndefinedSymbol when the runtime does not define it
     } else |err| {
         try std.testing.expectEqual(LinkError.UndefinedSymbol, err);
     }
+}
+
+test "writeExecutableElf produces an ELF executable whose _start calls _main" {
+    const gpa = std.testing.allocator;
+
+    // Merged image: _main at relative address 42, 2 bytes of program .text.
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+    defer symbols.deinit();
+    try symbols.put("_main", .{ .section = ".text", .value = 42 });
+
+    var prog_text = [_]u8{ 0x90, 0x90 };
+    var prog_data = [_]u8{};
+    var image = MergedImage{
+        .text = &prog_text,
+        .data = &prog_data,
+        .bss_size = 0,
+        .symbols = symbols,
+    };
+
+    const buf = try writeExecutableElf(&image, 42, gpa);
+    defer gpa.free(buf);
+
+    // ELF header: ET_EXEC executable, x86-64.
+    try std.testing.expectEqualSlices(u8, buf[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+    try std.testing.expectEqual(2, readU16(buf, 16));      // e_type = ET_EXEC
+    try std.testing.expectEqual(62, readU16(buf, 18));     // e_machine = EM_X86_64
+    // e_entry = vaddr of _start = 0x400000 + start_offset(2) = 0x400002.
+    try std.testing.expectEqual(0x400002, readU64(buf, 24));
+
+    // Two PT_LOAD program headers at offset 64.
+    try std.testing.expectEqual(1, readU32(buf, 64 + 0));  // p_type = PT_LOAD (.text)
+    try std.testing.expectEqual(1, readU32(buf, 64 + 56)); // p_type = PT_LOAD (.data)
+
+    // .text content at file offset 64 + 2*56 = 176, followed by the _start stub.
+    const text_file_off: u64 = 64 + 2 * 56;
+    try std.testing.expectEqualSlices(u8, buf[text_file_off..text_file_off + 2], &[_]u8{ 0x90, 0x90 });
+
+    const stub_off = text_file_off + 2;
+    try std.testing.expectEqual(0xe8, buf[stub_off]); // E8 = call rel32
+    // disp = main_addr(42) - start_offset(2) - 5 = 35 = 0x23 (little-endian).
+    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x23, 0x00, 0x00, 0x00 });
+    // mov edi,eax; mov eax,60; syscall
+    try std.testing.expectEqualSlices(
+        u8,
+        buf[stub_off + 5..stub_off + 14],
+        &[_]u8{ 0x89, 0xc7, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05 },
+    );
+}
+
+test "writeExecutable reports UndefinedSymbol when entry symbol is absent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+    defer symbols.deinit();
+    var prog_text = [_]u8{ 0x90 };
+    var prog_data = [_]u8{};
+    var image = MergedImage{
+        .text = &prog_text,
+        .data = &prog_data,
+        .bss_size = 0,
+        .symbols = symbols,
+    };
+    const opts = defaultLinkOptions(.linux_x86_64);
+    if (writeExecutable(&image, "no-such-entry.exe", opts, gpa, io)) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(LinkError.UndefinedSymbol, err);
+    }
+}
+
+test "linkObject writes an ELF executable whose entry _start calls _main" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_elf = @import("obj_elf.zig");
+
+    // Program object: _main (ret) in .text, puts undefined.
+    var prog_text = [_]u8{ 0xc3 };
+    const prog_symbols = &.{
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_input = obj_elf.ObjectInput{
+        .text = &prog_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var prog_w = obj_elf.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "ferro_entry_prog.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    // Runtime object: puts (nop) defined in .text.
+    const rt_text = [_]u8{ 0x90 };
+    const rt_symbols = &.{
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_elf.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var rt_w = obj_elf.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "ferro_entry_rt.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    const exe_path = "ferro_entry.exe";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, exe_path) catch {};
+
+    const opts = defaultLinkOptions(.linux_x86_64);
+    try linkObject(io, gpa, prog_path, rt_path, exe_path, opts);
+
+    const exe_bytes = try std.Io.Dir.cwd().readFileAlloc(io, exe_path, gpa, .unlimited);
+    defer gpa.free(exe_bytes);
+
+    try std.testing.expectEqualSlices(u8, exe_bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+    try std.testing.expectEqual(2, readU16(exe_bytes, 16)); // ET_EXEC
+    // e_entry = 0x400000 + start_offset. merged .text = prog(1) + rt(1) = 2, _start at offset 2.
+    try std.testing.expectEqual(0x400002, readU64(exe_bytes, 24));
+
+    const text_file_off: u64 = 64 + 2 * 56;
+    const stub_off = text_file_off + 2; // after 2 bytes of merged .text
+    try std.testing.expectEqual(0xe8, exe_bytes[stub_off]); // call rel32
+    // disp = main_addr(0) - start_offset(2) - 5 = -7 = 0xfffffff9 (little-endian: f9 ff ff ff).
+    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
+}
+
+test "writeExecutablePe produces a PE executable whose main calls _main" {
+    const gpa = std.testing.allocator;
+
+    // Merged image: _main at relative address 10, 1 byte of program .text.
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+    defer symbols.deinit();
+    try symbols.put("_main", .{ .section = ".text", .value = 10 });
+
+    var prog_text = [_]u8{ 0x90 };
+    var prog_data = [_]u8{};
+    var image = MergedImage{
+        .text = &prog_text,
+        .data = &prog_data,
+        .bss_size = 0,
+        .symbols = symbols,
+    };
+
+    const buf = try writeExecutablePe(&image, 10, .console, gpa);
+    defer gpa.free(buf);
+
+    // DOS header + e_lfanew pointing at the PE signature.
+    try std.testing.expectEqualSlices(u8, buf[0..2], &[_]u8{ 'M', 'Z' });
+    try std.testing.expectEqual(64, readU32(buf, 60)); // e_lfanew = offset to "PE\0\0"
+
+    // PE signature + COFF file header.
+    try std.testing.expectEqualSlices(u8, buf[64..68], &[_]u8{ 'P', 'E', 0, 0 });
+    try std.testing.expectEqual(0x8664, readU16(buf, 68)); // machine = AMD64
+
+    // Optional header (PE32+): magic 0x20b at offset 88.
+    try std.testing.expectEqual(0x20b, readU16(buf, 88)); // magic = PE32+
+    // AddressOfEntryPoint at optional header + 16 = 104.
+    try std.testing.expectEqual(0x40001001, readU32(buf, 104)); // image_base(0x140000000) low32 + stub_rel_addr(0x1001)
+
+    // .text raw data at file offset size_of_headers = alignUp(448, 512) = 512.
+    const text_file_off: u64 = 512;
+    try std.testing.expectEqual(0x90, buf[text_file_off]); // program byte
+    // main stub right after: E8 disp32 + C3 ret.
+    const stub_off = text_file_off + 1;
+    try std.testing.expectEqual(0xe8, buf[stub_off]); // E8 = call rel32
+    // disp = main_rel_addr(10) - stub_rel_addr(0x1001) - 5 = -4092 = 0xfffff004 (LE: 04 f0 ff ff).
+    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x04, 0xf0, 0xff, 0xff });
+    try std.testing.expectEqual(0xc3, buf[stub_off + 5]); // C3 = ret
 }
