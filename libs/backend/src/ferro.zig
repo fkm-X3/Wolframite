@@ -1988,6 +1988,91 @@ test "linkObject writes an ELF executable whose entry _start calls _main" {
     try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
 }
 
+test "linkObject writes a PE executable whose entry main calls _main" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_pe = @import("obj_pe.zig");
+
+    // Program object: _main (ret) in .text, puts undefined.
+    var prog_text = [_]u8{ 0xc3 };
+    const prog_symbols = &.{
+        obj_pe.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = true },
+        obj_pe.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_input = obj_pe.ObjectInput{
+        .text = &prog_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = &[_]obj_pe.Reloc{},
+    };
+    var prog_w = obj_pe.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "ferro_link_pe_prog.obj";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    // Runtime object: puts (nop) defined in .text.
+    const rt_text = [_]u8{ 0x90 };
+    const rt_symbols = &.{
+        obj_pe.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_pe.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_pe.Reloc{},
+    };
+    var rt_w = obj_pe.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "ferro_link_pe_rt.obj";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    const exe_path = "ferro_link_pe.exe";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, exe_path) catch {};
+
+    const opts = defaultLinkOptions(.windows_x86_64);
+    try linkObject(io, gpa, prog_path, rt_path, exe_path, opts);
+
+    const exe_bytes = try std.Io.Dir.cwd().readFileAlloc(io, exe_path, gpa, .unlimited);
+    defer gpa.free(exe_bytes);
+
+    // DOS header + e_lfanew pointing at the PE signature.
+    try std.testing.expectEqualSlices(u8, exe_bytes[0..2], &[_]u8{ 'M', 'Z' });
+    try std.testing.expectEqual(64, readU32(exe_bytes, 60));
+
+    // PE signature + COFF file header.
+    try std.testing.expectEqualSlices(u8, exe_bytes[64..68], &[_]u8{ 'P', 'E', 0, 0 });
+    try std.testing.expectEqual(0x8664, readU16(exe_bytes, 68)); // machine = AMD64
+
+    // Optional header (PE32+): magic 0x20b at offset 88.
+    try std.testing.expectEqual(0x20b, readU16(exe_bytes, 88)); // magic = PE32+
+    // AddressOfEntryPoint at optional header + 16 = 104.
+    // image_base low32 (0x40000000) + stub_rel_addr(0x1002) = 0x40001002.
+    try std.testing.expectEqual(0x40001002, readU32(exe_bytes, 104));
+
+    // .text raw data at file offset size_of_headers = alignUp(448, 512) = 512.
+    // merged .text = prog(1 byte ret) + rt(1 byte nop) = 2 bytes.
+    const text_file_off: u64 = 512;
+    try std.testing.expectEqual(0xc3, exe_bytes[text_file_off]); // program byte (ret)
+    try std.testing.expectEqual(0x90, exe_bytes[text_file_off + 1]); // runtime byte (nop)
+    // main stub right after: E8 disp32 + C3 ret.
+    const stub_off = text_file_off + 2;
+    try std.testing.expectEqual(0xe8, exe_bytes[stub_off]); // E8 = call rel32
+    // disp = main_rel_addr(0) - stub_rel_addr(0x1002) - 5 = -4103 = 0xffffeff9 (LE: f9 ef ff ff).
+    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xef, 0xff, 0xff });
+    try std.testing.expectEqual(0xc3, exe_bytes[stub_off + 5]); // C3 = ret
+}
+
 test "writeExecutablePe produces a PE executable whose main calls _main" {
     const gpa = std.testing.allocator;
 
