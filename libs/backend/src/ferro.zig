@@ -193,6 +193,9 @@ pub const Binding = enum(u8) {
 
 /// A relocation record parsed from an object file.
 pub const Relocation = struct {
+    /// Section index the relocation applies to (1 = .text, 2 = .data, matching
+    /// the codegen/`ObjectInput` convention; section 0 is undefined/null).
+    section_idx: u16,
     /// Offset within the section where the relocated bytes live.
     offset: u64,
     symbol: []const u8,
@@ -270,8 +273,23 @@ pub const ResolvedSymbols = struct {
 };
 
 /// Relocations applied and sections merged into output sections.
+///
+/// `text` and `data` are owned buffers (allocated with `gpa`) holding the
+/// merged `.text` and `.data` contents (program object first, then runtime
+/// object). `bss_size` is the merged `.bss` size (no file bytes). `symbols`
+/// maps each defined symbol name to its final address in the merged image,
+/// used by the executable writer to wire the entry point.
 pub const MergedImage = struct {
-    pub fn deinit(_: *MergedImage, _: Allocator) void {}
+    text: []u8,
+    data: []u8,
+    bss_size: u64,
+    symbols: std.StringHashMap(ResolvedSymbol),
+
+    pub fn deinit(self: *MergedImage, gpa: Allocator) void {
+        gpa.free(self.text);
+        gpa.free(self.data);
+        self.symbols.deinit();
+    }
 };
 
 // ============================================================================
@@ -516,12 +534,12 @@ fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
                 else => .addr64,
             };
             try obj.relocations.append(gpa, .{
+                .section_idx = @as(u16, @intCast(target_sec_idx)),
                 .offset = r_offset,
                 .symbol = sym_name,
                 .kind = kind,
                 .addend = r_addend,
             });
-            _ = target_sec_idx;
         }
     }
 
@@ -632,6 +650,7 @@ fn readCoffObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
                 else => .addr64,
             };
             try obj.relocations.append(gpa, .{
+                .section_idx = @truncate(si + 1), // COFF sections are 1-based
                 .offset = r_offset,
                 .symbol = sym_name,
                 .kind = kind,
@@ -749,12 +768,203 @@ pub fn resolveSymbols(
     return result;
 }
 
+/// Find a section by name in `obj`, or null if absent.
+fn findSectionByName(obj: *Object, name: []const u8) ?*Section {
+    for (obj.sections.items) |*sec| {
+        if (std.mem.eql(u8, sec.name, name)) return sec;
+    }
+    return null;
+}
+
+/// Size of a named section in `obj`, or 0 if absent.
+fn sectionSize(obj: *Object, name: []const u8) u64 {
+    const sec = findSectionByName(obj, name) orelse return 0;
+    return sec.size;
+}
+
+/// Apply a single relocation to `buf` (merged .text or .data).
+///
+/// `section_base` is the merged-image address where `buf` starts.
+/// `symbols` maps symbol names to their merged addresses.
+fn applyReloc(
+    rel: *const Relocation,
+    section_base: u64,
+    buf: []u8,
+    symbols: *std.StringHashMap(ResolvedSymbol),
+) !void {
+    const sym_addr = symbols.get(rel.symbol) orelse return error.RelocationFailed;
+    const s = sym_addr.value;
+    const p = section_base + rel.offset;
+    const off = @as(usize, rel.offset);
+
+    switch (rel.kind) {
+        .pc32 => {
+            // S + A - P, sign-extended to 64, must fit in i32.
+            const s_i64: i64 = @intCast(s);
+            const p_i64: i64 = @intCast(p);
+            const disp: i64 = s_i64 + rel.addend - p_i64;
+            if (disp < @as(i64, std.math.minInt(i32)) or disp > @as(i64, std.math.maxInt(i32))) {
+                return error.RelocationFailed;
+            }
+            if (off + 4 > buf.len) return error.RelocationFailed;
+            const disp_i32: i32 = @intCast(disp);
+            const bytes = std.mem.asBytes(&disp_i32);
+            for (bytes, 0..4) |b, i| {
+                buf[off + i] = b;
+            }
+        },
+        .addr64 => {
+            // S + A.
+            const addend_u64: u64 = @intCast(rel.addend);
+            const abs: u64 = s + addend_u64;
+            if (off + 8 > buf.len) return error.RelocationFailed;
+            const bytes = std.mem.asBytes(&abs);
+            for (bytes, 0..8) |b, i| {
+                buf[off + i] = b;
+            }
+        },
+    }
+}
+
 /// Apply relocations and merge `.text`/`.data`/`.bss` from program object
 /// and runtime into output sections.
 ///
-/// Stub: returns `RelocationUnimplemented`.
-pub fn applyRelocations(_: *ResolvedSymbols, _: Allocator) !MergedImage {
-    return error.RelocationUnimplemented;
+/// Merged layout (relative addresses starting at 0):
+///   .text: [0, merged_text_size)        — program .text, then runtime .text
+///   .data: [merged_text_size, ...)      — program .data, then runtime .data
+///   .bss:  zero-initialized, size = sum of both .bss sizes
+///
+/// Returns `RelocationFailed` if a referenced symbol is undefined or a PC32
+/// displacement is out of range.
+pub fn applyRelocations(
+    program: *Object,
+    runtime: *Object,
+    resolved: *ResolvedSymbols,
+    gpa: Allocator,
+) !MergedImage {
+    // ---- Locate sections ----
+    const prog_text = findSectionByName(program, ".text") orelse return error.ObjectReadFailed;
+    const prog_data = findSectionByName(program, ".data") orelse return error.ObjectReadFailed;
+    const rt_text = findSectionByName(runtime, ".text") orelse return error.ObjectReadFailed;
+    const rt_data = findSectionByName(runtime, ".data") orelse return error.ObjectReadFailed;
+
+    const prog_text_size = prog_text.size;
+    const prog_data_size = prog_data.size;
+    const rt_text_size = rt_text.size;
+    const rt_data_size = rt_data.size;
+    const prog_bss_size = sectionSize(program, ".bss");
+    const rt_bss_size = sectionSize(runtime, ".bss");
+
+    // Merged layout (relative addresses starting at 0).
+    const merged_text_size = prog_text_size + rt_text_size;
+    const data_base = merged_text_size; // .data starts right after .text
+    const merged_data_size = prog_data_size + rt_data_size;
+    const merged_bss_size = prog_bss_size + rt_bss_size;
+
+    // ---- Build merged .text ----
+    var merged_text = try gpa.alloc(u8, merged_text_size);
+    if (prog_text_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, prog_text_size)) : (i += 1) {
+            merged_text[i] = prog_text.content[i];
+        }
+    }
+    if (rt_text_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, rt_text_size)) : (i += 1) {
+            merged_text[@as(usize, prog_text_size) + i] = rt_text.content[i];
+        }
+    }
+
+    // ---- Build merged .data ----
+    var merged_data = try gpa.alloc(u8, merged_data_size);
+    if (prog_data_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, prog_data_size)) : (i += 1) {
+            merged_data[i] = prog_data.content[i];
+        }
+    }
+    if (rt_data_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, rt_data_size)) : (i += 1) {
+            merged_data[@as(usize, prog_data_size) + i] = rt_data.content[i];
+        }
+    }
+
+    // ---- Build symbol address map ----
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+
+    // Program-defined symbols (.text / .data only).
+    for (program.symbols.items) |sym| {
+        if (sym.section == null) continue;
+        const sec = sym.section.?;
+        var addr: u64 = 0;
+        if (std.mem.eql(u8, sec, ".text")) {
+            addr = sym.value;
+        } else if (std.mem.eql(u8, sec, ".data")) {
+            addr = data_base + sym.value;
+        } else {
+            continue;
+        }
+        if (symbols.get(sym.name) == null) {
+            try symbols.put(sym.name, .{ .section = sec, .value = addr });
+        }
+    }
+
+    // Runtime-defined symbols (.text / .data only). First definition wins.
+    for (runtime.symbols.items) |sym| {
+        if (sym.section == null) continue;
+        const sec = sym.section.?;
+        var addr: u64 = 0;
+        if (std.mem.eql(u8, sec, ".text")) {
+            addr = prog_text_size + sym.value;
+        } else if (std.mem.eql(u8, sec, ".data")) {
+            addr = data_base + prog_data_size + sym.value;
+        } else {
+            continue;
+        }
+        if (symbols.get(sym.name) == null) {
+            try symbols.put(sym.name, .{ .section = sec, .value = addr });
+        }
+    }
+
+    // Resolved undefined program symbols -> point to runtime definitions,
+    // adjusted to merged addresses.
+    var iter = resolved.resolved.iterator();
+    while (iter.next()) |node| {
+        const name = node.key_ptr.*;
+        const rt_addr = node.value_ptr.*;
+        var addr: u64 = 0;
+        if (std.mem.eql(u8, rt_addr.section, ".text")) {
+            addr = prog_text_size + rt_addr.value;
+        } else if (std.mem.eql(u8, rt_addr.section, ".data")) {
+            addr = data_base + prog_data_size + rt_addr.value;
+        } else {
+            continue;
+        }
+        try symbols.put(name, .{ .section = rt_addr.section, .value = addr });
+    }
+
+    // ---- Apply relocations: program object ----
+    for (program.relocations.items) |rel| {
+        const buf = if (rel.section_idx == 1) merged_text else merged_data;
+        const base = if (rel.section_idx == 1) @as(u64, 0) else data_base;
+        try applyReloc(&rel, base, buf, &symbols);
+    }
+
+    // ---- Apply relocations: runtime object ----
+    for (runtime.relocations.items) |rel| {
+        const buf = if (rel.section_idx == 1) merged_text else merged_data;
+        const base = if (rel.section_idx == 1) prog_text_size else data_base + prog_data_size;
+        try applyReloc(&rel, base, buf, &symbols);
+    }
+
+    return MergedImage{
+        .text = merged_text,
+        .data = merged_data,
+        .bss_size = merged_bss_size,
+        .symbols = symbols,
+    };
 }
 
 /// Synthesize the platform entry point and write the final executable.
@@ -806,7 +1016,7 @@ pub fn linkObject(
     var resolved = try resolveSymbols(&object, &runtime, options.entry_symbol, gpa);
     defer resolved.deinit(gpa);
 
-    var image = try applyRelocations(&resolved, gpa);
+    var image = try applyRelocations(&object, &runtime, &resolved, gpa);
     defer image.deinit(gpa);
 
     try writeExecutable(&image, exe_path, options, gpa, io);
