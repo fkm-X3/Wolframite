@@ -129,9 +129,8 @@ pub const CodeGen = struct {
 
         // Emit globals first so their addresses are known when referenced.
         if (self.module.globals.items.len > 0) {
-            for (self.module.globals.items, 0..) |global, i| {
-                const gname = try std.fmt.allocPrint(self.gpa, "__g{d}", .{i});
-                defer self.gpa.free(gname);
+            for (self.module.globals.items) |global| {
+                const gname = self.module.strings.get(global.name);
                 const data_off = @as(u64, @intCast(self.obj_data.items.len));
                 switch (global.kind) {
                     .string => |data| {
@@ -151,7 +150,6 @@ pub const CodeGen = struct {
                         for (funcs, 0..) |func_idx, j| {
                             const fname = self.module.strings.get(self.module.functions.items[func_idx].name);
                             const symbol = try std.fmt.allocPrint(self.gpa, "_{s}", .{fname});
-                            defer self.gpa.free(symbol);
                             try self.obj_data.appendSlice(self.gpa, &[_]u8{0,0,0,0,0,0,0,0});
                             const entry_off = data_off + @as(u64, @intCast(j)) * 8;
                             try self.relocData(entry_off, symbol, .addr64, 0);
@@ -173,7 +171,6 @@ pub const CodeGen = struct {
         for (self.module.externs.items) |ext| {
             const ename = self.module.strings.get(ext.name);
             const name = try self.gpa.dupe(u8, ename);
-            defer self.gpa.free(name);
             try self.obj_symbols.append(self.gpa, .{
                 .name = name,
                 .section_idx = 0, // SHN_UNDEF / COFF undefined
@@ -205,7 +202,6 @@ pub const CodeGen = struct {
 
         const name = self.module.strings.get(func.name);
         const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{name});
-        defer self.gpa.free(fname);
 
         const func_start = @as(u64, @intCast(self.obj_text.items.len));
         try self.obj_symbols.append(self.gpa, .{
@@ -346,7 +342,6 @@ pub const CodeGen = struct {
     /// Record a relocation site in .text at the current end of obj_text.
     fn relocText(self: *@This(), symbol: []const u8, kind: ferro.RelocKind, addend: i64) !void {
         const name = try self.gpa.dupe(u8, symbol);
-        defer self.gpa.free(name);
         try self.obj_relocs.append(self.gpa, .{
             .section_idx = 0,
             .offset = @as(u64, @intCast(self.obj_text.items.len)),
@@ -359,7 +354,6 @@ pub const CodeGen = struct {
     /// Record a relocation site in .data at the given offset.
     fn relocData(self: *@This(), offset: u64, symbol: []const u8, kind: ferro.RelocKind, addend: i64) !void {
         const name = try self.gpa.dupe(u8, symbol);
-        defer self.gpa.free(name);
         try self.obj_relocs.append(self.gpa, .{
             .section_idx = 1,
             .offset = offset,
@@ -661,7 +655,6 @@ pub const CodeGen = struct {
                 const target_func = &self.module.functions.items[ops[0]];
                 const target_name = self.module.strings.get(target_func.name);
                 const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{target_name});
-                defer self.gpa.free(fname);
                 // lea rax, [rel _{name}] (relocation)
                 try self.o8(0x48);
                 try self.o8(0x8d);
@@ -678,7 +671,6 @@ pub const CodeGen = struct {
                 const target_func = &self.module.functions.items[ops[0]];
                 const target_name = self.module.strings.get(target_func.name);
                 const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{target_name});
-                defer self.gpa.free(fname);
                 const arg_count: u32 = @intCast(ops.len - 1);
                 const extra_stack = try self.emitCallSetupObject(ops, arg_count);
                 // call _{name} (relocation)

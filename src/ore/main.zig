@@ -7,9 +7,11 @@
 //! the compiler) from GitHub (`update`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+const ferro = @import("Tungsten").ferro;
 const manifest_mod = @import("manifest.zig");
 const compile_mod = @import("compile.zig");
 const link_mod = @import("link.zig");
@@ -166,7 +168,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, mode, .linux_x86_64) catch |err| {
+    const result = compile_mod.compile(gpa, source, mode, hostTarget()) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -193,7 +195,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return 0;
         },
         .@"obj" => {
-            const obj_path = out_path orelse try replaceExt(gpa, source_path, "o");
+            const obj_path = out_path orelse try replaceExt(gpa, source_path, hostObjectExt());
             if ((try writeBinaryFile(io, obj_path, result.text.?)) != 0) return 1;
             printOut(io, "wrote {s}\n", .{obj_path});
             return 0;
@@ -265,7 +267,7 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, .@"asm", .linux_x86_64) catch |err| {
+    const result = compile_mod.compile(gpa, source, .@"asm", hostTarget()) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -443,6 +445,25 @@ fn printUpdateHelp(io: Io) void {
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+/// The `ferro.Target` for the host OS ore is running on. The backend only
+/// supports x86-64 Linux and Windows; anything else falls back to Linux.
+fn hostTarget() ferro.Target {
+    return switch (builtin.os.tag) {
+        .windows => .windows_x86_64,
+        .linux => .linux_x86_64,
+        else => .linux_x86_64,
+    };
+}
+
+/// Default object-file extension for the host OS: `.obj` on Windows, `.o`
+/// elsewhere.
+fn hostObjectExt() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "obj",
+        else => "o",
+    };
+}
 
 /// Resolve the source file to compile: an explicit path, else the `entry`
 /// from `ore.toml`. Returns `null` (after reporting) when neither exists.

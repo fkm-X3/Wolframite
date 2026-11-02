@@ -298,7 +298,7 @@ pub fn build(b: *std.Build) void {
     // `%USERPROFILE%\wolframite\bin` (ore/Wolframite) and `%USERPROFILE%\wolframite\lib`
     // (wfr_std) on Windows, `/usr/local/bin` + `/usr/local/wolframite/lib` on Linux.
     const install_compiler_step = b.step("install-compiler", "Install Wolframite, ore, and the wfr_std runtime");
-    addInstallCompilerStep(install_compiler_step, &.{ exe, ore_exe }, wfr_std_lib);
+    addInstallCompilerStep(b, install_compiler_step, &.{ exe, ore_exe }, wfr_std_lib);
     // std.debug.print("[wolframite] toolchain installed\n", .{});  // see NOTE above
 
     // Just like flags, top level steps are also listed in the `--help` menu.
@@ -342,6 +342,7 @@ fn addPrintStep(
 /// Returns the step performing the installation; wire it up with
 /// `step.dependOn(...)`.
 fn addInstallCompilerStep(
+    b: *std.Build,
     install_step: *std.Build.Step,
     bin_artifacts: []const *std.Build.Step.Compile,
     lib_artifact: ?*std.Build.Step.Compile,
@@ -353,6 +354,21 @@ fn addInstallCompilerStep(
     }
     if (lib_artifact) |lib| {
         lib.getEmittedBin().addStepDependencies(&install_step.*);
+    }
+
+    // Install helper copies artifacts to the system install location via
+    // platform-specific scripts (matching scripts/dev-install.sh on Linux
+    // and the build.zig doc comment on Windows).
+    switch (builtin.os.tag) {
+        .windows => {
+            const script_step = b.addSystemCommand(&.{"pwsh", "-File", "scripts/install-compiler.ps1"});
+            install_step.dependOn(&script_step.step);
+        },
+        .linux => {
+            const script_step = b.addSystemCommand(&.{"sh", "scripts/install-compiler.sh"});
+            install_step.dependOn(&script_step.step);
+        },
+        else => {},
     }
 }
 
