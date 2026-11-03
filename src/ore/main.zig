@@ -2,12 +2,11 @@
 //!
 //! Currently a single-file build tool wrapping the full compiler pipeline
 //! (see `compile.zig`), with package scaffolding (`init`), a run mode that
-//! assembles + links via `nasm` and `zig cc` (`run`, `build --emit-bin`),
+//! assembles + links via Ferro (`run`, `build --emit-bin`),
 //! and a self-update command that installs new ore releases (which bundle
 //! the compiler) from GitHub (`update`).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -16,6 +15,10 @@ const manifest_mod = @import("manifest.zig");
 const compile_mod = @import("compile.zig");
 const link_mod = @import("link.zig");
 const update_mod = @import("update.zig");
+
+const replaceExt = link_mod.replaceExt;
+const hostObjectExt = link_mod.hostObjectExt;
+const hostTarget = link_mod.hostTarget;
 const diag_mod = @import("compiler").diagnostics;
 
 const version_string = "Dev (unstable)";
@@ -160,12 +163,32 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         }
     }
 
-    if ((mode == .ir or mode == .@"obj") and emit_bin) {
-        reportErr(io, "error: --emit-bin cannot be combined with --ir or --obj\n", .{});
+    if (emit_bin and mode == .ir) {
+        reportErr(io, "error: --emit-bin cannot be combined with --ir\n", .{});
         return 2;
     }
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
+
+    if (emit_bin) {
+        const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+        return linkBinary(gpa, io, source_path, exe_path) catch |err| switch (err) {
+            link_mod.LinkError.CompileFailed => {
+                reportErr(io, "error: compilation failed\n", .{});
+                return 1;
+            },
+            link_mod.LinkError.LinkFailed => {
+                reportErr(io, "error: link failed\n", .{});
+                return 1;
+            },
+            link_mod.LinkError.StdLibMissing => {
+                reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
+                reportErr(io, "       run 'zig build' from the repository root first\n", .{});
+                return 1;
+            },
+        };
+    }
+
     const source = readSource(gpa, io, source_path) orelse return 1;
 
     const result = compile_mod.compile(gpa, source, mode, hostTarget()) catch |err| {
@@ -185,7 +208,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             const asm_path = out_path orelse try replaceExt(gpa, source_path, "asm");
             if ((try writeTextFile(io, asm_path, result.text.?)) != 0) return 1;
             printOut(io, "wrote {s}\n", .{asm_path});
-            if (emit_bin) return linkBinary(gpa, io, asm_path);
             return 0;
         },
         .ir => {
@@ -203,34 +225,25 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     }
 }
 
-/// Assemble `<asm_path>` into an executable next to it, cleaning up the
-/// intermediates on success.
-fn linkBinary(gpa: Allocator, io: Io, asm_path: []const u8) !u8 {
-    const obj_path = try replaceExt(gpa, asm_path, "obj");
-    const exe_path = try replaceExt(gpa, asm_path, "exe");
-
-    link_mod.assembleAndLink(io, gpa, asm_path, obj_path, exe_path) catch |err| switch (err) {
-        error.ToolMissing => {
-            reportErr(io, "error: could not run 'nasm' or 'zig' — make sure both are on PATH\n", .{});
+/// Compile `source_path` to an object and link it into `exe_path` via Ferro,
+/// cleaning up the intermediate object on success.
+fn linkBinary(gpa: Allocator, io: Io, source_path: []const u8, exe_path: []const u8) !u8 {
+    link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
+        link_mod.LinkError.CompileFailed => {
+            reportErr(io, "error: compilation failed\n", .{});
             return 1;
         },
-        error.ToolFailed => {
-            reportErr(io, "error: assemble/link failed (kept {s} and {s} for debugging)\n", .{ asm_path, obj_path });
+        link_mod.LinkError.LinkFailed => {
+            reportErr(io, "error: link failed\n", .{});
             return 1;
         },
-        error.WriteFailed => {
-            reportErr(io, "error: could not write the link shim\n", .{});
-            return 1;
-        },
-        error.StdLibMissing => {
+        link_mod.LinkError.StdLibMissing => {
             reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
             reportErr(io, "       run 'zig build' from the repository root first\n", .{});
             return 1;
         },
     };
 
-    link_mod.deleteFile(io, asm_path);
-    link_mod.deleteFile(io, obj_path);
     printOut(io, "wrote {s}\n", .{exe_path});
     return 0;
 }
@@ -265,45 +278,23 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     }
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
-    const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, .@"asm", hostTarget()) catch |err| {
-        reportErr(io, "error: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    reportDiagnostics(io, source_path, &result.diagnostics);
-
-    if (!result.ok) {
-        reportErr(io, "error: compilation failed\n", .{});
-        return 1;
-    }
-
-    const asm_path = out_path orelse try replaceExt(gpa, source_path, "asm");
-    if ((try writeTextFile(io, asm_path, result.text.?)) != 0) return 1;
-
-    const obj_path = try replaceExt(gpa, asm_path, "obj");
-    const exe_path = try replaceExt(gpa, asm_path, "exe");
-    link_mod.assembleAndLink(io, gpa, asm_path, obj_path, exe_path) catch |err| switch (err) {
-        error.ToolMissing => {
-            reportErr(io, "error: could not run 'nasm' or 'zig' — make sure both are on PATH\n", .{});
+    const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+    _ = linkBinary(gpa, io, source_path, exe_path) catch |err| switch (err) {
+        link_mod.LinkError.CompileFailed => {
+            reportErr(io, "error: compilation failed\n", .{});
             return 1;
         },
-        error.ToolFailed => {
-            reportErr(io, "error: assemble/link failed (kept {s} and {s} for debugging)\n", .{ asm_path, obj_path });
+        link_mod.LinkError.LinkFailed => {
+            reportErr(io, "error: link failed\n", .{});
             return 1;
         },
-        error.WriteFailed => {
-            reportErr(io, "error: could not write the link shim\n", .{});
-            return 1;
-        },
-        error.StdLibMissing => {
+        link_mod.LinkError.StdLibMissing => {
             reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
             reportErr(io, "       run 'zig build' from the repository root first\n", .{});
             return 1;
         },
     };
-    link_mod.deleteFile(io, asm_path);
-    link_mod.deleteFile(io, obj_path);
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(gpa, exe_path);
@@ -446,25 +437,6 @@ fn printUpdateHelp(io: Io) void {
 // Shared helpers
 // ============================================================================
 
-/// The `ferro.Target` for the host OS ore is running on. The backend only
-/// supports x86-64 Linux and Windows; anything else falls back to Linux.
-fn hostTarget() ferro.Target {
-    return switch (builtin.os.tag) {
-        .windows => .windows_x86_64,
-        .linux => .linux_x86_64,
-        else => .linux_x86_64,
-    };
-}
-
-/// Default object-file extension for the host OS: `.obj` on Windows, `.o`
-/// elsewhere.
-fn hostObjectExt() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => "obj",
-        else => "o",
-    };
-}
-
 /// Resolve the source file to compile: an explicit path, else the `entry`
 /// from `ore.toml`. Returns `null` (after reporting) when neither exists.
 fn resolveSource(gpa: Allocator, io: Io, file: ?[]const u8) !?[]const u8 {
@@ -523,16 +495,6 @@ fn writeBinaryFile(io: Io, path: []const u8, data: []const u8) !u8 {
     return 0;
 }
 
-/// Replace the extension of `path` with `.new_ext` (allocated).
-fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(path) orelse "";
-    const stem = std.fs.path.stem(path);
-    if (dir.len == 0) {
-        return std.fmt.allocPrint(gpa, "{s}.{s}", .{ stem, new_ext });
-    }
-    return std.fmt.allocPrint(gpa, "{s}{c}{s}.{s}", .{ dir, std.fs.path.sep, stem, new_ext });
-}
-
 fn reportDiagnostics(io: Io, path: []const u8, diagnostics: *const diag_mod.Diagnostics) void {
     for (diagnostics.items.items) |item| {
         var buf: [4096]u8 = undefined;
@@ -587,7 +549,7 @@ fn printHelp(io: Io) void {
         \\Commands:
         \\  init [name]      Scaffold a new package (ore.toml + src/main.wfr)
         \\  build [file]     Compile a .wfr file (or the package entry) to NASM assembly
-        \\  run [file]       Compile, assemble, link (nasm + zig cc), and execute
+        \\  run [file]       Compile, link via Ferro, and execute a program.
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:
@@ -616,8 +578,8 @@ fn printBuildHelp(io: Io) void {
         \\      --ir             Emit textual Tungsten IR instead of assembly
         \\      --obj            Emit a relocatable object file (.o on Linux,
         \\                       .obj on Windows) instead of assembly
-        \\      --emit-bin       Also assemble and link into an executable
-        \\                       (needs nasm; incompatible with --ir / --obj)
+        \\      --emit-bin       Also link into an executable via Ferro
+        \\                       (incompatible with --ir)
         \\  -h, --help           Show this help
         \\
         \\Exit codes:
@@ -632,7 +594,7 @@ fn printRunHelp(io: Io) void {
         \\Usage:
         \\  ore run [options] [file] [args...]
         \\
-        \\Compile, assemble, link (nasm + zig cc), and execute a program.
+        \\Compile, link via Ferro, and execute a program.
         \\When no file is given, the entry from ore.toml is used. Arguments
         \\after the file are passed to the program.
         \\

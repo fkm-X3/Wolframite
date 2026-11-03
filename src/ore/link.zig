@@ -1,52 +1,27 @@
-//! Assemble + link pipeline for `ore run` / `ore build --emit-bin`.
+//! Link pipeline for `ore run` / `ore build --emit-bin`.
 //!
-//! The Tungsten backend emits NASM x86-64 assembly (Windows ABI), so ore
-//! shells out to `nasm` to produce object files and to `zig cc` to link them
-//! into an executable. `malloc` and friends resolve against the C runtime
-//! pulled in by `zig cc`.
-//!
-//! Entry shim: the backend names the entry function `_main` (a NASM-era
-//! convention), while the Windows x64 CRT resolves `main` / `WinMain` /
-//! `wWinMain` depending on the subsystem it picks. ore therefore links a tiny
-//! assembly shim exporting all three entry points, each branching to `_main`.
-//!
+//! Ore now compiles the source to a relocatable object (via Tungsten's object
+//! emission) and links it into an executable using Ferro — the Tungsten
+//! backend's internal linker — instead of shelling out to `nasm` + `zig cc`.
 //! Runtime: prelude calls such as `print` lower to extern calls into the
 //! Wolframite runtime, `libs/std`, built by `zig build` and linked here as a
-//! static library. That library is what actually implements the `wfr_std_*`
-//! symbols — it talks to the kernel directly and pulls in no libc of its own.
+//! static object/archive. Ferro reads the runtime alongside the program object
+//! and resolves `wfr_std_*` symbols against it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const ferro = @import("Tungsten").ferro;
+const compile_mod = @import("compile.zig");
 
 pub const LinkError = error{
-    /// `nasm` or `zig` not found on PATH, or a tool could not be started.
-    ToolMissing,
-    /// A tool ran but exited nonzero.
-    ToolFailed,
-    /// Could not write the entry shim.
-    WriteFailed,
-    /// The Wolframite runtime (`libs/std`) archive was not found.
+    /// `wfr_std` could not be located on disk.
     StdLibMissing,
+    /// The Wolframite compiler pipeline failed to emit an object.
+    CompileFailed,
+    /// Ferro failed to link the object into an executable.
+    LinkFailed,
 };
-
-const shim_asm_text =
-    \\; ore entry shim
-    \\; Tungsten emits `_main`; the Windows x64 CRT needs main/WinMain/wWinMain.
-    \\bits 64
-    \\default rel
-    \\extern _main
-    \\global main
-    \\global WinMain
-    \\global wWinMain
-    \\section .text
-    \\main:
-    \\    jmp _main
-    \\WinMain:
-    \\    jmp _main
-    \\wWinMain:
-    \\    jmp _main
-    \\
-;
 
 /// Directories, relative to the working directory, where `zig build` may have
 /// installed the runtime archive. `ore` reads `ore.toml` from the working
@@ -57,15 +32,14 @@ const std_lib_dirs = [_][]const u8{
     "build/zig-out/lib",
 };
 
-/// Archive file names for the runtime. `zig build-lib` writes `wfr_std.lib` for
-/// Windows targets and `libwfr_std.a` for ELF ones.
+/// Archive/file names for the runtime, per platform.
 const std_lib_names = [_][]const u8{
     "wfr_std.lib",
     "libwfr_std.a",
     "wfr_std.a",
 };
 
-/// Locate the Wolframite runtime archive, or fail with `StdLibMissing`.
+/// Locate the Wolframite runtime object/archive, or fail with `StdLibMissing`.
 ///
 /// `ore` first tries the project-local `zig-out/` layout (where `zig build`
 /// installs the runtime), then falls back to the system-wide install location
@@ -128,58 +102,13 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-/// Run a tool and print its stderr on failure.
-fn runTool(io: std.Io, gpa: Allocator, argv: []const []const u8) LinkError!void {
-    const result = std.process.run(gpa, io, .{ .argv = argv }) catch return error.ToolMissing;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print("{s}", .{result.stderr});
-                return error.ToolFailed;
-            }
-        },
-        else => return error.ToolFailed,
-    }
-}
-
-/// Assemble `<asm_path>` + entry shim with `nasm -f win64` and link with
-/// `zig cc` into `<exe_path>`, together with the Wolframite runtime.
-/// Intermediates are removed on success.
-pub fn assembleAndLink(io: std.Io, gpa: Allocator, asm_path: []const u8, obj_path: []const u8, exe_path: []const u8) LinkError!void {
-    const shim_asm_path = replaceExt(gpa, obj_path, "ore-shim.asm") catch return error.WriteFailed;
-    defer gpa.free(shim_asm_path);
-    const shim_obj_path = replaceExt(gpa, obj_path, "ore-shim.obj") catch return error.WriteFailed;
-    defer gpa.free(shim_obj_path);
-
-    const wfr_std_lib = try findWfrStdLib(io, gpa);
-    defer gpa.free(wfr_std_lib);
-
-    writeShim(io, shim_asm_path) catch return error.WriteFailed;
-    defer deleteFile(io, shim_asm_path);
-    defer deleteFile(io, shim_obj_path);
-
-    try runTool(io, gpa, &.{ "nasm", "-f", "win64", "-o", shim_obj_path, shim_asm_path });
-    try runTool(io, gpa, &.{ "nasm", "-f", "win64", "-o", obj_path, asm_path });
-    try runTool(io, gpa, &.{ "zig", "cc", obj_path, shim_obj_path, wfr_std_lib, "-o", exe_path });
-
-    // `zig cc` emits a PDB next to the exe in debug mode; drop it.
-    deleteFile(io, replaceExt(gpa, exe_path, "pdb") catch return error.WriteFailed);
-}
-
-fn writeShim(io: std.Io, path: []const u8) !void {
-    const f = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer f.close(io);
-    var buf: [1024]u8 = undefined;
-    var w: std.Io.File.Writer = .init(f, io, &buf);
-    try w.interface.writeAll(shim_asm_text);
-    try w.interface.flush();
+/// Remove a file, ignoring whether it exists.
+pub fn deleteFile(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 /// Replace the extension of `path` with `.new_ext` (allocated).
-fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
+pub fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
     const dir = std.fs.path.dirname(path) orelse "";
     const stem = std.fs.path.stem(path);
     if (dir.len == 0) {
@@ -188,9 +117,61 @@ fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{c}{s}.{s}", .{ dir, std.fs.path.sep, stem, new_ext });
 }
 
-/// Remove a file, ignoring whether it exists.
-pub fn deleteFile(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+/// Compile `source_path` to an object file at `obj_path` (via Tungsten object
+/// emission) and link it with the Wolframite runtime into `exe_path` via Ferro.
+///
+/// This replaces `assembleAndLink` (nasm + zig cc). The object file is written
+/// as an intermediate, then deleted on success.
+pub fn linkBinary(
+    io: std.Io,
+    gpa: Allocator,
+    source_path: []const u8,
+    exe_path: []const u8,
+) LinkError!void {
+    const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch return error.LinkFailed;
+    defer gpa.free(obj_path);
+    defer deleteFile(io, obj_path);
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .unlimited) catch return error.CompileFailed;
+    defer gpa.free(source);
+
+    const target = hostTarget();
+    const result = compile_mod.compile(gpa, source, .@"obj", target) catch return error.CompileFailed;
+    if (!result.ok) return error.CompileFailed;
+
+    const obj_bytes = result.text orelse return error.CompileFailed;
+    const write_obj = std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = obj_path,
+        .data = obj_bytes,
+    }) catch return error.CompileFailed;
+
+    _ = write_obj;
+
+    const wfr_std_lib = try findWfrStdLib(io, gpa);
+    defer gpa.free(wfr_std_lib);
+
+    const opts = ferro.defaultLinkOptions(target);
+    if (ferro.linkObject(io, gpa, obj_path, wfr_std_lib, exe_path, opts)) |_| {} else |_| {
+        return error.LinkFailed;
+    }
+}
+
+/// The default object-file extension for the host OS: `.obj` on Windows, `.o`
+/// elsewhere (mirrors Tungsten's object-format mapping).
+pub fn hostObjectExt() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "obj",
+        else => "o",
+    };
+}
+
+/// The `ferro.Target` for the host OS ore is running on.
+pub fn hostTarget() ferro.Target {
+    return switch (builtin.os.tag) {
+        .windows => .windows_x86_64,
+        .linux => .linux_x86_64,
+        else => .linux_x86_64,
+    };
 }
 
 const testing = std.testing;
@@ -208,11 +189,11 @@ test "findWfrStdLib reports a missing runtime instead of guessing" {
 
 test "replaceExt rewrites the extension, keeping the directory" {
     const gpa = testing.allocator;
-    const got = try replaceExt(gpa, "build/out/hello.asm", "obj");
+    const got = try replaceExt(gpa, "build/out/hello.obj", "o");
     defer gpa.free(got);
-    try testing.expectEqualStrings("build/out/hello.obj", got);
+    try testing.expectEqualStrings("build/out/hello.o", got);
 
-    const bare = try replaceExt(gpa, "hello.asm", "obj");
+    const bare = try replaceExt(gpa, "hello.o", "obj");
     defer gpa.free(bare);
     try testing.expectEqualStrings("hello.obj", bare);
 }
