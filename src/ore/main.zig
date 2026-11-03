@@ -172,7 +172,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     if (emit_bin) {
         const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
-        return linkBinary(gpa, io, source_path, exe_path) catch |err| switch (err) {
+        link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
             link_mod.LinkError.CompileFailed => {
                 reportErr(io, "error: compilation failed\n", .{});
                 return 1;
@@ -187,6 +187,8 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
                 return 1;
             },
         };
+        printOut(io, "wrote {s}\n", .{exe_path});
+        return 0;
     }
 
     const source = readSource(gpa, io, source_path) orelse return 1;
@@ -225,29 +227,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     }
 }
 
-/// Compile `source_path` to an object and link it into `exe_path` via Ferro,
-/// cleaning up the intermediate object on success.
-fn linkBinary(gpa: Allocator, io: Io, source_path: []const u8, exe_path: []const u8) !u8 {
-    link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
-        link_mod.LinkError.CompileFailed => {
-            reportErr(io, "error: compilation failed\n", .{});
-            return 1;
-        },
-        link_mod.LinkError.LinkFailed => {
-            reportErr(io, "error: link failed\n", .{});
-            return 1;
-        },
-        link_mod.LinkError.StdLibMissing => {
-            reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
-            reportErr(io, "       run 'zig build' from the repository root first\n", .{});
-            return 1;
-        },
-    };
-
-    printOut(io, "wrote {s}\n", .{exe_path});
-    return 0;
-}
-
 // ============================================================================
 // run
 // ============================================================================
@@ -280,7 +259,7 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
     const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
-    _ = linkBinary(gpa, io, source_path, exe_path) catch |err| switch (err) {
+    link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
         link_mod.LinkError.CompileFailed => {
             reportErr(io, "error: compilation failed\n", .{});
             return 1;
@@ -295,6 +274,7 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return 1;
         },
     };
+    printOut(io, "wrote {s}\n", .{exe_path});
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(gpa, exe_path);
