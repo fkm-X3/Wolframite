@@ -132,7 +132,7 @@ fn cmdInit(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
 fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
-    var mode: compile_mod.EmitMode = .@"asm";
+    var mode: compile_mod.EmitMode = .@"obj";
     var emit_bin = false;
     var file: ?[]const u8 = null;
 
@@ -206,12 +206,6 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     switch (mode) {
         .none => unreachable,
-        .@"asm" => {
-            const asm_path = out_path orelse try replaceExt(gpa, source_path, "asm");
-            if ((try writeTextFile(io, asm_path, result.text.?)) != 0) return 1;
-            printOut(io, "wrote {s}\n", .{asm_path});
-            return 0;
-        },
         .ir => {
             const ir_path = out_path orelse try replaceExt(gpa, source_path, "ir");
             if ((try writeTextFile(io, ir_path, result.text.?)) != 0) return 1;
@@ -528,7 +522,7 @@ fn printHelp(io: Io) void {
         \\
         \\Commands:
         \\  init [name]      Scaffold a new package (ore.toml + src/main.wfr)
-        \\  build [file]     Compile a .wfr file (or the package entry) to NASM assembly
+        \\  build [file]     Compile a .wfr file (or the package entry) to a relocatable object file
         \\  run [file]       Compile, link via Ferro, and execute a program.
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
@@ -546,18 +540,16 @@ fn printBuildHelp(io: Io) void {
         \\Usage:
         \\  ore build [options] [file]
         \\
-        \\Compile a single Wolframite source file. Default output is NASM
-        \\x86-64 assembly; use --obj to write a relocatable object file
-        \\instead.
+        \\Compile a single Wolframite source file. Default output is a
+        \\relocatable object file (.o on Linux, .obj on Windows).
         \\
         \\When no file is given, the entry from ore.toml is used.
         \\
         \\Options:
-        \\  -o, --output <path>  Write output to <path> (default: <input>.asm
-        \\                       or <input>.o with --obj)
-        \\      --ir             Emit textual Tungsten IR instead of assembly
+        \\  -o, --output <path>  Write output to <path> (default: <input>.o)
+        \\      --ir             Emit textual Tungsten IR instead of an object
         \\      --obj            Emit a relocatable object file (.o on Linux,
-        \\                       .obj on Windows) instead of assembly
+        \\                       .obj on Windows) (default)
         \\      --emit-bin       Also link into an executable via Ferro
         \\                       (incompatible with --ir)
         \\  -h, --help           Show this help
@@ -579,7 +571,7 @@ fn printRunHelp(io: Io) void {
         \\after the file are passed to the program.
         \\
         \\Options:
-        \\  -o, --output <path>  Assembly output path (default: <input>.asm)
+        \\  -o, --output <path>  Executable output path (default: <input>.exe)
         \\  -h, --help           Show this help
         \\
     , .{});

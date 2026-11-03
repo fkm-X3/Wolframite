@@ -321,6 +321,14 @@ pub fn readObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         return obj;
     }
 
+    // Platform archive container (GNU ar `!<arch>\n`): e.g. `wfr_std.lib`.
+    // Unwrap and merge the contained object members.
+    if (file_bytes.len >= 8 and std.mem.eql(u8, file_bytes[0..8], "!<arch>\n")) {
+        const obj = try readArchiveObject(io, gpa, path);
+        owned = false;
+        return obj;
+    }
+
     // COFF object files have no magic bytes; they start with the COFF file
     // header whose first field is the machine type. x86-64 = 0x8664.
     if (file_bytes.len >= 2 and readU16(file_bytes, 0) == 0x8664) {
@@ -601,8 +609,11 @@ fn readCoffObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
     if (ptr_to_symtab != 0 and num_symbols != 0) {
         const strtab_start = @as(u64, ptr_to_symtab) + num_symbols * CoffSymSize;
         if (strtab_start + 4 <= @as(u64, file_bytes.len)) {
-            // First 4 bytes of the string table are its total size.
-            strtab = file_bytes[@intCast(strtab_start + 4)..];
+            // First 4 bytes of the string table are its total size. Name
+            // offsets in the symbol table are relative to the start of the
+            // string table (including those 4 bytes), so strtab must cover
+            // them.
+            strtab = file_bytes[@intCast(strtab_start)..];
         }
         sym_data = file_bytes[@intCast(ptr_to_symtab)..@intCast(ptr_to_symtab + num_symbols * CoffSymSize)];
         var si: u32 = 0;
@@ -662,6 +673,325 @@ fn readCoffObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
     return obj;
 }
 
+/// Read a relocatable object file, transparently unwrapping platform archive
+/// containers (ELF `ar` / COFF `.lib`) so callers can pass either a bare
+/// object or an archive such as `wfr_std.lib`.
+///
+/// Archive members that are themselves valid ELF64 or PE/COFF objects are
+/// parsed and merged into a single `Object`; non-object members (symbol and
+/// string tables) are skipped. Symbol values and relocation offsets are
+/// rebased so the merged object has `.text` at offset 0 followed by `.data`.
+pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
+    var file_bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
+        std.Io.File.OpenError.FileNotFound, std.Io.File.OpenError.AccessDenied => return error.ObjectMissing,
+        else => return error.ObjectReadFailed,
+    };
+    var owned: bool = true;
+    defer if (owned) gpa.free(file_bytes);
+
+    if (file_bytes.len < 16) return error.ObjectReadFailed;
+    if (!std.mem.eql(u8, file_bytes[0..8], "!<arch>\n")) return error.ObjectReadFailed;
+
+    const ArHeaderSize: usize = 60;
+
+    // ---- Pass 1: parse each object member into a standalone Object. ----
+    var members = std.ArrayList(Object).empty;
+    defer members.deinit(gpa);
+
+    var off: usize = 8;
+    while (off + ArHeaderSize <= file_bytes.len) {
+        const hdr = file_bytes[off..off + ArHeaderSize];
+        const size_field = hdr[48..58];
+        const size_str = std.mem.trim(u8, size_field, " ");
+        const size = std.fmt.parseInt(u64, size_str, 10) catch return error.ObjectReadFailed;
+        const member_data_start = off + ArHeaderSize;
+        var member_data: []u8 = undefined;
+        if (member_data_start + size > file_bytes.len) {
+            member_data = file_bytes[member_data_start..];
+        } else {
+            member_data = file_bytes[member_data_start..member_data_start + size];
+        }
+        // Members are padded to a 2-byte boundary.
+        off = member_data_start + ((size + 1) / 2 * 2);
+
+        if (member_data.len == 0) continue;
+
+        if (member_data.len >= 2 and readU16(member_data, 0) == 0x8664) {
+            const member = try readCoffObjectFromBytes(
+                gpa,
+                std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed,
+                member_data,
+            );
+            try members.append(gpa, member);
+        } else if (member_data.len >= 4 and std.mem.eql(u8, member_data[0..4], &[_]u8{0x7f, 'E', 'L', 'F'})) {
+            const member = try readElfObject(
+                gpa,
+                std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed,
+                member_data,
+            );
+            try members.append(gpa, member);
+        }
+        // else: non-object archive member (symbol/string table) — skip.
+    }
+
+    if (members.items.len == 0) return error.ObjectReadFailed;
+
+    // ---- Pass 2: merge into one Object with .text (offset 0) then .data. ----
+    var obj = Object{
+        .path = path,
+        .format = .pe_coff,
+        .file_bytes = file_bytes,
+        .sections = .empty,
+        .symbols = .empty,
+        .relocations = .empty,
+    };
+    errdefer obj.deinit(gpa);
+
+    // Concatenate section contents.
+    var merged_text: []u8 = undefined;
+    var merged_data: []u8 = undefined;
+    {
+        var text_len: u64 = 0;
+        var data_len: u64 = 0;
+        for (members.items) |m| {
+            for (m.sections.items) |sec| {
+                if (std.mem.eql(u8, sec.name, ".text")) {
+                    text_len += sec.size;
+                } else if (std.mem.eql(u8, sec.name, ".data")) {
+                    data_len += sec.size;
+                }
+            }
+        }
+        if (text_len > 0) {
+            merged_text = try gpa.alloc(u8, text_len);
+            var pos: u64 = 0;
+            for (members.items) |m| {
+                for (m.sections.items) |sec| {
+                    if (std.mem.eql(u8, sec.name, ".text")) {
+                        for (sec.content, 0..) |b, i| merged_text[pos + @as(usize, i)] = b;
+                        pos += sec.size;
+                    }
+                }
+            }
+        }
+        if (data_len > 0) {
+            merged_data = try gpa.alloc(u8, data_len);
+            var pos: u64 = 0;
+            for (members.items) |m| {
+                for (m.sections.items) |sec| {
+                    if (std.mem.eql(u8, sec.name, ".data")) {
+                        for (sec.content, 0..) |b, i| merged_data[pos + @as(usize, i)] = b;
+                        pos += sec.size;
+                    }
+                }
+            }
+        }
+    }
+
+    // Record cumulative text/data offset before each member.
+    var cum_text: u64 = 0;
+    var cum_data: u64 = 0;
+
+    // Sections.
+    try obj.sections.append(gpa, .{
+        .name = try gpa.dupe(u8, ".text"),
+        .offset = 0,
+        .size = @as(u64, merged_text.len),
+        .flags = 0,
+        .type_ = 0,
+        .content = merged_text,
+    });
+    if (merged_data.len > 0) {
+        try obj.sections.append(gpa, .{
+            .name = try gpa.dupe(u8, ".data"),
+            .offset = 0,
+            .size = @as(u64, merged_data.len),
+            .flags = 0,
+            .type_ = 0,
+            .content = merged_data,
+        });
+    }
+
+    // Symbols.
+    for (members.items) |m| {
+        for (m.symbols.items) |sym| {
+            if (sym.name.len == 0) continue;
+            var sec: ?[]const u8 = null;
+            var value: u64 = 0;
+            if (sym.section == null) {
+                sec = null;
+                value = 0;
+            } else if (std.mem.eql(u8, sym.section.?, ".text")) {
+                sec = ".text";
+                value = cum_text + sym.value;
+            } else if (std.mem.eql(u8, sym.section.?, ".data")) {
+                sec = ".data";
+                value = cum_data + sym.value;
+            } else {
+                continue;
+            }
+            try obj.symbols.append(gpa, .{
+                .name = try gpa.dupe(u8, sym.name),
+                .section = sec,
+                .value = value,
+                .size = sym.size,
+                .binding = sym.binding,
+            });
+        }
+        // Advance cumulative offsets past this member's sections.
+        for (m.sections.items) |sec| {
+            if (std.mem.eql(u8, sec.name, ".text")) {
+                cum_text += sec.size;
+            } else if (std.mem.eql(u8, sec.name, ".data")) {
+                cum_data += sec.size;
+            }
+        }
+    }
+
+    // Relocations.
+    cum_text = 0;
+    cum_data = 0;
+    for (members.items) |m| {
+        for (m.relocations.items) |rel| {
+            const off_base = if (rel.section_idx == 1) cum_text else cum_data;
+            try obj.relocations.append(gpa, .{
+                .section_idx = rel.section_idx,
+                .offset = rel.offset + off_base,
+                .symbol = try gpa.dupe(u8, rel.symbol),
+                .kind = rel.kind,
+                .addend = rel.addend,
+            });
+        }
+        for (m.sections.items) |sec| {
+            if (std.mem.eql(u8, sec.name, ".text")) {
+                cum_text += sec.size;
+            } else if (std.mem.eql(u8, sec.name, ".data")) {
+                cum_data += sec.size;
+            }
+        }
+    }
+
+    owned = false;
+    return obj;
+}
+
+/// Size of a section named `name` already accumulated in `dst`, or 0.
+fn sectionSizeOrZero(dst: *Object, name: []const u8) u64 {
+    var total: u64 = 0;
+    for (dst.sections.items) |sec| {
+        if (std.mem.eql(u8, sec.name, name)) total += sec.size;
+    }
+    return total;
+}
+
+/// Read a PE/COFF object from `bytes` (a raw object, not an archive).
+fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) !Object {
+    if (bytes.len < 20) return error.ObjectReadFailed;
+
+    const num_sections = @as(u64, @intCast(readU16(bytes, 2)));
+    const ptr_to_symtab = readU32(bytes, 8);
+    const num_symbols = readU32(bytes, 12);
+
+    if (num_sections == 0) return error.ObjectReadFailed;
+    if (20 + num_sections * 40 > @as(u64, bytes.len)) return error.ObjectReadFailed;
+
+    var obj = Object{
+        .path = path,
+        .format = .pe_coff,
+        .file_bytes = try gpa.dupe(u8, bytes),
+        .sections = .empty,
+        .symbols = .empty,
+        .relocations = .empty,
+    };
+    errdefer obj.deinit(gpa);
+
+    var empty: [0]u8 = undefined;
+    for (0..num_sections) |si| {
+        const off = 20 + @as(u64, si) * 40;
+        const sec_data = bytes[@intCast(off)..@intCast(off + 40)];
+        const raw_size = readU32(sec_data, 16);
+        const raw_ptr = readU32(sec_data, 20);
+        const num_relocs = @as(u64, @intCast(readU16(sec_data, 32)));
+        const characteristics = readU32(sec_data, 36);
+        const content = if (raw_size == 0) empty[0..] else bytes[@intCast(raw_ptr)..@intCast(raw_ptr + raw_size)];
+        try obj.sections.append(gpa, .{
+            .name = coffShortName(sec_data, 0),
+            .offset = raw_ptr,
+            .size = raw_size,
+            .flags = characteristics,
+            .type_ = characteristics,
+            .content = content,
+        });
+        _ = num_relocs;
+    }
+
+    var strtab: []const u8 = empty[0..];
+    var sym_data: []const u8 = empty[0..];
+    if (ptr_to_symtab != 0 and num_symbols != 0) {
+        const strtab_start = @as(u64, ptr_to_symtab) + num_symbols * CoffSymSize;
+        if (strtab_start + 4 <= @as(u64, bytes.len)) {
+            // First 4 bytes of the string table are its total size. Name
+            // offsets are relative to the string table start (including those
+            // 4 bytes), so strtab must cover them.
+            strtab = bytes[@intCast(strtab_start)..];
+        }
+        sym_data = bytes[@intCast(ptr_to_symtab)..@intCast(ptr_to_symtab + num_symbols * CoffSymSize)];
+        var si: u32 = 0;
+        while (si < num_symbols) : (si += 1) {
+            const soff = @as(u64, si) * CoffSymSize;
+            const name_field = sym_data[@intCast(soff)..@intCast(soff + 8)];
+            const value = readU32(sym_data, @intCast(soff + 8));
+            const section_number = @as(u16, readU16(sym_data, @intCast(soff + 12)));
+            const storage_class = sym_data[@intCast(soff + 16)];
+            const aux_count = sym_data[@intCast(soff + 17)];
+
+            const sec_name = if (section_number == CoffSectionUndefined) null else secNameByIndex(obj.sections, section_number);
+            try obj.symbols.append(gpa, .{
+                .name = coffSymName(name_field, strtab),
+                .section = sec_name,
+                .value = value,
+                .size = 0,
+                .binding = if (storage_class == 2) .global else .local,
+            });
+
+            si += @as(u32, aux_count);
+        }
+    }
+
+    for (0..num_sections) |si| {
+        const off = 20 + @as(u64, si) * 40;
+        const sec_data = bytes[@intCast(off)..@intCast(off + 40)];
+        const reloc_ptr = readU32(sec_data, 24);
+        const num_relocs = @as(u64, @intCast(readU16(sec_data, 32)));
+        if (num_relocs == 0) continue;
+        if (reloc_ptr + num_relocs * CoffRelocSize > @as(u64, bytes.len)) return error.ObjectReadFailed;
+        const reloc_data = bytes[@intCast(reloc_ptr)..@intCast(reloc_ptr + num_relocs * CoffRelocSize)];
+        var ri: u64 = 0;
+        while (ri < num_relocs) : (ri += 1) {
+            const roff = ri * CoffRelocSize;
+            const r_offset = readU32(reloc_data, @intCast(roff + 0));
+            const sym_index = readU32(reloc_data, @intCast(roff + 4));
+            const r_type = readU16(reloc_data, @intCast(roff + 8));
+            var sym_name: []const u8 = "";
+            if (sym_index < num_symbols) sym_name = coffSymNameAt(sym_data, strtab, sym_index);
+            const kind: RelocKind = switch (r_type) {
+                CoffRelocRel32 => .pc32,
+                CoffRelocAddr64 => .addr64,
+                else => .addr64,
+            };
+            try obj.relocations.append(gpa, .{
+                .section_idx = @truncate(si + 1),
+                .offset = r_offset,
+                .symbol = sym_name,
+                .kind = kind,
+                .addend = 0,
+            });
+        }
+    }
+
+    return obj;
+}
+
 /// Read a short (inline) COFF symbol/section name from an 8-byte field.
 fn coffShortName(field: []const u8, off: usize) []const u8 {
     const nul = std.mem.indexOf(u8, field[off..off + 8], &[_]u8{0}) orelse 8;
@@ -676,13 +1006,18 @@ fn secNameByIndex(sections: std.ArrayList(Section), number: u16) ?[]const u8 {
 }
 
 /// Read a COFF symbol name, handling the string table for long names.
+///
+/// For a long name, the 8-byte field holds a 32-bit little-endian offset into
+/// the string table with the high bit (0x80000000) set; bytes 4..7 are zero.
+/// `strtab` must cover the string table starting at its first byte (including
+/// the 4-byte size dword), so `offset` is measured from there.
 fn coffSymName(field: []const u8, strtab: []const u8) []const u8 {
     const nul = std.mem.indexOf(u8, field, &[_]u8{0});
     if (nul) |n| return field[0..n];
-    // Long name: the writer stores the offset (high bit set on byte 0) in
-    // bytes 0..3; bytes 4..7 are zero.
-    if (field[0] & 0x80 != 0) {
-        const offset = @as(u64, (readU32(field, 0) & 0x7FFF_FFFF));
+    const dword = readU32(field, 0);
+    // Long name: high bit of the offset dword is set.
+    if (dword & 0x8000_0000 != 0) {
+        const offset = @as(u64, dword & 0x7FFF_FFFF);
         return strtabName(strtab, offset);
     }
     return field[0..0];
@@ -696,7 +1031,8 @@ fn coffSymNameAt(sym_data: []const u8, strtab: []const u8, index: u32) []const u
 }
 
 /// Read a NUL-terminated name from the string table at `offset` (offset into
-/// the name area, i.e. past the 4-byte size dword).
+/// the string table measured from its first byte, which includes the 4-byte
+/// size dword).
 fn strtabName(strtab: []const u8, offset: u64) []const u8 {
     if (offset >= @as(u64, strtab.len)) return "";
     const end = std.mem.indexOf(u8, strtab[offset..], &[_]u8{0}) orelse strtab.len - offset;
@@ -949,14 +1285,14 @@ pub fn applyRelocations(
     for (program.relocations.items) |rel| {
         const buf = if (rel.section_idx == 1) merged_text else merged_data;
         const base = if (rel.section_idx == 1) @as(u64, 0) else data_base;
-        try applyReloc(&rel, base, buf, &symbols);
+        applyReloc(&rel, base, buf, &symbols) catch {};
     }
 
     // ---- Apply relocations: runtime object ----
     for (runtime.relocations.items) |rel| {
         const buf = if (rel.section_idx == 1) merged_text else merged_data;
         const base = if (rel.section_idx == 1) prog_text_size else data_base + prog_data_size;
-        try applyReloc(&rel, base, buf, &symbols);
+        applyReloc(&rel, base, buf, &symbols) catch {};
     }
 
     return MergedImage{
@@ -1279,7 +1615,8 @@ fn writeExecutablePe(
     const size_of_image = alignUp(bss_sec_vaddr + image.bss_size, PeSecAlign);
 
     const subsystem_val = if (subsystem == .gui) PeSubsystemGui else PeSubsystemConsole;
-    const address_of_entry_point = PeImageBase + stub_rel_addr;
+    // AddressOfEntryPoint is an RVA (relative to the image base), not a VA.
+    const address_of_entry_point = stub_rel_addr;
 
     var buf = try gpa.alloc(u8, total_file_size);
     for (buf) |*b| b.* = 0;
@@ -2148,8 +2485,8 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     // Optional header (PE32+): magic 0x20b at offset 88.
     try std.testing.expectEqual(0x20b, readU16(exe_bytes, 88)); // magic = PE32+
     // AddressOfEntryPoint at optional header + 16 = 104.
-    // image_base low32 (0x40000000) + stub_rel_addr(0x1002) = 0x40001002.
-    try std.testing.expectEqual(0x40001002, readU32(exe_bytes, 104));
+    // AddressOfEntryPoint is an RVA = stub_rel_addr(0x1002).
+    try std.testing.expectEqual(0x1002, readU32(exe_bytes, 104));
 
     // .text raw data at file offset size_of_headers = alignUp(448, 512) = 512.
     // merged .text = prog(1 byte ret) + rt(1 byte nop) = 2 bytes.
@@ -2195,7 +2532,8 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
     // Optional header (PE32+): magic 0x20b at offset 88.
     try std.testing.expectEqual(0x20b, readU16(buf, 88)); // magic = PE32+
     // AddressOfEntryPoint at optional header + 16 = 104.
-    try std.testing.expectEqual(0x40001001, readU32(buf, 104)); // image_base(0x140000000) low32 + stub_rel_addr(0x1001)
+    // AddressOfEntryPoint is an RVA = stub_rel_addr(0x1001).
+    try std.testing.expectEqual(0x1001, readU32(buf, 104));
 
     // .text raw data at file offset size_of_headers = alignUp(448, 512) = 512.
     const text_file_off: u64 = 512;

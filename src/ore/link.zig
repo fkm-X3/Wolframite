@@ -2,11 +2,10 @@
 //!
 //! Ore now compiles the source to a relocatable object (via Tungsten's object
 //! emission) and links it into an executable using Ferro — the Tungsten
-//! backend's internal linker — instead of shelling out to `nasm` + `zig cc`.
-//! Runtime: prelude calls such as `print` lower to extern calls into the
-//! Wolframite runtime, `libs/std`, built by `zig build` and linked here as a
-//! static object/archive. Ferro reads the runtime alongside the program object
-//! and resolves `wfr_std_*` symbols against it.
+//! backend's internal linker. Runtime: prelude calls such as `print` lower to
+//! extern calls into the Wolframite runtime, `libs/std`, built by `zig build`
+//! and linked here as a static object/archive. Ferro reads the runtime
+//! alongside the program object and resolves `wfr_std_*` symbols against it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -102,11 +101,6 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-/// Remove a file, ignoring whether it exists.
-pub fn deleteFile(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-}
-
 /// Replace the extension of `path` with `.new_ext` (allocated).
 pub fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
     const dir = std.fs.path.dirname(path) orelse "";
@@ -120,8 +114,7 @@ pub fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
 /// Compile `source_path` to an object file at `obj_path` (via Tungsten object
 /// emission) and link it with the Wolframite runtime into `exe_path` via Ferro.
 ///
-/// This replaces `assembleAndLink` (nasm + zig cc). The object file is written
-/// as an intermediate, then deleted on success.
+/// The object file is written as an intermediate alongside the executable.
 pub fn linkBinary(
     io: std.Io,
     gpa: Allocator,
@@ -130,7 +123,6 @@ pub fn linkBinary(
 ) LinkError!void {
     const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch return error.LinkFailed;
     defer gpa.free(obj_path);
-    defer deleteFile(io, obj_path);
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .unlimited) catch return error.CompileFailed;
     defer gpa.free(source);

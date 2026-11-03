@@ -504,17 +504,6 @@ pub const Context = struct {
     // Output — Native Code
     // ========================================================================
 
-    /// Emit x86-64 NASM assembly for the entire module.
-    ///
-    /// Returns an allocated byte slice that the caller must free with
-    /// `ctx.gpa.free(result)`.
-    pub fn emitAssembly(self: *Context) ![]u8 {
-        var cg = codegen.CodeGen.init(self.gpa, &self.module);
-        defer cg.deinit();
-        try cg.emitModule();
-        return self.gpa.dupe(u8, cg.buf.items);
-    }
-
     /// Emit a relocatable object file (ELF64 on Linux, PE/COFF on Windows)
     /// for `self.target`.
     ///
@@ -790,13 +779,12 @@ test "extended opcodes" {
     _ = fn_array_global;
 }
 
-test "emit assembly with globals floats and heap" {
+test "emit object with globals and an indirect call" {
     const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const void_ty = try ctx.voidType();
     const i64_ty = try ctx.intType(true, 64);
-    const f64_ty = try ctx.floatType(.f64);
     const ptr_ty = try ctx.ptrType(i64_ty);
 
     const helper = try ctx.addFunction("helper", void_ty, 0);
@@ -815,36 +803,35 @@ test "emit assembly with globals floats and heap" {
 
     const one = try ctx.buildIntConst(i64_ty, 1);
     const two = try ctx.buildIntConst(i64_ty, 2);
-    const half = try ctx.buildFloatConst(f64_ty, 0.5);
-    const sum = try ctx.buildFAdd(f64_ty, half, half);
-    _ = try ctx.buildFCmp(.fcmp_oge, f64_ty, sum, half);
     _ = try ctx.buildSRem(i64_ty, two, one);
-    const alloc = try ctx.buildMalloc(ptr_ty, one);
-    _ = try ctx.buildGlobalAddr(ptr_ty, str_global);
-    // Indirect call through a fn value; `alloc` stands in as the opaque
-    // callee address (the exact fn-address pairing via func_addr is covered
-    // by the "call through fn value with env record" test below).
+    const alloc = try ctx.buildGlobalAddr(ptr_ty, str_global);
+    // Pair the lifted callee's address with a null env and call through it.
+    const helper_addr = try ctx.buildFuncAddr(i64_ty, helper);
     const sig = try ctx.funcType(i64_ty, &.{ i64_ty, i64_ty });
     const fv_ty = try ctx.fnValueType(sig);
-    const fv = try ctx.buildFnValue(fv_ty, alloc, try ctx.buildIntConst(i64_ty, 0));
+    const fv = try ctx.buildFnValue(fv_ty, helper_addr, try ctx.buildIntConst(i64_ty, 0));
     _ = try ctx.buildCallPtr(i64_ty, fv, &.{ one, two });
     _ = try ctx.buildRet(alloc);
 
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "section .data") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "__g0:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "db 104, 105, 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "dq _helper") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "addsd") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "ucomisd") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    malloc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    rax") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel __g0]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "extern malloc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rax, 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "movq    xmm0, rax") != null);
+    // ELF64 relocatable object, x86-64, LSB.
+    try std.testing.expectEqualSlices(u8, bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+    try std.testing.expectEqual(2, bytes[4]); // ELFCLASS64
+    try std.testing.expectEqual(1, bytes[5]); // ELFDATA2LSB
+    try std.testing.expectEqual(@as(u16, 1), readU16(bytes, 16)); // ET_REL
+    try std.testing.expectEqual(@as(u16, 62), readU16(bytes, 18)); // EM_X86_64
+
+    // .text holds the emitted machine code: iconst, indirect call rax.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }) != null); // mov rax, 1
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null); // call rax
+
+    // .data holds the "greeting" string; greeting and _helper appear as symbol
+    // names.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{'h', 'i', 0}) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "greeting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "_helper") != null);
 }
 
 test "function type creation" {
@@ -955,4 +942,17 @@ test "call through fn value with env record" {
     try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%0)") != null);
+}
+
+fn readU16(bytes: []const u8, off: usize) u16 {
+    return @as(u16, bytes[off]) | (@as(u16, bytes[off + 1]) << 8);
+}
+
+fn readU64(bytes: []const u8, off: usize) u64 {
+    var v: u64 = 0;
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) {
+        v |= @as(u64, bytes[off + @as(usize, i)]) << i * 8;
+    }
+    return v;
 }

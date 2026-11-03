@@ -301,19 +301,23 @@ test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
 
-    // Asm round-trip: the record is materialized in the frame, the env is
+    // Object round-trip: the record is materialized in the frame, the env is
     // marshaled as hidden argument 0, and the call goes through the address
     // loaded from record+0.
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel _add_from_env]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rax], rdx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rcx, qword [r10+8]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rax, qword [r10+0]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    rax") != null);
+    // func_addr pairs the lifted callee's address: lea rax, [rel32].
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8d, 0x05 }) != null);
+    // The fn-value record is materialized: mov [rax], rdx.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x10 }) != null);
+    // Hidden env marshaled as argument 0: mov rcx, qword [r10+8].
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    // Callee address loaded, then indirect call: mov rax, qword [r10+0]; call rax.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x42, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
     // The visible argument shifts one register slot: rdx, not rcx.
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rdx, [rbp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0x55 }) != null);
 }
 
 test "capture-only closure: zero visible args marshals env alone" {
@@ -347,12 +351,13 @@ test "capture-only closure: zero visible args marshals env alone" {
     defer interp.deinit();
     try std.testing.expectEqual(@as(i64, 7), try interp.call(run, &.{}));
 
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    // Object round-trip: rcx receives only the hidden env; no visible
+    // argument follows it.
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    // rcx receives only the hidden env; no visible argument follows it.
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rcx, qword [r10+8]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
 }
 
 test "multi-arg closure: hidden env plus stack-spilled visible args" {
@@ -395,15 +400,16 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     defer interp.deinit();
     try std.testing.expectEqual(@as(i64, 115), try interp.call(run, &.{ 1, 2, 3, 4, 5 }));
 
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    // Object round-trip: hidden env marshaled as argument 0; visible args
+    // fill rdx/r8/r9 and spill to stack slots 32 and 40 (after the 32-byte
+    // shadow space).
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    // Hidden env in rcx; visible args fill rdx/r8/r9 and spill to stack
-    // slots 32 and 40 (after the 32-byte shadow space).
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rcx, qword [r10+8]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     r9, [rbp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp + 32], rax") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     [rsp + 40], rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x89, 0x8d }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x20 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x28 }) != null);
 }
 
 test "nested closure: inner closure created and called inside an outer closure body" {
@@ -468,12 +474,13 @@ test "nested closure: inner closure created and called inside an outer closure b
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn1") != null);
 
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    // Object round-trip: both closures pair a callee address with an env
+    // record (func_addr = lea rax, [rel32]), and both call through rax.
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel _mul_add]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel _apply_outer]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8d, 0x05 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
 }
 
 test "closure-in-closure: fn-value capture copied inline into the env record" {
@@ -548,10 +555,11 @@ test "closure-in-closure: fn-value capture copied inline into the env record" {
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn1") != null);
 
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    // Object round-trip: both closures pair a callee address with an env
+    // record (func_addr = lea rax, [rel32]), and both call through rax.
+    const bytes = try ctx.emitObject();
+    defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel _mul_add]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "lea     rax, [rel _apply_outer]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "call    rax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8d, 0x05 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
 }

@@ -1,9 +1,9 @@
 const std = @import("std");
-const Io = std.Io;
 
 const Tungsten = @import("Tungsten");
 const ir = Tungsten.ir;
 const codegen = Tungsten.codegen;
+const obj_elf = Tungsten.obj_elf;
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -28,12 +28,16 @@ pub fn main(init: std.process.Init) !void {
 
     var cg = codegen.CodeGen.init(arena, &module);
     defer cg.deinit();
-    try cg.emitModule();
+    const input = try cg.emitObjectModule();
+
+    var w = obj_elf.Writer.init(arena);
+    defer w.deinit();
+    const bytes = try w.writeObject(input);
 
     const dir: std.Io.Dir = .cwd();
-    const file = try dir.createFile(init.io, "output.asm", .{});
+    const file = try dir.createFile(init.io, "output.o", .{});
     defer file.close(init.io);
-    try file.writePositionalAll(init.io, cg.buf.items, 0);
+    try file.writePositionalAll(init.io, bytes, 0);
 }
 
 test "simple test" {
@@ -50,6 +54,7 @@ test "fuzz example" {
 
 fn testOne(context: void, smith: *std.testing.Smith) !void {
     _ = context;
+
     // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
 
     const gpa = std.testing.allocator;

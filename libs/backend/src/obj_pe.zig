@@ -250,6 +250,10 @@ pub const Writer = struct {
         }
 
         // Input symbols.
+        // `strtab_size` was pre-computed above to size the buffer; reset it here
+        // so it doubles as the running string-table offset (starting right after
+        // the 4-byte size dword) while emitting each symbol's name field.
+        strtab_size = 4;
         for (input.symbols) |sym| {
             const sym_index = @as(u32, @intCast((pos - symtab_file_off) / CoffSymSize));
             _ = try sym_index_map.put(sym.name, sym_index);
@@ -261,10 +265,14 @@ pub const Writer = struct {
                 for (0..8) |k| { sym_name[k] = if (k < sym.name.len) sym.name[k] else 0; }
             } else {
                 use_strtab = true;
-                strtab_name_off = strtab_size - 4; // offset within string table (after size dword)
-                // first 4 bytes of name field = offset with high bit set; next 4 = 0.
+                // Offset within the string table measured from the string table
+                // start (which includes the 4-byte size dword). strtab_size
+                // already accounts for the size dword (starts at 4).
+                strtab_name_off = strtab_size;
+                // first 4 bytes of name field = offset with the high bit
+                // (0x80000000) set on the most significant byte; next 4 = 0.
                 for (0..4) |k| { sym_name[k] = @as(u8, @truncate((strtab_name_off >> @intCast(k * 8)) & 0xFF)); }
-                sym_name[0] = @as(u8, sym_name[0] | 0x80);
+                sym_name[3] = @as(u8, sym_name[3] | 0x80);
                 for (4..8) |k| { sym_name[k] = 0; }
                 strtab_size += @as(u64, sym.name.len) + 1;
             }

@@ -4,7 +4,7 @@
 //!
 //!   lexer -> parser -> resolver -> typechecker -> Tungsten lowering
 //!
-//! and then emits either textual Tungsten IR or NASM x86-64 assembly.
+//! and then emits either textual Tungsten IR or a relocatable object file.
 //! This is the same pipeline exercised by the compiler crate's own tests
 //! (see `lower.zig:runLower`).
 
@@ -29,8 +29,6 @@ pub const EmitMode = enum {
     none,
     /// Textual Tungsten IR.
     ir,
-    /// NASM x86-64 assembly (single-file compile).
-    @"asm",
     /// Relocatable object file (ELF64 on Linux, PE/COFF on Windows).
     @"obj",
 };
@@ -94,10 +92,6 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: fer
             var allocating: std.Io.Writer.Allocating = .fromArrayList(arena, &buf);
             try ctx.print(&allocating.writer);
             return .{ .ok = true, .text = try allocating.toOwnedSlice(), .diagnostics = diagnostics };
-        },
-        .@"asm" => {
-            const text = try ctx.emitAssembly();
-            return .{ .ok = true, .text = text, .diagnostics = diagnostics };
         },
         .@"obj" => {
             const bytes = try ctx.emitObject();

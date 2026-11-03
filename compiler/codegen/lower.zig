@@ -3610,7 +3610,7 @@ test "lower: float arithmetic and compare" {
     try std.testing.expect(std.mem.indexOf(u8, text, "fcmp oge") != null);
 }
 
-test "lower: emit assembly for a module" {
+test "lower: emit object for a module" {
     var res = try checkLower(std.testing.allocator,
         \\fn main() -> i32 {
         \\    return 42
@@ -3618,11 +3618,16 @@ test "lower: emit assembly for a module" {
     );
     defer res.deinit();
 
-    const asm_text = try res.ctx.emitAssembly();
-    defer res.ctx.gpa.free(asm_text);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "section .text") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "_main:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, asm_text, "mov     rax, 42") != null);
+    const bytes = try res.ctx.emitObject();
+    defer res.ctx.gpa.free(bytes);
+
+    // ELF64 relocatable object.
+    try std.testing.expectEqualSlices(u8, bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
+    try std.testing.expectEqual(2, bytes[4]); // ELFCLASS64
+    try std.testing.expectEqual(1, bytes[5]); // ELFDATA2LSB
+    // _main's body: mov rax, 42; ...; ret.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xc3 }) != null); // ret
 }
 
 test "lower: if expression produces a phi at the merge" {
