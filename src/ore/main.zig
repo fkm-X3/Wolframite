@@ -9,6 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 
 const ferro = @import("Tungsten").ferro;
 const manifest_mod = @import("manifest.zig");
@@ -133,7 +134,7 @@ fn cmdInit(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var mode: compile_mod.EmitMode = .@"obj";
-    var emit_bin = false;
+    var emit_bin = true;
     var file: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -148,8 +149,10 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             out_path = args[i];
         } else if (std.mem.eql(u8, arg, "--ir")) {
             mode = .ir;
+            emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--obj")) {
             mode = .@"obj";
+            emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -253,34 +256,21 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
     const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
-    link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
-        link_mod.LinkError.CompileFailed => {
-            reportErr(io, "error: compilation failed\n", .{});
-            return 1;
-        },
-        link_mod.LinkError.LinkFailed => {
-            reportErr(io, "error: link failed\n", .{});
-            return 1;
-        },
-        link_mod.LinkError.StdLibMissing => {
-            reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
-            reportErr(io, "       run 'zig build' from the repository root first\n", .{});
-            return 1;
-        },
-    };
-    printOut(io, "wrote {s}\n", .{exe_path});
+
+    // `ore run` only executes a binary already produced by `ore build`; it
+    // never compiles or links.
+    if (!link_mod.fileExists(io, exe_path)) {
+        reportErr(io, "error: executable '{s}' not found\n", .{exe_path});
+        reportErr(io, "       run `ore build` first\n", .{});
+        return 1;
+    }
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(gpa, exe_path);
     try argv.appendSlice(gpa, prog_args.items);
     const argv_slice = try argv.toOwnedSlice(gpa);
 
-    var child = std.process.spawn(io, .{
-        .argv = argv_slice,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch |err| {
+    var child = spawnOrShell(io, gpa, exe_path, argv_slice) catch |err| {
         reportErr(io, "error: could not start '{s}': {s}\n", .{ exe_path, @errorName(err) });
         return 1;
     };
@@ -296,6 +286,57 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return 1;
         },
     }
+}
+
+/// Spawn `exe` directly, falling back to the OS shell when direct process
+/// creation fails (e.g. Windows `InvalidExe` for a freshly linked executable).
+///
+/// On Windows this runs `cmd /c "<exe>" <args...>`; elsewhere `sh -c "<exe>" <args...>`.
+fn spawnOrShell(
+    io: Io,
+    gpa: Allocator,
+    exe_path: []const u8,
+    args: []const []const u8,
+) !std.process.Child {
+    const child = std.process.spawn(io, .{
+        .argv = args,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        if (err != error.InvalidExe) return err;
+        const shell_cmd = switch (builtin.os.tag) {
+            .windows => "cmd",
+            else => "sh",
+        };
+        const shell_arg = switch (builtin.os.tag) {
+            .windows => "/c",
+            else => "-c",
+        };
+
+        // Build the command string: "<exe>" <arg1> <arg2> ...
+        var cmd_buf: std.ArrayList(u8) = .empty;
+        try cmd_buf.appendSlice(gpa, exe_path);
+        for (args[1..]) |arg| {
+            try cmd_buf.append(gpa, ' ');
+            try cmd_buf.appendSlice(gpa, arg);
+        }
+        const cmd_str = try cmd_buf.toOwnedSlice(gpa);
+
+        var shell_args: std.ArrayList([]const u8) = .empty;
+        try shell_args.append(gpa, shell_cmd);
+        try shell_args.append(gpa, shell_arg);
+        try shell_args.append(gpa, cmd_str);
+        const shell_argv = try shell_args.toOwnedSlice(gpa);
+
+        return std.process.spawn(io, .{
+            .argv = shell_argv,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+    };
+    return child;
 }
 
 // ============================================================================
@@ -522,8 +563,8 @@ fn printHelp(io: Io) void {
         \\
         \\Commands:
         \\  init [name]      Scaffold a new package (ore.toml + src/main.wfr)
-        \\  build [file]     Compile a .wfr file (or the package entry) to a relocatable object file
-        \\  run [file]       Compile, link via Ferro, and execute a program.
+        \\  build [file]     Compile a .wfr file and link it into an executable via Ferro
+        \\  run [file]       Run a previously built executable (does not compile or link)
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:
@@ -540,23 +581,24 @@ fn printBuildHelp(io: Io) void {
         \\Usage:
         \\  ore build [options] [file]
         \\
-        \\Compile a single Wolframite source file. Default output is a
-        \\relocatable object file (.o on Linux, .obj on Windows).
+        \\Compile a single Wolframite source file and link it into an
+        \\executable via Ferro. Default output is <input>.exe.
         \\
         \\When no file is given, the entry from ore.toml is used.
         \\
         \\Options:
-        \\  -o, --output <path>  Write output to <path> (default: <input>.o)
-        \\      --ir             Emit textual Tungsten IR instead of an object
-        \\      --obj            Emit a relocatable object file (.o on Linux,
-        \\                       .obj on Windows) (default)
-        \\      --emit-bin       Also link into an executable via Ferro
+        \\  -o, --output <path>  Write the executable to <path>
+        \\                       (default: <input>.exe)
+        \\      --ir             Emit textual Tungsten IR only (no link)
+        \\      --obj            Emit a relocatable object file only (no link)
+        \\                       (.o on Linux, .obj on Windows)
+        \\      --emit-bin       Link into an executable via Ferro (default)
         \\                       (incompatible with --ir)
         \\  -h, --help           Show this help
         \\
         \\Exit codes:
         \\  0  success
-        \\  1  compilation or I/O failure
+        \\  1  compilation, link, or I/O failure
         \\  2  usage error
     , .{});
 }
@@ -566,12 +608,14 @@ fn printRunHelp(io: Io) void {
         \\Usage:
         \\  ore run [options] [file] [args...]
         \\
-        \\Compile, link via Ferro, and execute a program.
-        \\When no file is given, the entry from ore.toml is used. Arguments
-        \\after the file are passed to the program.
+        \\Execute a program previously built with `ore build`. `ore run` does
+        \\not compile or link; the executable must already exist. When no file
+        \\is given, the entry from ore.toml is used to locate the executable
+        \\ (<input>.exe). Arguments after the file are passed to the program.
         \\
         \\Options:
-        \\  -o, --output <path>  Executable output path (default: <input>.exe)
+        \\  -o, --output <path>  Run the executable at <path>
+        \\                       (default: <input>.exe)
         \\  -h, --help           Show this help
         \\
     , .{});

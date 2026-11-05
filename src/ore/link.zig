@@ -96,7 +96,7 @@ fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
     return error.StdLibMissing;
 }
 
-fn fileExists(io: std.Io, path: []const u8) bool {
+pub fn fileExists(io: std.Io, path: []const u8) bool {
     _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return true;
 }

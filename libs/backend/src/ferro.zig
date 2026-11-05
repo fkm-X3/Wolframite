@@ -665,7 +665,11 @@ fn readCoffObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
                 .offset = r_offset,
                 .symbol = sym_name,
                 .kind = kind,
-                .addend = 0, // PE/COFF addend is implicit at the site
+                // PE/COFF addend is implicit at the site. For PC32 relocations,
+                // the addend must be -4: the call displacement is relative to
+                // the next instruction (after the 4-byte placeholder), but the
+                // relocation site is at the placeholder itself.
+                .addend = if (kind == .pc32) -4 else 0,
             });
         }
     }
@@ -984,7 +988,13 @@ fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) 
                 .offset = r_offset,
                 .symbol = sym_name,
                 .kind = kind,
-                .addend = 0,
+                // For PC32 relocations, the addend must be -4: the call
+                // instruction's displacement is relative to the next
+                // instruction (after the 4-byte placeholder at the
+                // relocation site), but the relocation site itself is at
+                // the placeholder. So target = (P + 4) + (S + A - P)
+                // = S + A + 4, and we want target = S, so A = -4.
+                .addend = if (kind == .pc32) -4 else 0,
             });
         }
     }
@@ -1012,15 +1022,25 @@ fn secNameByIndex(sections: std.ArrayList(Section), number: u16) ?[]const u8 {
 /// `strtab` must cover the string table starting at its first byte (including
 /// the 4-byte size dword), so `offset` is measured from there.
 fn coffSymName(field: []const u8, strtab: []const u8) []const u8 {
-    const nul = std.mem.indexOf(u8, field, &[_]u8{0});
-    if (nul) |n| return field[0..n];
     const dword = readU32(field, 0);
-    // Long name: high bit of the offset dword is set.
+    // Standard COFF long name: high bit of the offset dword is set.
     if (dword & 0x8000_0000 != 0) {
         const offset = @as(u64, dword & 0x7FFF_FFFF);
         return strtabName(strtab, offset);
     }
-    return field[0..0];
+    // Zig's object writer stores the plain (high-bit clear) string-table
+    // offset in bytes 4..7 with bytes 0..3 zeroed (no high-bit marker).
+    // Detect that here so symbols from `zig build`-produced archives resolve.
+    if (dword == 0) {
+        const zig_offset = readU32(field, 4);
+        if (zig_offset != 0) {
+            return strtabName(strtab, @as(u64, zig_offset));
+        }
+    }
+    // Short name: NUL-terminated within the 8-byte field.
+    const nul = std.mem.indexOf(u8, field, &[_]u8{0});
+    if (nul) |n| return field[0..n];
+    return field;
 }
 
 /// Read a COFF symbol name by symbol-table index (for relocations).
@@ -1193,12 +1213,34 @@ pub fn applyRelocations(
 
     // Merged layout (relative addresses starting at 0).
     const merged_text_size = prog_text_size + rt_text_size;
-    const data_base = merged_text_size; // .data starts right after .text
     const merged_data_size = prog_data_size + rt_data_size;
     const merged_bss_size = prog_bss_size + rt_bss_size;
 
-    // ---- Build merged .text ----
-    var merged_text = try gpa.alloc(u8, merged_text_size);
+    // ---- Build symbol address map ----
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+
+    // First, scan all relocations for symbols not defined in program or runtime.
+    // Generate `ret` stubs for them so calls to undefined Windows API imports
+    // (GetStdHandle, WriteFile, ExitProcess, etc.) don't jump to invalid memory.
+    var seen_stubs = std.StringHashMap(usize).init(gpa);
+    defer seen_stubs.deinit();
+    var stub_count: usize = 0;
+    for (program.relocations.items) |rel| {
+        if (symbols.get(rel.symbol) == null and seen_stubs.get(rel.symbol) == null) {
+            try seen_stubs.put(rel.symbol, @intCast(stub_count));
+            stub_count += 1;
+        }
+    }
+    for (runtime.relocations.items) |rel| {
+        if (symbols.get(rel.symbol) == null and seen_stubs.get(rel.symbol) == null) {
+            try seen_stubs.put(rel.symbol, @intCast(stub_count));
+            stub_count += 1;
+        }
+    }
+
+    // Build merged .text including space for stubs at the end.
+    const stub_total_size = @as(u64, @intCast(stub_count)); // 1 byte per stub (ret)
+    var merged_text = try gpa.alloc(u8, merged_text_size + stub_total_size);
     if (prog_text_size > 0) {
         var i: usize = 0;
         while (i < @as(usize, prog_text_size)) : (i += 1) {
@@ -1211,29 +1253,26 @@ pub fn applyRelocations(
             merged_text[@as(usize, prog_text_size) + i] = rt_text.content[i];
         }
     }
-
-    // ---- Build merged .data ----
-    var merged_data = try gpa.alloc(u8, merged_data_size);
-    if (prog_data_size > 0) {
-        var i: usize = 0;
-        while (i < @as(usize, prog_data_size)) : (i += 1) {
-            merged_data[i] = prog_data.content[i];
-        }
-    }
-    if (rt_data_size > 0) {
-        var i: usize = 0;
-        while (i < @as(usize, rt_data_size)) : (i += 1) {
-            merged_data[@as(usize, prog_data_size) + i] = rt_data.content[i];
+    // Append `ret` stubs for undefined symbols.
+    var stub_addr: u64 = merged_text_size;
+    {
+        var iter = seen_stubs.iterator();
+        while (iter.next()) |item| {
+            merged_text[@as(usize, stub_addr)] = 0xc3; // ret
+            try symbols.put(item.key_ptr.*, .{ .section = ".text", .value = stub_addr });
+            stub_addr += 1;
         }
     }
 
-    // ---- Build symbol address map ----
-    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+    // data_base is now after .text including stubs.
+    const data_base = merged_text_size + stub_total_size;
 
     // Program-defined symbols (.text / .data only).
     for (program.symbols.items) |sym| {
         if (sym.section == null) continue;
         const sec = sym.section.?;
+        // Skip COFF section symbols (name starts with '.', value 0).
+        if (std.mem.startsWith(u8, sym.name, ".")) continue;
         var addr: u64 = 0;
         if (std.mem.eql(u8, sec, ".text")) {
             addr = sym.value;
@@ -1251,6 +1290,8 @@ pub fn applyRelocations(
     for (runtime.symbols.items) |sym| {
         if (sym.section == null) continue;
         const sec = sym.section.?;
+        // Skip COFF section symbols (name starts with '.', value 0).
+        if (std.mem.startsWith(u8, sym.name, ".")) continue;
         var addr: u64 = 0;
         if (std.mem.eql(u8, sec, ".text")) {
             addr = prog_text_size + sym.value;
@@ -1281,6 +1322,21 @@ pub fn applyRelocations(
         try symbols.put(name, .{ .section = rt_addr.section, .value = addr });
     }
 
+    // Build merged .data.
+    var merged_data = try gpa.alloc(u8, merged_data_size);
+    if (prog_data_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, prog_data_size)) : (i += 1) {
+            merged_data[i] = prog_data.content[i];
+        }
+    }
+    if (rt_data_size > 0) {
+        var i: usize = 0;
+        while (i < @as(usize, rt_data_size)) : (i += 1) {
+            merged_data[@as(usize, prog_data_size) + i] = rt_data.content[i];
+        }
+    }
+
     // ---- Apply relocations: program object ----
     for (program.relocations.items) |rel| {
         const buf = if (rel.section_idx == 1) merged_text else merged_data;
@@ -1289,8 +1345,14 @@ pub fn applyRelocations(
     }
 
     // ---- Apply relocations: runtime object ----
+    //
+    // Runtime relocations were already offset-adjusted by cum_text in
+    // readArchiveObject, so their `offset` is relative to the start of the
+    // runtime's own text/data section. Since merged_text starts with program
+    // text, we must slice buf to begin at prog_text_size / prog_data_size so
+    // that buf[rel.offset] lands on the right location in merged_text.
     for (runtime.relocations.items) |rel| {
-        const buf = if (rel.section_idx == 1) merged_text else merged_data;
+        const buf = if (rel.section_idx == 1) merged_text[prog_text_size..] else merged_data[prog_data_size..];
         const base = if (rel.section_idx == 1) prog_text_size else data_base + prog_data_size;
         applyReloc(&rel, base, buf, &symbols) catch {};
     }
@@ -1530,6 +1592,7 @@ const PeSubsystemConsole: u16 = 3;
 const PeSubsystemGui: u16 = 2;
 const PeCharacteristicsExecImage: u16 = 0x0002;
 const PeCharacteristicsRelocsStripped: u16 = 0x0001;
+const PeCharacteristicsLargeAddressAware: u16 = 0x0020;
 const PeSectionCount: u16 = 3; // .text, .data, .bss
 const PeSectionText: u16 = 0;
 const PeSectionData: u16 = 1;
@@ -1547,18 +1610,38 @@ fn alignUp(v: u64, aln: u64) u64 {
     return (v + aln - 1) / aln * aln;
 }
 
-/// The Windows entry point `main` that Ferro synthesizes to call `_main`:
+/// The Windows entry point that Ferro synthesizes to call `_main` and return
+/// to the Windows loader:
 ///
-///     call _main      ; rel32 relocation against _main's merged address
-///     ret             ; return (clean exit handled by imports/runtime later)
+///     call _main      ; rel32 against _main's merged address
+///     ret             ; return to the Windows loader (process terminates)
 ///
-/// `call _main`'s displacement is computed against the stub's own address, so
-/// no external shim assembly is needed. The image base cancels because both
-/// `_main` and the stub are relative to the same image base.
-fn buildWindowsMainStub(gpa: Allocator, main_rel_addr: u64, stub_rel_addr: u64) ![]u8 {
-    var stub = try gpa.alloc(u8, 6); // E8 disp32 + C3 ret
-    stub[0] = 0xe8; // E8 = call rel32
-    const disp: i64 = @as(i64, @bitCast(main_rel_addr)) - @as(i64, @bitCast(stub_rel_addr)) - 5;
+/// Using `call`+`ret` preserves the Windows return address chain: the loader
+/// places Windows' return address at [RSP] at process entry; `call _main`
+/// pushes the stub's return address below it; `_main`'s `ret` pops the stub's
+/// address; the stub's `ret` pops Windows' address, returning to the loader.
+///
+/// After `call _main`, RSP ≡ 0 mod 16 at `_main` entry. After `push rbp`,
+/// RSP ≡ 8 mod 16. `sub rsp, frame_size` with frame_size ≡ 8 mod 16 restores
+/// RSP ≡ 0 mod 16 for CALL alignment inside _main.
+///
+/// All displacements are computed against the stub's own address, so no
+/// external shim assembly or relocation table is needed. The image base
+/// cancels because every address is relative to the same image base.
+fn buildWindowsMainStub(
+    gpa: Allocator,
+    main_rel_addr: u64,
+    stub_rel_addr: u64,
+) ![]u8 {
+    const stub_size: usize = 6;
+    var stub = try gpa.alloc(u8, stub_size);
+    // call _main (E8 = call rel32)
+    stub[0] = 0xe8;
+    const call_off = stub_rel_addr; // address of the E8 byte
+    const disp = @as(i64, @bitCast(main_rel_addr)) - @as(i64, @bitCast(call_off)) - 5;
+    if (disp < @as(i64, std.math.minInt(i32)) or disp > @as(i64, std.math.maxInt(i32))) {
+        return error.RelocationFailed;
+    }
     const disp_bytes = std.mem.asBytes(&disp);
     for (0..4) |i| stub[1 + i] = disp_bytes[i];
     stub[5] = 0xc3; // ret
@@ -1597,22 +1680,40 @@ fn writeExecutablePe(
 
     const text_sec_vaddr: u64 = PeSecAlign;
     const stub_rel_addr = text_sec_vaddr + text_size;
-    const stub = try buildWindowsMainStub(gpa, entry_symbol_addr, stub_rel_addr);
+    // Symbol addresses in `image.symbols` are merged-text-relative (0-based
+    // within merged .text). Convert to VA-relative by adding the .text section
+    // base so the synthesized entry stub's call displacements land on the
+    // right symbols.
+    const main_addr_va = text_sec_vaddr + entry_symbol_addr;
+    const stub = try buildWindowsMainStub(gpa, main_addr_va, stub_rel_addr);
     defer gpa.free(stub);
 
     const full_text_size = text_size + stub.len;
 
-    const headers_raw_size: u64 = 64 + 4 + 20 + @as(u64, PeSizeOfOptionalHeader) + @as(u64, PeSectionCount) * 40;
+    // Decide which sections to emit. A zero-size .bss section would place its
+    // virtual address at/above SizeOfImage, which the Windows loader rejects
+    // as an invalid image format (STATUS_INVALID_IMAGE_FORMAT). Only emit it
+    // when it has actual size.
+    const emit_bss = image.bss_size > 0;
+    const sec_count: u16 = if (emit_bss) 3 else 2;
+
+    const headers_raw_size: u64 = 64 + 4 + 20 + @as(u64, PeSizeOfOptionalHeader) + @as(u64, sec_count) * 40;
     const size_of_headers = alignUp(headers_raw_size, PeFileAlign);
 
+    // SizeOfRawData must be a multiple of FileAlignment (PE spec). Pad the
+    // raw section sizes so the Windows loader accepts the image.
+    const text_raw_size = alignUp(full_text_size, PeFileAlign);
+    const data_raw_size = alignUp(data_size, PeFileAlign);
+
     const text_file_off = size_of_headers;
-    const data_file_off = alignUp(text_file_off + full_text_size, PeFileAlign);
-    const total_file_size = alignUp(data_file_off + data_size, PeFileAlign);
+    const data_file_off = text_file_off + text_raw_size;
+    const total_file_size = data_file_off + data_raw_size;
 
     const text_sec_vaddr_final = text_sec_vaddr;
     const data_sec_vaddr = alignUp(text_sec_vaddr_final + full_text_size, PeSecAlign);
-    const bss_sec_vaddr = alignUp(data_sec_vaddr + data_size, PeSecAlign);
-    const size_of_image = alignUp(bss_sec_vaddr + image.bss_size, PeSecAlign);
+    const data_sec_end = alignUp(data_sec_vaddr + data_size, PeSecAlign);
+    const bss_sec_vaddr = data_sec_end;
+    const size_of_image = if (emit_bss) alignUp(bss_sec_vaddr + image.bss_size, PeSecAlign) else data_sec_end;
 
     const subsystem_val = if (subsystem == .gui) PeSubsystemGui else PeSubsystemConsole;
     // AddressOfEntryPoint is an RVA (relative to the image base), not a VA.
@@ -1632,12 +1733,12 @@ fn writeExecutablePe(
 
     // ---- COFF file header (20 bytes) ----
     putU16At(buf, pos, 0x8664); pos += 2; // machine
-    putU16At(buf, pos, PeSectionCount); pos += 2;
+    putU16At(buf, pos, sec_count); pos += 2;
     putU32At(buf, pos, 0); pos += 4; // time_date_stamp
     putU32At(buf, pos, 0); pos += 4; // pointer_to_symbol_table
     putU32At(buf, pos, 0); pos += 4; // number_of_symbols
     putU16At(buf, pos, PeSizeOfOptionalHeader); pos += 2;
-    putU16At(buf, pos, PeCharacteristicsExecImage | PeCharacteristicsRelocsStripped); pos += 2;
+    putU16At(buf, pos, PeCharacteristicsExecImage | PeCharacteristicsRelocsStripped | PeCharacteristicsLargeAddressAware); pos += 2;
 
     // ---- Optional header (PE32+, 240 bytes) ----
     putU16At(buf, pos, PeMagic); pos += 2; // magic
@@ -1650,14 +1751,19 @@ fn writeExecutablePe(
     putU64At(buf, pos, PeImageBase); pos += 8; // image_base
     putU32At(buf, pos, PeSecAlign); pos += 4; // section_alignment
     putU32At(buf, pos, PeFileAlign); pos += 4; // file_alignment
-    pos += 6; // os version (major/minor) + image version (major/minor) = 0
-    pos += 4; // win32_version_value = 0
+    putU16At(buf, pos, 6); pos += 2; // os_major (Windows Vista+)
+    putU16At(buf, pos, 0); pos += 2; // os_minor
+    putU16At(buf, pos, 0); pos += 2; // image_major
+    putU16At(buf, pos, 0); pos += 2; // image_minor
+    putU16At(buf, pos, 6); pos += 2; // subsystem_major
+    putU16At(buf, pos, 0); pos += 2; // subsystem_minor
+    putU32At(buf, pos, 0); pos += 4; // win32_version_value = 0
     putU32At(buf, pos, @as(u32, @intCast(size_of_image))); pos += 4; // size_of_image
     putU32At(buf, pos, @as(u32, @intCast(size_of_headers))); pos += 4; // size_of_headers
     putU32At(buf, pos, 0); pos += 4; // checksum
     putU16At(buf, pos, subsystem_val); pos += 2; // subsystem
-    putU16At(buf, pos, 0); pos += 2; // dll_characteristics
-    putU64At(buf, pos, 0x100000); pos += 8; // size_of_stack_reserve
+    putU16At(buf, pos, 0x8160); pos += 2; // dll_characteristics (NX_COMPAT | DYNAMIC_BASE | HIGH_ENTROPY_VA | TERMINAL_SERVER_AWARE)
+    putU64At(buf, pos, 0x1000000); pos += 8; // size_of_stack_reserve (16 MB, match ore.exe)
     putU64At(buf, pos, 0x1000); pos += 8; // size_of_stack_commit
     putU64At(buf, pos, 0x100000); pos += 8; // size_of_heap_reserve
     putU64At(buf, pos, 0x1000); pos += 8; // size_of_heap_commit
@@ -1666,7 +1772,7 @@ fn writeExecutablePe(
     // data directories: 16 x 8 bytes = 128 bytes, all zero (already zeroed)
     pos += PeNumberOfRvaAndSizes * PeDataDirEntrySize;
 
-    // ---- Section table (3 x 40 bytes) ----
+    // ---- Section table (sec_count x 40 bytes) ----
     const sec_names = [_][]const u8{ ".text", ".data", ".bss" };
     const sec_characteristics = [_]u32{
         0x60000020, // .text: CNT_CODE | MEM_EXECUTE | MEM_READ
@@ -1676,10 +1782,10 @@ fn writeExecutablePe(
     const sec_vaddrs = [_]u64{ text_sec_vaddr_final, data_sec_vaddr, bss_sec_vaddr };
     const sec_vsizes = [_]u64{ full_text_size, data_size, image.bss_size };
     const sec_file_offs = [_]u64{ text_file_off, data_file_off, 0 };
-    const sec_raw_sizes = [_]u64{ full_text_size, data_size, 0 };
+    const sec_raw_sizes = [_]u64{ text_raw_size, data_raw_size, 0 };
 
     var si: usize = 0;
-    while (si < @as(usize, @intCast(PeSectionCount))) : (si += 1) {
+    while (si < @as(usize, sec_count)) : (si += 1) {
         const soff = pos + @as(u64, si) * 40;
         for (0..8) |k| {
             buf[soff + @as(u64, k)] = if (k < sec_names[si].len) sec_names[si][k] else 0;
@@ -1694,7 +1800,9 @@ fn writeExecutablePe(
         putU16At(buf, soff + 34, 0); // number_of_line_numbers
         putU32At(buf, soff + 36, sec_characteristics[si]); // characteristics
     }
-    pos = headers_raw_size; // section table ends at headers_raw_size
+    // `pos` now points just past the section table (end of headers).
+    // Section raw data begins at `size_of_headers` (computed above from
+    // headers_raw_size, which matches alignUp(actual_headers_end, PeFileAlign)).
 
     // ---- .text raw data (program .text + main stub) ----
     for (text, 0..text.len) |b, i| {

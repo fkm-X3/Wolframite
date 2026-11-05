@@ -164,7 +164,11 @@ pub const CodeGen = struct {
         }
 
         const raw_size: u32 = 32 + (value_slots + alloca_data_slots) * 8;
-        const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15);
+        // On Windows x64, after `call _main` from the entry stub, RSP ≡ 0 mod 16
+        // at entry. After `push rbp`, RSP ≡ 8 mod 16 inside _main. For subsequent
+        // CALL instructions, RSP must be ≡ 0 mod 16 before each call, so
+        // frame_size must be ≡ 8 mod 16 (8 - frame_size ≡ 0 mod 16).
+        const frame_size: u32 = ((raw_size + 7) & ~@as(u32, 15)) + 8;
 
         var offset: i32 = 0;
         {
@@ -543,7 +547,7 @@ pub const CodeGen = struct {
                 // mov rdx, [rbp + val]
                 try self.o8(0x48);
                 try self.o8(0x8b);
-                try self.o8(0x55);
+                try self.o8(0x95);
                 try self.emitI32(val);
                 // mov [rax], rdx
                 try self.o8(0x48);
@@ -579,7 +583,7 @@ pub const CodeGen = struct {
                 try self.o8(0x48);
                 try self.o8(0x8d);
                 try self.o8(0x05);
-                try self.relocText(gname, .addr64, 0);
+                try self.relocText(gname, .pc32, -4);
                 try self.emitI32(0); // placeholder
                 // mov [rbp + r], rax
                 try self.o8(0x48);
@@ -597,7 +601,7 @@ pub const CodeGen = struct {
                 try self.o8(0x48);
                 try self.o8(0x8d);
                 try self.o8(0x05);
-                try self.relocText(fname, .addr64, 0);
+                try self.relocText(fname, .pc32, -4);
                 try self.emitI32(0); // placeholder
                 // mov [rbp + r], rax
                 try self.o8(0x48);
@@ -780,7 +784,7 @@ pub const CodeGen = struct {
             while (i < num_reg_args) : (i += 1) {
                 const arg_off = try self.valueOff(ops[1 + i]);
                 try self.o8(reg_rex[i]);
-                try self.o8(0x89);
+                try self.o8(0x8b);
                 try self.o8(reg_modrm[i]);
                 try self.emitI32(arg_off);
             }
