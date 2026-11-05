@@ -317,7 +317,7 @@ test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x42, 0x00 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
     // The visible argument shifts one register slot: rdx, not rcx.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0x55 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0x95 }) != null);
 }
 
 test "capture-only closure: zero visible args marshals env alone" {

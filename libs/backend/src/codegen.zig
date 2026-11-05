@@ -1025,14 +1025,17 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
     const sym_g0 = symtab_offset + 24 * 1; // symbol 1 = __g0
     try std.testing.expectEqual(2, readU16(bytes, sym_g0 + 6)); // st_shndx = .data (2)
 
-    // .rela.text has ADDR64 relocation for __g0 (the lea instruction is in .text).
+    // .rela.text has PC32 relocation for __g0 (the lea rax, [rel __g0] is RIP-relative).
     const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_off = readU64(bytes, sh_rela_off + 24);
     const rela_size = readU64(bytes, sh_rela_off + 32);
     try std.testing.expectEqual(24, rela_size);
-    const r_type: u32 = @truncate(readU64(bytes, rela_off + 8) & 0xFFFF_FFFF);
-    try std.testing.expectEqual(1, r_type); // R_X86_64_64
+    const r_info = readU64(bytes, rela_off + 8);
+    const r_type: u32 = @truncate(r_info & 0xFFFF_FFFF);
+    try std.testing.expectEqual(2, r_type); // R_X86_64_PC32
+    // addend = -4: disp is relative to the instruction after the 4-byte placeholder.
+    try std.testing.expectEqual(-4, readI64(bytes, rela_off + 16));
 }
 
 test "object emission: function call between two functions (ELF64)" {
@@ -1180,23 +1183,23 @@ test "object emission: closure env + call_ptr (ELF64)" {
     try std.testing.expectEqual(1, readU16(bytes, sym_lifted + 6)); // st_shndx = .text (1)
     try std.testing.expectEqual(1, readU16(bytes, sym_caller + 6)); // st_shndx = .text (1)
 
-    // func_addr emitted an ADDR64 relocation for "_lifted" in .text.
+    // func_addr emitted a PC32 relocation for "_lifted" in .text.
     const sh_rela_off = e_shoff + 6 * 64;
     try std.testing.expectEqual(4, readU32(bytes, sh_rela_off + 4)); // SHT_RELA
     const rela_size = readU64(bytes, sh_rela_off + 32);
     try std.testing.expect(rela_size >= 24);
     const rela_off = readU64(bytes, sh_rela_off + 24);
-    var found_addr64 = false;
+    var found_pc32 = false;
     const entries = rela_size / 24;
     var e: u64 = 0;
     while (e < entries) : (e += 1) {
         const r_info = readU64(bytes, rela_off + e * 24 + 8);
         const r_type: u32 = @truncate(r_info & 0xFFFF_FFFF);
-        if (r_type == 1) { // R_X86_64_64
-            found_addr64 = true;
+        if (r_type == 2) { // R_X86_64_PC32
+            found_pc32 = true;
         }
     }
-    try std.testing.expect(found_addr64);
+    try std.testing.expect(found_pc32);
 }
 
 test "object emission: function call between two functions (PE/COFF)" {
@@ -1342,18 +1345,18 @@ test "object emission: closure env + call_ptr (PE/COFF)" {
     }
     try std.testing.expect(found_call_rax);
 
-    // ADDR64 relocation (type 1) present for the func_addr'd lifted function.
+    // PC32 relocation (type 4 / IMAGE_REL_AMD64_REL32) present for the func_addr'd lifted function.
     const data_size = readU32(bytes, 20 + 1 * 40 + 16);
     const reloc_start = text_ptr + text_size + data_size;
-    var found_addr64 = false;
+    var found_pc32 = false;
     var r: u64 = 0;
     while (r < @as(u64, @intCast(text_reloc_count)) and reloc_start + r * 10 + 10 <= bytes.len) : (r += 1) {
         const r_type: u16 = @as(u16, bytes[reloc_start + r * 10 + 8]) | (@as(u16, bytes[reloc_start + r * 10 + 9]) << 8);
-        if (r_type == obj_pe.CoffRelocAddr64) { // IMAGE_REL_AMD64_ADDR64
-            found_addr64 = true;
+        if (r_type == obj_pe.CoffRelocRel32) { // IMAGE_REL_AMD64_REL32
+            found_pc32 = true;
         }
     }
-    try std.testing.expect(found_addr64);
+    try std.testing.expect(found_pc32);
 }
 
 fn readU16(bytes: []const u8, off: usize) u16 {

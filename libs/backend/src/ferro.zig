@@ -1182,6 +1182,26 @@ fn applyReloc(
     }
 }
 
+/// Returns true when `name` is genuinely undefined: not defined in the
+/// program or runtime symbol tables, and not resolved against the runtime.
+// Membersip (not address) is enough here, so this does not depend on
+// `data_base` or stub layout.
+fn symbolNeedsStub(
+    program: *const Object,
+    runtime: *const Object,
+    resolved: *const ResolvedSymbols,
+    name: []const u8,
+) bool {
+    for (program.symbols.items) |s| {
+        if (s.section != null and std.mem.eql(u8, s.name, name)) return false;
+    }
+    for (runtime.symbols.items) |s| {
+        if (s.section != null and std.mem.eql(u8, s.name, name)) return false;
+    }
+    if (resolved.resolved.get(name) != null) return false;
+    return true;
+}
+
 /// Apply relocations and merge `.text`/`.data`/`.bss` from program object
 /// and runtime into output sections.
 ///
@@ -1219,20 +1239,21 @@ pub fn applyRelocations(
     // ---- Build symbol address map ----
     var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
 
-    // First, scan all relocations for symbols not defined in program or runtime.
-    // Generate `ret` stubs for them so calls to undefined Windows API imports
-    // (GetStdHandle, WriteFile, ExitProcess, etc.) don't jump to invalid memory.
+    // A relocation target only gets a `ret` stub when it is genuinely
+    // undefined: not defined in the program, not defined in the runtime, and
+    // not resolved against the runtime. Membership (not address) is enough
+    // here, so this scan does not depend on `data_base` or stub layout.
     var seen_stubs = std.StringHashMap(usize).init(gpa);
     defer seen_stubs.deinit();
     var stub_count: usize = 0;
     for (program.relocations.items) |rel| {
-        if (symbols.get(rel.symbol) == null and seen_stubs.get(rel.symbol) == null) {
+        if (symbolNeedsStub(program, runtime, resolved, rel.symbol) and seen_stubs.get(rel.symbol) == null) {
             try seen_stubs.put(rel.symbol, @intCast(stub_count));
             stub_count += 1;
         }
     }
     for (runtime.relocations.items) |rel| {
-        if (symbols.get(rel.symbol) == null and seen_stubs.get(rel.symbol) == null) {
+        if (symbolNeedsStub(program, runtime, resolved, rel.symbol) and seen_stubs.get(rel.symbol) == null) {
             try seen_stubs.put(rel.symbol, @intCast(stub_count));
             stub_count += 1;
         }
@@ -1253,7 +1274,7 @@ pub fn applyRelocations(
             merged_text[@as(usize, prog_text_size) + i] = rt_text.content[i];
         }
     }
-    // Append `ret` stubs for undefined symbols.
+    // Append `ret` stubs for genuinely undefined symbols.
     var stub_addr: u64 = merged_text_size;
     {
         var iter = seen_stubs.iterator();
@@ -2140,12 +2161,13 @@ test "readObject reads a PE/COFF object (sections, symbols, relocations)" {
     try std.testing.expectEqualStrings("puts", object.symbols.items[puts_idx.?].name);
     try std.testing.expectEqual(null, object.symbols.items[puts_idx.?].section);
 
-    // Relocations: one PC32 in .text (puts), one ADDR64 in .data (__g0).
-    // PE/COFF addends are implicit at the relocation site, so addend is 0 here.
+    // PE/COFF addends are implicit at the relocation site; for PC32 the
+    // implicit addend is -4 (the displacement is relative to the next
+    // instruction, after the 4-byte placeholder).
     try std.testing.expectEqual(2, object.relocations.items.len);
     try std.testing.expectEqualStrings("puts", object.relocations.items[0].symbol);
     try std.testing.expectEqual(.pc32, object.relocations.items[0].kind);
-    try std.testing.expectEqual(0, object.relocations.items[0].addend);
+    try std.testing.expectEqual(-4, object.relocations.items[0].addend);
     try std.testing.expectEqualStrings("__g0", object.relocations.items[1].symbol);
     try std.testing.expectEqual(.addr64, object.relocations.items[1].kind);
     try std.testing.expectEqual(0, object.relocations.items[1].addend);
@@ -2604,8 +2626,9 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     // main stub right after: E8 disp32 + C3 ret.
     const stub_off = text_file_off + 2;
     try std.testing.expectEqual(0xe8, exe_bytes[stub_off]); // E8 = call rel32
-    // disp = main_rel_addr(0) - stub_rel_addr(0x1002) - 5 = -4103 = 0xffffeff9 (LE: f9 ef ff ff).
-    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xef, 0xff, 0xff });
+    // disp = main_rel_addr(0) - stub_rel_addr(2) - 5 = -7 = 0xfffffff9 (little-endian: f9 ff ff ff).
+    // (Both addresses are VA-relative with the 0x1000 .text base, which cancels.)
+    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
     try std.testing.expectEqual(0xc3, exe_bytes[stub_off + 5]); // C3 = ret
 }
 
@@ -2649,7 +2672,8 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
     // main stub right after: E8 disp32 + C3 ret.
     const stub_off = text_file_off + 1;
     try std.testing.expectEqual(0xe8, buf[stub_off]); // E8 = call rel32
-    // disp = main_rel_addr(10) - stub_rel_addr(0x1001) - 5 = -4092 = 0xfffff004 (LE: 04 f0 ff ff).
-    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x04, 0xf0, 0xff, 0xff });
+    // disp = main_rel_addr(10) - stub_rel_addr(1) - 5 = 4 = 0x00000004 (LE: 04 00 00 00).
+    // (Both addresses are VA-relative with the 0x1000 .text base, which cancels.)
+    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x04, 0x00, 0x00, 0x00 });
     try std.testing.expectEqual(0xc3, buf[stub_off + 5]); // C3 = ret
 }
