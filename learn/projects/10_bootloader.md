@@ -1,12 +1,17 @@
 # Project 10: x86 Bootloader via Ferro Linker
 
 **Difficulty:** Hard (final project)  
-**Status:** Not yet possible — teaches the Ferro linker story that is planned
-but not yet implemented.  
-**Teaches:** The Wolframite-facing link description, the Ferro linker, and how
-formatted args are passed to the linker in Wolframite syntax.
+**Status:** Not yet possible for bootloaders. The Ferro linker works and accepts
+link descriptions authored in Wolframite syntax (see `examples/link_description.wfr`),
+but it only targets hosted `linux` and `windows` — there is no freestanding /
+bare-metal target yet, no flat-binary / `.img` output, and no
+`--link-description` CLI flag. So you can author the link description now, but
+you cannot produce a bootable image from Wolframite.
 
-## The goal (when implemented)
+**Teaches:** The Wolframite-facing link description, the Ferro linker, and how
+link semantics are expressed in Wolframite syntax instead of an `ld` script.
+
+## The goal (when freestanding targets land)
 
 Write a tiny x86_64 bootloader in Wolframite that, when linked by Ferro and
 booted, prints `Hello from Wolframite` to the screen. This is the capstone that
@@ -16,12 +21,19 @@ the linker.
 ## Why this is not possible yet
 
 Ferro (the internal linker, short for Ferrotungsten) is specified in
-`libs/backend/docs/adr/adr_ferro_linker.md`. Today, Tungsten emits NASM
-assembly and `ore` shells out to `nasm` + `zig cc`. The object emission +
-Ferro pipeline is not yet complete, so you cannot
-produce a bootable image from Wolframite yet.
+`libs/backend/docs/adr/adr_ferro_linker.md`. Tungsten can now emit relocatable
+objects (ELF64 on Linux, PE/COFF on Windows) and `ore build --emit-bin` links
+them via Ferro into a hosted executable. But Ferro's `Target` only knows
+`linux_x86_64` and `windows_x86_64` — there is no freestanding / bare-metal
+target (no `x86_64-unknown-elf`), no multiboot or flat-binary output, and no
+`.img` container. The link-description compiler (`compileLinkDescription`) and
+`linkOptionsFromSource` exist in the compiler library, but `ore` has no CLI flag
+to feed a separate link description to Ferro.
 
-This project describes what you will do once Ferro lands.
+That means: you can write a Wolframite link description today, but you cannot
+yet link a freestanding bootable image from it.
+
+This project describes what you will do once freestanding targets land.
 
 ## What Ferro does
 
@@ -50,32 +62,50 @@ pub fn linkObject(
 ## The Wolframite link description
 
 There is **no GNU linker script** and no external `ld`. Instead, link semantics
-are expressed as a normal Wolframite program, compiled by the normal Wolframite
+are expressed as a normal Wolframite module, compiled by the normal Wolframite
 compiler pipeline, and handed to Ferro as structured arguments.
 
-The link description (conceptual) describes
-inputs, output, runtime lib, entry point, and sections:
+A link description binds a single `LinkerArgs` struct literal to a top-level
+`let` and defines no `fn main`. The compiler extracts it via
+`compiler.link_description.compileLinkDescription`, converts it to
+`ferro.LinkOptions` with `linkOptionsFromSource`, and feeds those options to
+`ferro.linkObject`.
 
 ```wfr
-// link.wfr — the link description, compiled by the normal compiler
-fn link_description() -> LinkDescription {
-    return LinkDescription{
-        .object = "bootloader.o",
-        .runtime = "wfr_std",
-        .output = "bootloader.img",
-        .target = "x86_64-unknown-elf",   // or the platform target triple
-        .entry = "_main",
-        .sections = [
-            { .name = ".text", .flags = "alloc|exec" },
-            { .name = ".data", .flags = "alloc|write" },
-            { .name = ".bss",  .flags = "alloc|write" },
-        ],
-    }
+// link.wfr — the link description, compiled by the normal compiler.
+// Defines no `fn main`.
+struct LinkerArgs {
+    target: String,
+    output: String,
+    entry: String,
+    subsystem: String,
+    runtime_lib: String,
+    input: String,
+    debug: bool,
+}
+
+let link = LinkerArgs {
+    .target = "windows",
+    .output = "hello.exe",
+    .entry = "_main",
+    .subsystem = "console",
+    .runtime_lib = "wfr_std.lib",
+    .input = "hello.obj",
+    .debug = false,
 }
 ```
 
-The formatted args (inputs, output, entry, sections, target) are passed to
-Ferro as structured arguments — not parsed from an `ld` script.
+Required fields: `target`, `output`, `input`, `runtime_lib`.  
+Optional fields (with defaults): `entry` (`"_main"`), `subsystem` (`"console"`),
+`debug` (`false`).
+
+`target` must be `"linux"` or `"windows"` — Ferro maps these to ELF64 and
+PE/COFF respectively. There is no freestanding target yet, so a bootloader
+target such as `"x86_64-unknown-elf"` is rejected with `InvalidTarget`.
+
+The formatted args (inputs, output, entry, target, runtime lib) are passed to
+Ferro as structured arguments — not parsed from an `ld` script. Note there is no
+`sections` field today; section layout is fixed by the object format.
 
 ## What the bootloader would look like
 
@@ -84,17 +114,18 @@ usual sense. Tungsten names the program entry `_main`, and Ferro synthesizes
 the platform entry that calls `_main` (no external shim assembly).
 
 Conceptual bootloader source (illustrative; VGA text-mode printing at
-`0xB8000`):
+`0xB8000`. Cannot run yet — no freestanding target.):
 
 ```wfr
+// bootloader.wfr — illustrative only, cannot be built yet
 fn main() -> i32 {
-    // VGA text buffer at 0xB8000
-    let vid: &mut [u8; 80 * 25 * 2] = ...  // region/mapped memory
+    // VGA text buffer at 0xB8000 (mapped/region memory in a real port)
+    let vid: &mut [u8; 80 * 25 * 2] = ...  // platform-specific mapping
 
     let msg = "Hello from Wolframite"
     mut i: i32 = 0
     while i < msg.len() {
-        vid[i * 2] = msg[i] as u8
+        vid[i * 2] = msg[i]
         vid[i * 2 + 1] = 0x07  // light gray on black
         i = i + 1
     }
@@ -107,33 +138,32 @@ fn main() -> i32 {
 }
 ```
 
-## What you would do once Ferro is implemented
+## What you would do once freestanding targets land
 
 1. Write the bootloader source (`bootloader.wfr`).
-2. Write the link description (`link.wfr`) describing the output image,
-   entry `_main`, and sections.
-3. Run:
+2. Write the link description (`link.wfr`) describing the output image and
+   entry `_main`.
+3. Build the bootloader object and link it (conceptual command — no CLI flag
+   for a separate link description exists yet):
 
-```sh
-# Conceptual command once Ferro + object emission are done:
-zig build ore -- build --bootloader bootloader.wfr --link-description link.wfr
-```
-
-This compiles `bootloader.wfr` to an object, compiles `link.wfr` to extract the
-link description, and feeds both to Ferro to produce a bootable image.
+   ```sh
+   # Conceptual command once a freestanding target + --link-description exist:
+   zig build ore -- build --obj bootloader.wfr -o bootloader.o
+   # then feed bootloader.o + link.wfr to Ferro to produce bootloader.img
+   ```
 
 4. Run the image in an emulator (QEMU) or on real hardware and see:
 
-```
-Hello from Wolframite
-```
+   ```
+   Hello from Wolframite
+   ```
 
 ## What this teaches
 
 Even though you can't run it yet, this project reinforces:
 
-- **`struct`** — the link description is a struct.
-- **`enum`** — section flags and target types are enums.
+- **`struct`** — the link description is a `LinkerArgs` struct.
+- **`enum`** — target types and subsystem values are enums under the hood.
 - **`match`** — handling different target platforms.
 - **`comptime`** — `@hasField`, `@sizeOf` for validating the link description.
 - **Regions** — explicit allocation control, matching Ferro's "Explicit
@@ -146,9 +176,14 @@ Even though you can't run it yet, this project reinforces:
   handling, symbol naming (`_main`, `__gN`, `_fnN`).
 - `libs/backend/docs/adr/adr_object_format.md` — ELF64 and PE/COFF object
   formats, relocation types, section layout.
+- `examples/link_description.wfr` — the working Wolframite link-description
+  syntax used by `compileLinkDescription`.
 
-## Checkpoint (when Ferro lands)
+## Checkpoint (when freestanding targets land)
 
+- [ ] Ferro gains a freestanding / bare-metal target (e.g. `x86_64-unknown-elf`)
+      and a flat-binary / `.img` output.
+- [ ] `ore` gains a way to pass a separate link description to Ferro.
 - [ ] A `.wfr` bootloader compiles to an object via Tungsten object emission.
 - [ ] A Wolframite link description compiles and drives Ferro.
 - [ ] Ferro links the object + `wfr_std` into a bootable image.
