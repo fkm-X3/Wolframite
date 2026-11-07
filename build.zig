@@ -360,8 +360,12 @@ fn addInstallCompilerStep(
     // scripts/install-compiler.py (replacing the old install-compiler.ps1
     // and install-compiler.sh).
     switch (builtin.os.tag) {
-        .windows, .linux => {
+        .windows => {
             const script_step = b.addSystemCommand(&.{"python", "scripts/install-compiler.py"});
+            install_step.dependOn(&script_step.step);
+        },
+        .linux => {
+            const script_step = b.addSystemCommand(&.{"python3", "scripts/install-compiler.py"});
             install_step.dependOn(&script_step.step);
         },
         else => {},
