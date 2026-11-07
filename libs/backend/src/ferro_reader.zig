@@ -49,8 +49,9 @@ pub fn readObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     // Platform archive container (GNU ar `!<arch>\n`): e.g. `wfr_std.lib`.
     // Unwrap and merge the contained object members.
     if (file_bytes.len >= 8 and std.mem.eql(u8, file_bytes[0..8], "!<arch>\n")) {
-        const obj = try readArchiveObject(io, gpa, path);
+        gpa.free(file_bytes);
         owned = false;
+        const obj = try readArchiveObject(io, gpa, path);
         return obj;
     }
 
@@ -75,10 +76,7 @@ pub fn readU16(bytes: []const u8, off: usize) u16 {
 }
 
 pub fn readU32(bytes: []const u8, off: usize) u32 {
-    return @as(u32, bytes[off])
-        | (@as(u32, bytes[off + 1]) << 8)
-        | (@as(u32, bytes[off + 2]) << 16)
-        | (@as(u32, bytes[off + 3]) << 24);
+    return @as(u32, bytes[off]) | (@as(u32, bytes[off + 1]) << 8) | (@as(u32, bytes[off + 2]) << 16) | (@as(u32, bytes[off + 3]) << 24);
 }
 
 pub fn readU64(bytes: []const u8, off: usize) u64 {
@@ -118,7 +116,7 @@ const RelX86_64_PC32: u32 = 2;
 fn cstr(strtab: []const u8, off: usize) []const u8 {
     if (off >= strtab.len) return "";
     const end = std.mem.indexOf(u8, strtab[off..], &[_]u8{0}) orelse strtab.len - off;
-    return strtab[off..off + end];
+    return strtab[off .. off + end];
 }
 
 fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
@@ -293,7 +291,7 @@ const CoffAuxSectionSize: u64 = 18;
 const CoffRelocSize: u64 = 10;
 
 const CoffRelocAddr64: u16 = 1; // IMAGE_REL_AMD64_ADDR64
-const CoffRelocRel32: u16 = 4;  // IMAGE_REL_AMD64_REL32
+const CoffRelocRel32: u16 = 4; // IMAGE_REL_AMD64_REL32
 
 /// Read a PE/COFF object from `bytes` (a raw object, not an archive).
 fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) !Object {
@@ -414,8 +412,8 @@ fn readCoffObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
 
 /// Read a short (inline) COFF symbol/section name from an 8-byte field.
 fn coffShortName(field: []const u8, off: usize) []const u8 {
-    const nul = std.mem.indexOf(u8, field[off..off + 8], &[_]u8{0}) orelse 8;
-    return field[off..off + nul];
+    const nul = std.mem.indexOf(u8, field[off .. off + 8], &[_]u8{0}) orelse 8;
+    return field[off .. off + nul];
 }
 
 /// Look up a section name by its 1-based COFF section number.
@@ -457,7 +455,7 @@ fn coffSymName(field: []const u8, strtab: []const u8) []const u8 {
 fn coffSymNameAt(sym_data: []const u8, strtab: []const u8, index: u32) []const u8 {
     const soff = @as(usize, index) * 18;
     if (soff + 8 > sym_data.len) return "";
-    return coffSymName(sym_data[soff..soff + 8], strtab);
+    return coffSymName(sym_data[soff .. soff + 8], strtab);
 }
 
 /// Read a NUL-terminated name from the string table at `offset` (offset into
@@ -466,7 +464,7 @@ fn coffSymNameAt(sym_data: []const u8, strtab: []const u8, index: u32) []const u
 fn strtabName(strtab: []const u8, offset: u64) []const u8 {
     if (offset >= @as(u64, strtab.len)) return "";
     const end = std.mem.indexOf(u8, strtab[offset..], &[_]u8{0}) orelse strtab.len - offset;
-    return strtab[offset..offset + end];
+    return strtab[offset .. offset + end];
 }
 
 // ============================================================================
@@ -500,7 +498,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
 
     var off: usize = 8;
     while (off + ArHeaderSize <= file_bytes.len) {
-        const hdr = file_bytes[off..off + ArHeaderSize];
+        const hdr = file_bytes[off .. off + ArHeaderSize];
         const size_field = hdr[48..58];
         const size_str = std.mem.trim(u8, size_field, " ");
         const size = std.fmt.parseInt(u64, size_str, 10) catch return error.ObjectReadFailed;
@@ -509,7 +507,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         if (member_data_start + size > file_bytes.len) {
             member_data = file_bytes[member_data_start..];
         } else {
-            member_data = file_bytes[member_data_start..member_data_start + size];
+            member_data = file_bytes[member_data_start .. member_data_start + size];
         }
         // Members are padded to a 2-byte boundary.
         off = member_data_start + ((size + 1) / 2 * 2);
@@ -523,7 +521,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 member_data,
             );
             try members.append(gpa, member);
-        } else if (member_data.len >= 4 and std.mem.eql(u8, member_data[0..4], &[_]u8{0x7f, 'E', 'L', 'F'})) {
+        } else if (member_data.len >= 4 and std.mem.eql(u8, member_data[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' })) {
             const member = try readElfObject(
                 gpa,
                 std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed,
@@ -544,6 +542,9 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         .sections = .empty,
         .symbols = .empty,
         .relocations = .empty,
+        .owned_text = null,
+        .owned_data = null,
+        .owns_symbol_names = true,
     };
     errdefer obj.deinit(gpa);
 
@@ -562,8 +563,8 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 }
             }
         }
+        merged_text = try gpa.alloc(u8, text_len);
         if (text_len > 0) {
-            merged_text = try gpa.alloc(u8, text_len);
             var pos: u64 = 0;
             for (members.items) |m| {
                 for (m.sections.items) |sec| {
@@ -574,8 +575,8 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 }
             }
         }
+        merged_data = try gpa.alloc(u8, data_len);
         if (data_len > 0) {
-            merged_data = try gpa.alloc(u8, data_len);
             var pos: u64 = 0;
             for (members.items) |m| {
                 for (m.sections.items) |sec| {
@@ -592,9 +593,12 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     var cum_text: u64 = 0;
     var cum_data: u64 = 0;
 
+    obj.owned_text = merged_text;
+    obj.owned_data = merged_data;
+
     // Sections.
     try obj.sections.append(gpa, .{
-        .name = try gpa.dupe(u8, ".text"),
+        .name = ".text",
         .offset = 0,
         .size = @as(u64, merged_text.len),
         .flags = 0,
@@ -603,7 +607,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     });
     if (merged_data.len > 0) {
         try obj.sections.append(gpa, .{
-            .name = try gpa.dupe(u8, ".data"),
+            .name = ".data",
             .offset = 0,
             .size = @as(u64, merged_data.len),
             .flags = 0,
@@ -695,6 +699,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
 
     // Release per-member containers now that their data has been merged.
     for (members.items) |*m| {
+        gpa.free(m.path);
         m.sections.deinit(gpa);
         m.symbols.deinit(gpa);
         m.relocations.deinit(gpa);

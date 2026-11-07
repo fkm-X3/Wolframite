@@ -30,7 +30,7 @@ pub const Target = enum(u8) {
 /// One format per platform keeps Ferro's reader simple: one reader per
 /// format, no cross-format conversion.
 pub const ObjectFormat = enum(u8) {
-    elf64,   // Linux: ET_REL ELF64 object, `.o`
+    elf64, // Linux: ET_REL ELF64 object, `.o`
     pe_coff, // Windows: COFF object, `.obj`
 };
 
@@ -95,12 +95,12 @@ pub fn defaultLinkOptions(target: Target) LinkOptions {
 /// Fields are string slices borrowed from the compiler arena; they must not
 /// outlive it.
 pub const LinkDescription = struct {
-    target: []const u8,      // "linux" | "windows"
-    output: []const u8,      // executable output path
-    entry: []const u8,       // entry symbol (default "_main")
-    subsystem: []const u8,   // "console" | "gui" (windows only)
+    target: []const u8, // "linux" | "windows"
+    output: []const u8, // executable output path
+    entry: []const u8, // entry symbol (default "_main")
+    subsystem: []const u8, // "console" | "gui" (windows only)
     runtime_lib: []const u8, // path to the wfr_std archive
-    input: []const u8,       // program object file to link
+    input: []const u8, // program object file to link
     debug: bool,
 };
 
@@ -115,14 +115,14 @@ pub const LinkDescriptionError = error{
 };
 
 /// Parse `s` ("linux" | "windows", case-insensitive) into a `Target`.
-pub fn parseTarget(s: []const u8) LinkDescriptionError !Target {
+pub fn parseTarget(s: []const u8) LinkDescriptionError!Target {
     if (std.ascii.eqlIgnoreCase(s, "linux")) return .linux_x86_64;
     if (std.ascii.eqlIgnoreCase(s, "windows")) return .windows_x86_64;
     return error.InvalidTarget;
 }
 
 /// Parse `s` ("console" | "gui", case-insensitive) into a `Subsystem`.
-pub fn parseSubsystem(s: []const u8) LinkDescriptionError !Subsystem {
+pub fn parseSubsystem(s: []const u8) LinkDescriptionError!Subsystem {
     if (std.ascii.eqlIgnoreCase(s, "console")) return .console;
     if (std.ascii.eqlIgnoreCase(s, "gui")) return .gui;
     return error.InvalidSubsystem;
@@ -134,7 +134,7 @@ pub fn parseSubsystem(s: []const u8) LinkDescriptionError !Subsystem {
 ///
 /// This is the "compile Wolframite → feed Ferro" mapping: the compiler fills a
 /// `LinkDescription` from source and Ferro turns it into `linkObject` args.
-pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError !LinkOptions {
+pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError!LinkOptions {
     const target = try parseTarget(desc.target);
     const subsystem = try parseSubsystem(desc.subsystem);
     return .{
@@ -255,8 +255,23 @@ pub const Object = struct {
     sections: std.ArrayList(Section),
     symbols: std.ArrayList(Symbol),
     relocations: std.ArrayList(Relocation),
+    /// Buffers owned by archive-merged objects (merged `.text`/`.data`).
+    /// `null` for directly-read objects, whose section contents borrow from
+    /// `file_bytes`.
+    owned_text: ?[]u8 = null,
+    owned_data: ?[]u8 = null,
+    /// When true, symbol and relocation names were duplicated and must be freed
+    /// by `deinit` (archive-merged objects). Directly-read objects borrow them
+    /// from `file_bytes`.
+    owns_symbol_names: bool = false,
 
     pub fn deinit(self: *Object, gpa: Allocator) void {
+        if (self.owns_symbol_names) {
+            for (self.symbols.items) |sym| gpa.free(sym.name);
+            for (self.relocations.items) |rel| gpa.free(rel.symbol);
+        }
+        if (self.owned_text) |buf| gpa.free(buf);
+        if (self.owned_data) |buf| gpa.free(buf);
         gpa.free(self.file_bytes);
         self.sections.deinit(gpa);
         self.symbols.deinit(gpa);

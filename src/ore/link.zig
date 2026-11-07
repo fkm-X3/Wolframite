@@ -128,7 +128,14 @@ pub fn linkBinary(
     defer gpa.free(source);
 
     const target = hostTarget();
-    const result = compile_mod.compile(gpa, source, .@"obj", target) catch return error.CompileFailed;
+
+    // All compiler allocations (AST, types, diagnostics, object bytes) are
+    // owned by this arena and released when linking completes.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const result = compile_mod.compile(arena_alloc, source, .obj, target) catch return error.CompileFailed;
     if (!result.ok) return error.CompileFailed;
 
     const obj_bytes = result.text orelse return error.CompileFailed;
@@ -179,11 +186,81 @@ test "findWfrStdLib reports a missing runtime instead of guessing" {
     }
 }
 
+test "linkBinary reports CompileFailed for source that does not compile" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const source_path = "link_binary_compile_failed.wfr";
+    const exe_path = "link_binary_compile_failed.exe";
+    const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch {
+        return;
+    };
+    defer gpa.free(obj_path);
+    defer {
+        _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(io, exe_path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+    }
+
+    const bad_source = "fn main() -> i32 { return \n";
+    if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = bad_source })) |_| {} else |_| {
+        // The test working directory is not writable; nothing meaningful to assert.
+        return;
+    }
+
+    if (linkBinary(io, gpa, source_path, exe_path)) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(LinkError.CompileFailed, err);
+    }
+}
+
+test "linkBinary reports StdLibMissing when the runtime archive is absent" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const source_path = "link_binary_stdlib_missing.wfr";
+    const exe_path = "link_binary_stdlib_missing.exe";
+    const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch {
+        return;
+    };
+    defer gpa.free(obj_path);
+    defer {
+        _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(io, exe_path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+    }
+
+    const good_source = "fn main() -> i32 { return 0 }\n";
+    if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = good_source })) |_| {} else |_| {
+        return;
+    }
+
+    var runtime_absent: bool = true;
+    if (findWfrStdLib(io, gpa)) |path| {
+        gpa.free(path);
+        runtime_absent = false;
+    } else |_| {}
+
+    if (linkBinary(io, gpa, source_path, exe_path)) |_| {
+        // Only reachable when a runtime is installed in the test environment.
+        try std.testing.expectEqual(false, runtime_absent);
+        if (std.Io.Dir.cwd().statFile(io, exe_path, .{})) |_| {} else |_| {
+            try std.testing.expect(false);
+        }
+    } else |err| {
+        try std.testing.expectEqual(true, runtime_absent);
+        try std.testing.expectEqual(LinkError.StdLibMissing, err);
+    }
+}
+
 test "replaceExt rewrites the extension, keeping the directory" {
     const gpa = testing.allocator;
     const got = try replaceExt(gpa, "build/out/hello.obj", "o");
     defer gpa.free(got);
-    try testing.expectEqualStrings("build/out/hello.o", got);
+    const expected = try std.fmt.allocPrint(gpa, "build/out{c}hello.o", .{std.fs.path.sep});
+    defer gpa.free(expected);
+    try testing.expectEqualStrings(expected, got);
 
     const bare = try replaceExt(gpa, "hello.o", "obj");
     defer gpa.free(bare);

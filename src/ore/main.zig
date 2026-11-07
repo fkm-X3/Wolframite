@@ -20,6 +20,13 @@ const update_mod = @import("update.zig");
 const replaceExt = link_mod.replaceExt;
 const hostObjectExt = link_mod.hostObjectExt;
 const hostTarget = link_mod.hostTarget;
+
+// Include link.zig's test blocks in the ore test build, mirroring the
+// pattern used by compiler/root.zig so that imported modules' tests run.
+test {
+    _ = @import("link.zig");
+}
+
 const diag_mod = @import("compiler").diagnostics;
 
 const version_string = "Dev (unstable)";
