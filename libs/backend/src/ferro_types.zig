@@ -289,6 +289,12 @@ pub const ResolvedSymbols = struct {
 pub const ImportThunk = struct {
     name: []const u8,
     rva: u64,
+    /// Merged-text address of the thunk in `.text`.
+    thunk_addr: u64,
+    /// Merged-data address of the IAT slot for this import.
+    iat_slot_addr: u64,
+    /// Merged-data address of the `IMAGE_IMPORT_BY_NAME` entry.
+    name_entry_addr: u64,
 };
 
 /// Relocations applied and sections merged into output sections.
@@ -304,6 +310,10 @@ pub const MergedImage = struct {
     bss_size: u64,
     symbols: std.StringHashMap(ResolvedSymbol),
     import_thunks: std.ArrayList(ImportThunk),
+    /// Merged-data address of the import directory descriptor (0 if none).
+    import_desc_addr: u64,
+    /// Size in bytes of the import directory (descriptors incl. terminator).
+    import_desc_size: u64,
 
     pub fn deinit(self: *MergedImage, gpa: Allocator) void {
         for (self.import_thunks.items) |thunk| gpa.free(thunk.name);

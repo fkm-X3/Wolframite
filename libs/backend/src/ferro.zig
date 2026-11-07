@@ -164,7 +164,7 @@ pub fn linkObject(
     var resolved = try resolveSymbols(&object, &runtime, options.entry_symbol, gpa);
     defer resolved.deinit(gpa);
 
-    var image = try applyRelocations(&object, &runtime, &resolved, gpa);
+    var image = try applyRelocations(&object, &runtime, &resolved, gpa, options.target);
     defer image.deinit(gpa);
 
     try writeExecutable(&image, exe_path, options, gpa, io);
@@ -643,7 +643,7 @@ test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
     var resolved = try resolveSymbols(&program, &runtime, "_main", gpa);
     defer resolved.deinit(gpa);
 
-    var image = try applyRelocations(&program, &runtime, &resolved, gpa);
+    var image = try applyRelocations(&program, &runtime, &resolved, gpa, .linux_x86_64);
     defer image.deinit(gpa);
 
     // Merged layout: .text = prog(4) + rt(2) = 6 bytes; .data = prog(8) + rt(0) = 8 bytes.
@@ -683,6 +683,8 @@ test "writeExecutableElf produces an ELF executable whose _start calls _main" {
         .bss_size = 0,
         .symbols = symbols,
         .import_thunks = .empty,
+        .import_desc_addr = 0,
+        .import_desc_size = 0,
     };
 
     const buf = try writeExecutableElf(&image, 42, gpa);
@@ -728,6 +730,8 @@ test "writeExecutable reports UndefinedSymbol when entry symbol is absent" {
         .bss_size = 0,
         .symbols = symbols,
         .import_thunks = .empty,
+        .import_desc_addr = 0,
+        .import_desc_size = 0,
     };
     const opts = defaultLinkOptions(.linux_x86_64);
     if (writeExecutable(&image, "no-such-entry.exe", opts, gpa, io)) |_| {
@@ -909,6 +913,8 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
         .bss_size = 0,
         .symbols = symbols,
         .import_thunks = .empty,
+        .import_desc_addr = 0,
+        .import_desc_size = 0,
     };
 
     const buf = try writeExecutablePe(&image, 10, .console, gpa);

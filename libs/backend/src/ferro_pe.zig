@@ -191,8 +191,21 @@ pub fn writeExecutablePe(
     putU64At(buf, pos, 0x1000); pos += 8; // size_of_heap_commit
     putU32At(buf, pos, 0); pos += 4; // loader_flags
     putU32At(buf, pos, PeNumberOfRvaAndSizes); pos += 4; // number_of_rva_and_sizes
-    // data directories: 16 x 8 bytes = 128 bytes, all zero (already zeroed)
-    pos += PeNumberOfRvaAndSizes * PeDataDirEntrySize;
+    // data directories: 16 x 8 bytes. Entry 1 = import table (if present).
+    const import_desc_rva: u64 = if (image.import_desc_addr > image.text.len)
+        data_sec_vaddr + (image.import_desc_addr - image.text.len)
+    else 0;
+    const import_desc_size: u64 = if (import_desc_rva != 0) image.import_desc_size else 0;
+    var di: u32 = 0;
+    while (di < PeNumberOfRvaAndSizes) : (di += 1) {
+        if (di == 1) {
+            putU32At(buf, pos, @as(u32, @intCast(import_desc_rva & 0xFFFFFFFF))); pos += 4;
+            putU32At(buf, pos, @as(u32, @intCast(import_desc_size & 0xFFFFFFFF))); pos += 4;
+        } else {
+            putU32At(buf, pos, 0); pos += 4;
+            putU32At(buf, pos, 0); pos += 4;
+        }
+    }
 
     // ---- Section table (sec_count x 40 bytes) ----
     const sec_names = [_][]const u8{ ".text", ".data", ".bss" };

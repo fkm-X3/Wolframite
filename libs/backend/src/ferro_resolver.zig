@@ -54,9 +54,18 @@ pub fn resolveSymbols(
         }
     }
 
-    if (result.undefined.items.len > 0) {
-        const name = result.undefined.items[0];
-        std.debug.print("Ferro: undefined symbol '{s}' not found in program or runtime archive\n", .{name});
+    // Allow Windows kernel32 imports to remain undefined: they are resolved via
+    // the PE import table rather than the runtime archive.
+    var has_unresolved: bool = false;
+    var first_unresolved: []const u8 = "";
+    for (result.undefined.items) |name| {
+        if (!ferro_types.isKernel32Import(name)) {
+            has_unresolved = true;
+            if (first_unresolved.len == 0) first_unresolved = name;
+        }
+    }
+    if (has_unresolved) {
+        std.debug.print("Ferro: undefined symbol '{s}' not found in program or runtime archive\n", .{first_unresolved});
         return error.UndefinedSymbol;
     }
 

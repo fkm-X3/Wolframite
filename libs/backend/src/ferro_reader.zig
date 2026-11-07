@@ -557,7 +557,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             for (m.sections.items) |sec| {
                 if (std.mem.eql(u8, sec.name, ".text")) {
                     text_len += sec.size;
-                } else if (std.mem.eql(u8, sec.name, ".data")) {
+                } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
                     data_len += sec.size;
                 }
             }
@@ -579,7 +579,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             var pos: u64 = 0;
             for (members.items) |m| {
                 for (m.sections.items) |sec| {
-                    if (std.mem.eql(u8, sec.name, ".data")) {
+                    if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
                         for (sec.content, 0..) |b, i| merged_data[pos + @as(usize, i)] = b;
                         pos += sec.size;
                     }
@@ -614,6 +614,10 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
 
     // Symbols.
     for (members.items) |m| {
+        var member_data_size: u64 = 0;
+        for (m.sections.items) |sec| {
+            if (std.mem.eql(u8, sec.name, ".data")) member_data_size += sec.size;
+        }
         for (m.symbols.items) |sym| {
             if (sym.name.len == 0) continue;
             var sec: ?[]const u8 = null;
@@ -627,6 +631,9 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             } else if (std.mem.eql(u8, sym.section.?, ".data")) {
                 sec = ".data";
                 value = cum_data + sym.value;
+            } else if (std.mem.eql(u8, sym.section.?, ".rdata")) {
+                sec = ".data";
+                value = cum_data + member_data_size + sym.value;
             } else {
                 continue;
             }
@@ -642,20 +649,35 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         for (m.sections.items) |sec| {
             if (std.mem.eql(u8, sec.name, ".text")) {
                 cum_text += sec.size;
-            } else if (std.mem.eql(u8, sec.name, ".data")) {
+            } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
                 cum_data += sec.size;
             }
         }
     }
 
-    // Relocations.
+    // Relocations. Only carry over relocations that target a section we
+    // actually merged (.text or .data). Relocations against .rdata, .xdata,
+    // .pdata, etc. are dropped: Ferro's object model has no representation
+    // for those sections, and applying them to .data corrupts appended data
+    // such as the PE import table.
     cum_text = 0;
     cum_data = 0;
     for (members.items) |m| {
+        var member_data_size: u64 = 0;
+        for (m.sections.items) |sec| {
+            if (std.mem.eql(u8, sec.name, ".data")) member_data_size += sec.size;
+        }
         for (m.relocations.items) |rel| {
-            const off_base = if (rel.section_idx == 1) cum_text else cum_data;
+            const sec_name = if (rel.section_idx > 0 and rel.section_idx <= m.sections.items.len)
+                m.sections.items[rel.section_idx - 1].name
+            else
+                "";
+            if (!std.mem.eql(u8, sec_name, ".text") and !std.mem.eql(u8, sec_name, ".data") and !std.mem.eql(u8, sec_name, ".rdata")) continue;
+            // Remap to Ferro's two-section model: .text -> 1, .data -> 2.
+            const new_section_idx: u16 = if (std.mem.eql(u8, sec_name, ".text")) 1 else 2;
+            const off_base = if (new_section_idx == 1) cum_text else (cum_data + (if (std.mem.eql(u8, sec_name, ".rdata")) member_data_size else 0));
             try obj.relocations.append(gpa, .{
-                .section_idx = rel.section_idx,
+                .section_idx = new_section_idx,
                 .offset = rel.offset + off_base,
                 .symbol = try gpa.dupe(u8, rel.symbol),
                 .kind = rel.kind,
@@ -665,7 +687,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         for (m.sections.items) |sec| {
             if (std.mem.eql(u8, sec.name, ".text")) {
                 cum_text += sec.size;
-            } else if (std.mem.eql(u8, sec.name, ".data")) {
+            } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
                 cum_data += sec.size;
             }
         }
