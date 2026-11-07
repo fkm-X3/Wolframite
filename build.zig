@@ -357,15 +357,11 @@ fn addInstallCompilerStep(
     }
 
     // Install helper copies artifacts to the system install location via
-    // platform-specific scripts (matching scripts/dev-install.sh on Linux
-    // and the build.zig doc comment on Windows).
+    // scripts/install-compiler.py (replacing the old install-compiler.ps1
+    // and install-compiler.sh).
     switch (builtin.os.tag) {
-        .windows => {
-            const script_step = b.addSystemCommand(&.{"pwsh", "-File", "scripts/install-compiler.ps1"});
-            install_step.dependOn(&script_step.step);
-        },
-        .linux => {
-            const script_step = b.addSystemCommand(&.{"sh", "scripts/install-compiler.sh"});
+        .windows, .linux => {
+            const script_step = b.addSystemCommand(&.{"python", "scripts/install-compiler.py"});
             install_step.dependOn(&script_step.step);
         },
         else => {},
