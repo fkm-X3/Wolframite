@@ -6,6 +6,7 @@ pub const codegen = @import("codegen.zig");
 pub const obj_elf = @import("obj_elf.zig");
 pub const obj_pe = @import("obj_pe.zig");
 pub const api = @import("api.zig");
+pub const sim = @import("sim.zig");
 pub const ferro = @import("ferro.zig");
 pub const ferro_types = @import("ferro_types.zig");
 pub const ferro_reader = @import("ferro_reader.zig");
