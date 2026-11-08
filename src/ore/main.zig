@@ -18,6 +18,7 @@ const manifest_mod = @import("manifest.zig");
 const compile_mod = @import("compile.zig");
 const link_mod = @import("link.zig");
 const update_mod = @import("update.zig");
+const disasm_mod = @import("disasm.zig");
 
 const replaceExt = link_mod.replaceExt;
 const hostObjectExt = link_mod.hostObjectExt;
@@ -72,6 +73,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "run")) return cmdRun(gpa, io, rest);
     if (std.mem.eql(u8, command, "update")) return cmdUpdate(gpa, io, rest);
     if (std.mem.eql(u8, command, "check-codegen")) return cmdCheckCodegen(gpa, io, rest);
+    if (std.mem.eql(u8, command, "disasm")) return disasm_mod.cmdDisasm(gpa, io, rest);
 
     reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
@@ -635,6 +637,8 @@ fn printHelp(io: Io) void {
         \\  run [file]       Run a previously built executable (does not compile or link)
         \\  check-codegen <file>
         \\                   Statically verify a Tungsten object file for codegen bugs
+        \\  disasm <file>
+        \\                   Disassemble a Tungsten object file with relocation annotations
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:
