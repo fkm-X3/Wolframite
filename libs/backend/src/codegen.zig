@@ -5,6 +5,12 @@ const obj_pe = @import("obj_pe.zig");
 const ferro = @import("ferro.zig");
 const Allocator = std.mem.Allocator;
 
+const BranchPatch = struct {
+    site: usize,
+    target: u32,
+    is_je: bool,
+};
+
 pub const CodeGen = struct {
     gpa: Allocator,
     module: *const ir.Module,
@@ -12,6 +18,11 @@ pub const CodeGen = struct {
     param_count: u32,
     value_offsets: std.AutoHashMapUnmanaged(ir.Value, i32),
     alloca_offsets: std.AutoHashMapUnmanaged(u32, i32),
+
+    // Per-function block start offsets (byte offsets into obj_text) and
+    // branch patch records, used to resolve branch targets and phi nodes.
+    block_offsets: std.ArrayList(u32),
+    branch_patches: std.ArrayList(BranchPatch),
 
     // Object-emission state (only populated when emitting an object file).
     obj_text: std.ArrayList(u8),
@@ -26,6 +37,8 @@ pub const CodeGen = struct {
             .param_count = 0,
             .value_offsets = .{},
             .alloca_offsets = .{},
+            .block_offsets = .empty,
+            .branch_patches = .empty,
             .obj_text = .empty,
             .obj_data = .empty,
             .obj_relocs = .empty,
@@ -36,6 +49,8 @@ pub const CodeGen = struct {
     pub fn deinit(self: *@This()) void {
         self.value_offsets.deinit(self.gpa);
         self.alloca_offsets.deinit(self.gpa);
+        self.block_offsets.deinit(self.gpa);
+        self.branch_patches.deinit(self.gpa);
         self.obj_text.deinit(self.gpa);
         self.obj_data.deinit(self.gpa);
 
@@ -136,6 +151,8 @@ pub const CodeGen = struct {
         self.value_offsets.clearRetainingCapacity();
         self.alloca_offsets.clearRetainingCapacity();
         self.param_count = func.param_count;
+        self.block_offsets.clearRetainingCapacity();
+        self.branch_patches.clearRetainingCapacity();
 
         const name = self.module.strings.get(func.name);
         const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{name});
@@ -208,7 +225,7 @@ pub const CodeGen = struct {
                 try self.o8(0x48);
                 try self.o8(0x8b);
                 try self.o8(0x84);
-                try self.o8(0x04);
+                try self.o8(0x24);
                 const disp_raw: u32 = 48 + (i - 4) * 8;
                 try self.emitI32(@bitCast(disp_raw));
                 // mov [rbp + off], rax (modrm 0x85 + disp32)
@@ -220,11 +237,11 @@ pub const CodeGen = struct {
         }
 
         if (frame_size > 0) {
-            // sub rsp, imm8
+            // sub rsp, imm32
             try self.o8(0x48);
-            try self.o8(0x83);
+            try self.o8(0x81);
             try self.o8(0xec);
-            try self.o8(@truncate(frame_size));
+            try self.emitI32(@intCast(frame_size));
         }
 
         const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c }; // rcx, rdx, r8, r9
@@ -240,7 +257,11 @@ pub const CodeGen = struct {
             }
         }
 
-        for (func.blocks.items) |_block| {
+        for (func.blocks.items, 0..) |blk, blk_idx| {
+            const _block = blk;
+            // Record this block's start offset for branch target resolution.
+            try self.block_offsets.append(self.gpa, @intCast(self.obj_text.items.len));
+
             const start = @intFromEnum(_block.first_inst);
             var rel: u32 = 0;
             while (rel < _block.inst_count) : (rel += 1) {
@@ -249,11 +270,25 @@ pub const CodeGen = struct {
                 const value_idx = self.param_count + start + rel;
 
                 if (is_last and (inst.opcode == .br or inst.opcode == .cond_br or inst.opcode == .ret or inst.opcode == .ret_void)) {
-                    try self.emitControlFlowObject(func, inst);
+                    try self.emitControlFlowObject(func, inst, @intCast(blk_idx));
                 } else {
                     try self.emitInstructionObject(func, inst, value_idx);
                 }
             }
+        }
+
+        // Patch recorded branch targets now that all block offsets are known.
+        for (self.branch_patches.items) |bp| {
+            if (bp.target >= self.block_offsets.items.len) continue;
+            const target_off = self.block_offsets.items[bp.target];
+            const disp: i32 = @intCast(@as(i64, target_off) - @as(i64, @intCast(bp.site + 4)));
+            // Write disp (little-endian i32) at site.
+            const bytes = self.obj_text.items;
+            const u: u32 = @bitCast(disp);
+            bytes[bp.site] = @truncate(u);
+            bytes[bp.site + 1] = @truncate(u >> 8);
+            bytes[bp.site + 2] = @truncate(u >> 16);
+            bytes[bp.site + 3] = @truncate(u >> 24);
         }
 
         // Epilogue: leave; ret
@@ -399,13 +434,20 @@ pub const CodeGen = struct {
                 // div/idiv qword [rbp + b]
                 try self.o8(0x48);
                 try self.o8(0xf7);
-                try self.o8(0x85);
+                if (is_signed) {
+                    try self.o8(0xbd);
+                } else {
+                    try self.o8(0xb5);
+                }
                 try self.emitI32(b);
                 // mov [rbp + r], rax/rdx
-                const res_reg: u8 = if (is_rem) 0x82 else 0x80; // mov [rbp+r], rdx/rax
                 try self.o8(0x48);
-                try self.o8(res_reg);
-                try self.o8(0x85);
+                try self.o8(0x89);
+                if (is_rem) {
+                    try self.o8(0x95);
+                } else {
+                    try self.o8(0x85);
+                }
                 try self.emitI32(r);
             },
             .shl, .shr => |op| {
@@ -494,6 +536,7 @@ pub const CodeGen = struct {
                 // {sc} al
                 try self.o8(0x0f);
                 try self.o8(sc);
+                try self.o8(0xc0);
                 // movzx eax, al
                 try self.o8(0x0f);
                 try self.o8(0xb6);
@@ -622,9 +665,9 @@ pub const CodeGen = struct {
                 try self.emitI32(0); // placeholder
                 if (extra_stack > 0) {
                     try self.o8(0x48);
-                    try self.o8(0x83);
+                    try self.o8(0x81);
                     try self.o8(0xc4);
-                    try self.o8(@truncate(extra_stack));
+                    try self.emitI32(@intCast(extra_stack));
                 }
                 if (inst.producesValue()) {
                     const r = try self.valueOffsetOf(value_idx);
@@ -647,9 +690,9 @@ pub const CodeGen = struct {
                 }
                 if (extra_stack > 0) {
                     try self.o8(0x48);
-                    try self.o8(0x83);
+                    try self.o8(0x81);
                     try self.o8(0xec);
-                    try self.o8(@truncate(extra_stack));
+                    try self.emitI32(@intCast(extra_stack));
                 }
                 // mov r10, [rbp + callee_off]
                 try self.o8(0x4c);
@@ -670,7 +713,7 @@ pub const CodeGen = struct {
                             try self.emitI32(arg_off);
                             try self.o8(0x48);
                             try self.o8(0x89);
-                            try self.o8(0x44);
+                            try self.o8(0x84);
                             try self.o8(0x24);
                             try self.emitI32(stack_pos);
                         }
@@ -704,9 +747,9 @@ pub const CodeGen = struct {
                 try self.o8(0xd0); // call rax
                 if (extra_stack > 0) {
                     try self.o8(0x48);
-                    try self.o8(0x83);
+                    try self.o8(0x81);
                     try self.o8(0xc4);
-                    try self.o8(@truncate(extra_stack));
+                    try self.emitI32(@intCast(extra_stack));
                 }
                 if (inst.producesValue()) {
                     const r = try self.valueOffsetOf(value_idx);
@@ -726,9 +769,9 @@ pub const CodeGen = struct {
                 try self.emitI32(0); // placeholder
                 if (extra_stack > 0) {
                     try self.o8(0x48);
-                    try self.o8(0x83);
+                    try self.o8(0x81);
                     try self.o8(0xc4);
-                    try self.o8(@truncate(extra_stack));
+                    try self.emitI32(@intCast(extra_stack));
                 }
             },
             .phi => {
@@ -774,9 +817,9 @@ pub const CodeGen = struct {
 
         if (extra_stack > 0) {
             try self.o8(0x48);
-            try self.o8(0x83);
+            try self.o8(0x81);
             try self.o8(0xec);
-            try self.o8(@truncate(extra_stack));
+            try self.emitI32(@intCast(extra_stack));
         }
 
         {
@@ -802,7 +845,7 @@ pub const CodeGen = struct {
                 try self.emitI32(arg_off);
                 try self.o8(0x48);
                 try self.o8(0x89);
-                try self.o8(0x44);
+                try self.o8(0x84);
                 try self.o8(0x24);
                 try self.emitI32(stack_pos);
             }
@@ -811,13 +854,60 @@ pub const CodeGen = struct {
         return extra_stack;
     }
 
-    fn emitControlFlowObject(self: *@This(), func: *const ir.Function, inst: ir.Instruction) !void {
+    fn emitPhiResolutionObject(self: *@This(), func: *const ir.Function, from_block: u32, to_block: u32) !void {
+        if (to_block >= func.blocks.items.len) return;
+        const target_block = func.blocks.items[to_block];
+        const start = @intFromEnum(target_block.first_inst);
+        var rel: u32 = 0;
+        while (rel < target_block.inst_count) : (rel += 1) {
+            const inst = func.instructions.items[start + rel];
+            if (inst.opcode != .phi) break;
+            const value_idx = self.param_count + start + rel;
+            const phi_off = self.valueOff(value_idx) catch continue;
+            const ops = func.getOperands(inst.operands);
+            var incoming_value: ?u32 = null;
+            var i: usize = 0;
+            while (i + 1 < ops.len) : (i += 2) {
+                if (ops[i + 1] == from_block) {
+                    incoming_value = ops[i];
+                    break;
+                }
+            }
+            if (incoming_value) |iv| {
+                const inc_off = self.valueOff(iv) catch continue;
+                // mov rax, [rbp + inc_off]
+                try self.o8(0x48);
+                try self.o8(0x8b);
+                try self.o8(0x85);
+                try self.emitI32(inc_off);
+                // mov [rbp + phi_off], rax
+                try self.o8(0x48);
+                try self.o8(0x89);
+                try self.o8(0x85);
+                try self.emitI32(phi_off);
+            }
+        }
+    }
+
+    fn emitControlFlowObject(self: *@This(), func: *const ir.Function, inst: ir.Instruction, current_block: u32) !void {
         const ops = func.getOperands(inst.operands);
         switch (inst.opcode) {
             .br => {
+                const target: u32 = ops[0];
+                // Resolve phi nodes in the target block for this predecessor.
+                try self.emitPhiResolutionObject(func, current_block, target);
+                if (target != current_block + 1) {
+                    // jmp rel32 (placeholder, patched later)
+                    try self.o8(0xe9);
+                    const site = self.obj_text.items.len;
+                    try self.emitI32(0);
+                    try self.branch_patches.append(self.gpa, .{ .site = site, .target = target, .is_je = false });
+                }
             },
             .cond_br => {
                 const cond_off = try self.valueOff(ops[0]);
+                const true_target: u32 = ops[1];
+                const false_target: u32 = ops[2];
                 // mov rax, [rbp + cond_off] (modrm 0x85)
                 try self.o8(0x48);
                 try self.o8(0x8b);
@@ -828,12 +918,31 @@ pub const CodeGen = struct {
                 try self.o8(0x83);
                 try self.o8(0xf8);
                 try self.o8(0x00);
-                // je +8
-                try self.o8(0x74);
-                try self.o8(0x08);
-                // jmp rel32 (placeholder)
-                try self.o8(0xe9);
+                // jne true_inline (rel32): 0F 85
+                try self.o8(0x0f);
+                try self.o8(0x85);
+                const jne_site = self.obj_text.items.len;
                 try self.emitI32(0);
+                // false path:
+                try self.emitPhiResolutionObject(func, current_block, false_target);
+                try self.o8(0xe9);
+                const false_jmp_site = self.obj_text.items.len;
+                try self.emitI32(0);
+                try self.branch_patches.append(self.gpa, .{ .site = false_jmp_site, .target = false_target, .is_je = false });
+                // true_inline:
+                const true_inline = self.obj_text.items.len;
+                const disp: i32 = @intCast(@as(i64, @intCast(true_inline)) - @as(i64, @intCast(jne_site + 4)));
+                const u: u32 = @bitCast(disp);
+                self.obj_text.items[jne_site] = @truncate(u);
+                self.obj_text.items[jne_site + 1] = @truncate(u >> 8);
+                self.obj_text.items[jne_site + 2] = @truncate(u >> 16);
+                self.obj_text.items[jne_site + 3] = @truncate(u >> 24);
+                // true path:
+                try self.emitPhiResolutionObject(func, current_block, true_target);
+                try self.o8(0xe9);
+                const true_jmp_site = self.obj_text.items.len;
+                try self.emitI32(0);
+                try self.branch_patches.append(self.gpa, .{ .site = true_jmp_site, .target = true_target, .is_je = false });
             },
             .ret => {
                 const val_off = try self.valueOff(ops[0]);

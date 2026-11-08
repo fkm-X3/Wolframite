@@ -408,8 +408,8 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
 
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x89, 0x8d }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x20 }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x44, 0x24, 0x28 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x20, 0x00, 0x00, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x28, 0x00, 0x00, 0x00 }) != null);
 }
 
 test "nested closure: inner closure created and called inside an outer closure body" {

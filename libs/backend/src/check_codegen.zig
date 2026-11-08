@@ -238,6 +238,8 @@ pub fn decodeInstruction(bytes: []const u8) !DecodedInstruction {
     const needs_modrm = switch (opcode2) {
         // 0x0F group
         0xB6 => true, // movzx
+        0x40...0x4F => true, // cmovcc
+        0x90...0x9F => true, // setcc / cmov
         else => switch (opcode) {
             0x8B => true, // mov r/m32 -> r32
             0x89 => true, // mov r32 -> r/m32
@@ -328,7 +330,9 @@ pub fn decodeInstruction(bytes: []const u8) !DecodedInstruction {
     // --- Immediate ---
     var imm_len: u8 = 0;
     var imm: u64 = 0;
-    const needs_imm = switch (opcode2) {
+    const needs_imm = if (opcode == 0x0F and opcode2 >= 0x80 and opcode2 <= 0x8F)
+        true
+    else switch (opcode2) {
         else => switch (opcode) {
             0xE8 => true, // call rel32
             0xE9 => true, // jmp rel32

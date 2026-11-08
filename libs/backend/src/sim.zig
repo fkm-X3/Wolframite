@@ -26,6 +26,8 @@ pub const Simulator = struct {
     current_func: usize,
     /// Currently executing block index within the current function.
     current_block: usize,
+    /// The block we entered the current block from (for phi resolution).
+    prev_block: usize,
     /// Block entry PC for each block (start instruction index).
     block_pcs: []usize,
     /// Number of instructions per block.
@@ -58,6 +60,7 @@ pub const Simulator = struct {
             .pc = 0,
             .current_func = func_idx,
             .current_block = 0,
+            .prev_block = 0,
             .block_pcs = undefined,
             .block_counts = undefined,
             .retval = 0,
@@ -154,6 +157,7 @@ pub const Simulator = struct {
                 self.call_stack.items = self.call_stack.items[0..frame_idx];
                 self.current_func = frame.func;
                 self.current_block = frame.block;
+                self.prev_block = frame.prev_block;
                 self.pc = frame.pc;
                 self.halted = false;
                 if (frame.retval_slot != std.math.maxInt(usize)) {
@@ -416,12 +420,11 @@ pub const Simulator = struct {
                 self.traceInst("func_addr", result_slot, @intCast(fidx));
             },
             .phi => {
-                // Resolve the incoming value from the block we entered from.
                 var found: ?i64 = null;
                 var i: usize = 0;
                 while (i + 1 < ops.len) : (i += 2) {
                     const inc_block = @as(usize, @intCast(ops[i + 1]));
-                    if (inc_block == self.current_block) {
+                    if (inc_block == self.prev_block) {
                         found = try self.readSlot(ops[i]);
                         break;
                     }
@@ -437,6 +440,7 @@ pub const Simulator = struct {
     fn jumpToBlock(self: *Simulator, target: usize) !void {
         const func = &self.module.functions.items[self.current_func];
         if (target >= func.blocks.items.len) return error.InvalidBranchTarget;
+        self.prev_block = self.current_block;
         self.current_block = target;
         self.pc = self.block_pcs[target];
     }
@@ -456,6 +460,7 @@ pub const Simulator = struct {
         try self.call_stack.append(self.gpa, .{
             .func = self.current_func,
             .block = self.current_block,
+            .prev_block = self.prev_block,
             .pc = resume_pc,
             .retval_slot = @intCast(result_slot),
         });
@@ -498,6 +503,7 @@ pub const Simulator = struct {
 pub const CallFrame = struct {
     func: usize,
     block: usize,
+    prev_block: usize,
     pc: usize,
     /// Slot index where the caller wants the return value stored (or usize
     /// max if the call result is discarded).
