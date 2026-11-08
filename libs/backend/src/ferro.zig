@@ -103,6 +103,177 @@ pub const writeExecutablePe = ferro_pe.writeExecutablePe;
 // Executable writer dispatch
 // ============================================================================
 
+// ============================================================================
+// Merged-image dump (debugging: `LinkOptions.dump`)
+// ============================================================================
+
+/// Return the raw section content (`.text` / `.data`) for a relocation's
+/// section index, or null when the section is absent.
+fn sectionContent(obj: *const Object, section_idx: u16) ?[]const u8 {
+    const name = switch (section_idx) {
+        1 => ".text",
+        2 => ".data",
+        else => return null,
+    };
+    for (obj.sections.items) |sec| {
+        if (std.mem.eql(u8, sec.name, name)) return sec.content;
+    }
+    return null;
+}
+
+/// Size of a named section in `obj`, or 0 if absent.
+fn sectionSize(obj: *const Object, name: []const u8) u64 {
+    for (obj.sections.items) |sec| {
+        if (std.mem.eql(u8, sec.name, name)) return sec.size;
+    }
+    return 0;
+}
+
+/// Print one object file's relocation list to `w` with computed
+/// site/target/displacement before and after application. `section_base` is
+/// the merged address where this object's `.text` / `.data` starts.
+fn dumpObjectRelocs(
+    w: *std.Io.File.Writer,
+    label: []const u8,
+    obj: *const Object,
+    text_base: u64,
+    data_base: u64,
+    gap: u64,
+    symbols: *const std.StringHashMap(ferro_types.ResolvedSymbol),
+) void {
+    const i32_min = @as(i64, std.math.minInt(i32));
+    const i32_max = @as(i64, std.math.maxInt(i32));
+    const near_limit: i64 = 1024;
+
+    _ = w.interface.print("\n-- {s} relocations --\n", .{label}) catch {};
+    for (obj.relocations.items) |rel| {
+        const section_name = switch (rel.section_idx) {
+            1 => ".text",
+            2 => ".data",
+            else => ".?",
+        };
+        const is_data = rel.section_idx == 2;
+        const base = if (is_data) data_base else text_base;
+        const site_merged = base + rel.offset;
+        const p_va = site_merged + (if (is_data) gap else 0);
+
+        // Raw bytes currently sitting at the relocation site (before patching).
+        var before: [8]u8 = undefined;
+        var before_len: usize = 0;
+        if (sectionContent(obj, rel.section_idx)) |content| {
+            before_len = @min(content.len, 8);
+            var i: usize = 0;
+            while (i < before_len) : (i += 1) {
+                before[i] = content[@as(usize, @intCast(rel.offset)) + i];
+            }
+        }
+
+        const sym_addr = symbols.get(rel.symbol);
+        const s_merged = if (sym_addr) |a| a.value else 0;
+        const s_va = s_merged + (if (is_data and sym_addr != null) gap else 0);
+
+        var disp_after: i64 = 0;
+        const kind_name = switch (rel.kind) {
+            .pc32 => "PC32",
+            .addr64 => "ADDR64",
+        };
+        switch (rel.kind) {
+            .pc32 => {
+                const s_va_i64: i64 = @intCast(s_va);
+                const p_va_i64: i64 = @intCast(p_va);
+                disp_after = s_va_i64 + rel.addend - p_va_i64;
+            },
+            .addr64 => {
+                const s_merged_i64: i64 = @intCast(s_merged);
+                disp_after = s_merged_i64 + rel.addend;
+            },
+        }
+
+        const near_i32_limit = rel.kind == .pc32 and (
+            @abs(disp_after - i32_min) <= near_limit or
+            @abs(disp_after - i32_max) <= near_limit
+        );
+
+        _ = w.interface.print(
+            "  {s} {s}+0x{x} -> {s} (0x{x}) | kind={s} addend={d} | before_disp={d} after_disp={d}{s}\n",
+            .{
+                section_name, section_name, rel.offset,
+                if (sym_addr) |a| a.section else "?",
+                if (sym_addr) |a| a.value else 0,
+                kind_name, rel.addend,
+                rel.addend,
+                disp_after,
+                if (near_i32_limit) "  <-- near i32 limit" else "",
+            },
+        ) catch {};
+
+        var hex_buf: [16 * 2 + 3]u8 = undefined;
+        var hex_len: usize = 0;
+        var i: usize = 0;
+        while (i < before_len) : (i += 1) {
+            const nibbles = "0123456789abcdef";
+            hex_buf[hex_len * 2] = nibbles[@intCast((before[i] >> 4) & 0x0f)];
+            hex_buf[hex_len * 2 + 1] = nibbles[@intCast(before[i] & 0x0f)];
+            hex_len += 1;
+        }
+        _ = w.interface.print("    before bytes: {s}\n", .{hex_buf[0..hex_len * 2]}) catch {};
+    }
+}
+
+/// Print the merged image to stderr: section sizes, symbol addresses, and
+/// every relocation's site/target/displacement before and after application.
+/// PC32 displacements that sit within `near_limit` bytes of the i32 limit are
+/// flagged, since they are the most likely to be truncated or mis-encoded.
+fn dumpMergedImage(
+    io: std.Io,
+    image: *const MergedImage,
+    program: *const Object,
+    runtime: *const Object,
+    options: LinkOptions,
+) void {
+    const Io = std.Io;
+    var buf: [8192]u8 = undefined;
+    var w = Io.File.Writer.init(.stderr(), io, &buf);
+
+    const data_base = image.text.len;
+    const gap = switch (options.target) {
+        .linux_x86_64 => 0,
+        .windows_x86_64 => (data_base + 0x1000 - 1) / 0x1000 * 0x1000 - data_base,
+    };
+
+    _ = w.interface.print("== Ferro merged image dump (target: {s}) ==\n", .{@tagName(options.target)}) catch {};
+
+    const entry_addr = image.symbols.get(options.entry_symbol);
+    if (entry_addr) |ea| {
+        _ = w.interface.print("entry symbol: {s} -> {s}+0x{x} = 0x{x}\n", .{
+            options.entry_symbol, ea.section, ea.value, ea.value,
+        }) catch {};
+    } else {
+        _ = w.interface.print("entry symbol: {s} -> (not found)\n", .{options.entry_symbol}) catch {};
+    }
+
+    _ = w.interface.print(
+        "merged .text: {d} bytes\nmerged .data: {d} bytes\nmerged .bss: {d} bytes\n",
+        .{ image.text.len, image.data.len, image.bss_size },
+    ) catch {};
+
+    _ = w.interface.print("\n-- Symbols (merged address) --\n", .{}) catch {};
+    var sym_iter = image.symbols.iterator();
+    while (sym_iter.next()) |node| {
+        const name = node.key_ptr.*;
+        const addr = node.value_ptr.*;
+        _ = w.interface.print("  {s}: {s}+0x{x} = 0x{x}\n", .{ name, addr.section, addr.value, addr.value }) catch {};
+    }
+
+    const prog_text_size = sectionSize(program, ".text");
+    const prog_data_size = sectionSize(program, ".data");
+
+    dumpObjectRelocs(&w, "program", program, 0, data_base, gap, &image.symbols);
+    dumpObjectRelocs(&w, "runtime", runtime, prog_text_size, data_base + prog_data_size, gap, &image.symbols);
+
+    _ = w.interface.flush() catch {};
+}
+
 /// Synthesize the platform entry point and write the final executable.
 ///
 /// Linux: entry `_start` (at end of merged `.text`) calls `_main`.
@@ -167,6 +338,10 @@ pub fn linkObject(
     var image = try applyRelocations(&object, &runtime, &resolved, gpa, options.target);
     defer image.deinit(gpa);
 
+    if (options.dump) {
+        dumpMergedImage(io, &image, &object, &runtime, options);
+    }
+
     try writeExecutable(&image, exe_path, options, gpa, io);
 }
 
@@ -185,6 +360,7 @@ test "defaultLinkOptions keeps target explicit and picks _main as entry" {
     try std.testing.expectEqualStrings("_main", opts.entry_symbol);
     try std.testing.expectEqual(.console, opts.subsystem);
     try std.testing.expectEqual(false, opts.debug);
+    try std.testing.expectEqual(false, opts.dump);
 }
 
 test "linkObject reports ObjectMissing for a nonexistent object file" {

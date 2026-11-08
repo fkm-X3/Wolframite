@@ -115,11 +115,16 @@ pub fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
 /// emission) and link it with the Wolframite runtime into `exe_path` via Ferro.
 ///
 /// The object file is written as an intermediate alongside the executable.
+///
+/// When `dump_image` is true, Ferro prints the merged image (section sizes,
+/// symbol addresses, relocations before/after application) to stderr before
+/// writing the executable — a debugging aid for linker issues.
 pub fn linkBinary(
     io: std.Io,
     gpa: Allocator,
     source_path: []const u8,
     exe_path: []const u8,
+    dump_image: bool,
 ) LinkError!void {
     const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch return error.LinkFailed;
     defer gpa.free(obj_path);
@@ -149,7 +154,8 @@ pub fn linkBinary(
     const wfr_std_lib = try findWfrStdLib(io, gpa);
     defer gpa.free(wfr_std_lib);
 
-    const opts = ferro.defaultLinkOptions(target);
+    var opts = ferro.defaultLinkOptions(target);
+    opts.dump = dump_image;
     if (ferro.linkObject(io, gpa, obj_path, wfr_std_lib, exe_path, opts)) |_| {} else |_| {
         return error.LinkFailed;
     }
@@ -208,7 +214,7 @@ test "linkBinary reports CompileFailed for source that does not compile" {
         return;
     }
 
-    if (linkBinary(io, gpa, source_path, exe_path)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false)) |_| {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.CompileFailed, err);
@@ -242,7 +248,7 @@ test "linkBinary reports StdLibMissing when the runtime archive is absent" {
         runtime_absent = false;
     } else |_| {}
 
-    if (linkBinary(io, gpa, source_path, exe_path)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false)) |_| {
         // Only reachable when a runtime is installed in the test environment.
         try std.testing.expectEqual(false, runtime_absent);
         if (std.Io.Dir.cwd().statFile(io, exe_path, .{})) |_| {} else |_| {

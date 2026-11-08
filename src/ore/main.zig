@@ -74,6 +74,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "update")) return cmdUpdate(gpa, io, rest);
     if (std.mem.eql(u8, command, "check-codegen")) return cmdCheckCodegen(gpa, io, rest);
     if (std.mem.eql(u8, command, "disasm")) return disasm_mod.cmdDisasm(gpa, io, rest);
+    if (std.mem.eql(u8, command, "trace")) return cmdTrace(gpa, io, rest);
 
     reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
@@ -147,6 +148,8 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var mode: compile_mod.EmitMode = .@"obj";
     var emit_bin = true;
+    var dump_image = false;
+    var emit_annotated = false;
     var file: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -167,6 +170,11 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
+        } else if (std.mem.eql(u8, arg, "--dump-image")) {
+            dump_image = true;
+        } else if (std.mem.eql(u8, arg, "--emit-annotated")) {
+            emit_annotated = true;
+            emit_bin = false;
         } else if (arg.len > 0 and arg[0] == '-') {
             reportErr(io, "error: unknown option '{s}'\n", .{arg});
             return 2;
@@ -185,9 +193,26 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
+    if (emit_annotated) {
+        const source = readSource(gpa, io, source_path) orelse return 1;
+        const target = link_mod.hostTarget();
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const result = try compile_mod.compileAnnotated(arena.allocator(), source, target);
+        if (!result.ok) {
+            reportDiagnostics(io, source_path, &result.diagnostics);
+            reportErr(io, "error: compilation failed\n", .{});
+            return 1;
+        }
+        const obj_path = out_path orelse try replaceExt(gpa, source_path, link_mod.hostObjectExt());
+        if ((try writeBinaryFile(io, obj_path, result.obj_bytes)) != 0) return 1;
+        printOut(io, "wrote {s}\n", .{ obj_path });
+        return 0;
+    }
+
     if (emit_bin) {
         const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
-        link_mod.linkBinary(io, gpa, source_path, exe_path) catch |err| switch (err) {
+        link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image) catch |err| switch (err) {
             link_mod.LinkError.CompileFailed => {
                 reportErr(io, "error: compilation failed\n", .{});
                 return 1;
@@ -668,6 +693,11 @@ fn printBuildHelp(io: Io) void {
         \\                       (.o on Linux, .obj on Windows)
         \\      --emit-bin       Link into an executable via Ferro (default)
         \\                       (incompatible with --ir)
+        \\      --dump-image     Print Ferro's merged image (section sizes,
+        \\                       symbol addresses, relocations before/after) to
+        \\                       stderr before writing the executable
+        \\      --emit-annotated Emit a relocatable object file (.o / .obj)
+        \\                       without asm output \
         \\  -h, --help           Show this help
         \\
         \\Exit codes:
@@ -693,4 +723,88 @@ fn printRunHelp(io: Io) void {
         \\  -h, --help           Show this help
         \\
     , .{});
+}
+
+fn printTraceHelp(io: Io) void {
+    printOut(io,
+        \\Usage:
+        \\  ore trace [options] [file] [args...]
+        \\
+        \\Execute a program previously built with `ore build` and report how
+        \\the run ended (exit code or crash). The executable must already
+        \\exist; `ore trace` does not compile or link.
+        \\
+        \\Options:
+        \\  -o, --output <path>  Trace the executable at <path>
+        \\                       (default: <input>.exe)
+        \\  -h, --help           Show this help
+        \\
+    , .{});
+}
+
+/// `ore trace <file> [args...]` — execute a program and report how the run
+/// ended (exit code or crash). Wraps execution and captures the termination
+/// report.
+fn cmdTrace(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
+    var out_path: ?[]const u8 = null;
+    var file: ?[]const u8 = null;
+    var prog_args: std.ArrayList([]const u8) = .empty;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printTraceHelp(io);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            if (i + 1 >= args.len) return flagNeedsValue(io, arg);
+            i += 1;
+            out_path = args[i];
+        } else if (arg.len > 0 and arg[0] == '-' and file == null) {
+            reportErr(io, "error: unknown option '{s}'\n", .{arg});
+            return 2;
+        } else if (file == null) {
+            file = arg;
+        } else {
+            try prog_args.append(gpa, arg);
+        }
+    }
+
+    const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
+
+    const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+
+    // `ore trace` only executes a binary already produced by `ore build`.
+    if (!link_mod.fileExists(io, exe_path)) {
+        reportErr(io, "error: executable '{s}' not found\n", .{exe_path});
+        reportErr(io, "       run `ore build` first\n", .{});
+        return 1;
+    }
+
+    printOut(io, "trace: executing '{s}'\n", .{exe_path});
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(gpa, exe_path);
+    try argv.appendSlice(gpa, prog_args.items);
+    const argv_slice = try argv.toOwnedSlice(gpa);
+
+    var child = spawnOrShell(io, gpa, exe_path, argv_slice) catch |err| {
+        reportErr(io, "error: could not start '{s}': {s}\n", .{ exe_path, @errorName(err) });
+        return 1;
+    };
+    const term = child.wait(io) catch |err| {
+        reportErr(io, "error: could not wait for '{s}': {s}\n", .{ exe_path, @errorName(err) });
+        return 1;
+    };
+
+    switch (term) {
+        .exited => |code| {
+            printOut(io, "trace: '{s}' exited with code {d}\n", .{ exe_path, code });
+            return code;
+        },
+        else => {
+            reportErr(io, "trace: '{s}' terminated abnormally\n", .{ exe_path });
+            return 1;
+        },
+    }
 }

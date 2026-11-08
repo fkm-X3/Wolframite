@@ -9,6 +9,7 @@ pub const api = @import("api.zig");
 pub const sim = @import("sim.zig");
 pub const check_codegen = @import("check_codegen.zig");
 pub const disasm = @import("disasm.zig");
+pub const verify_ir = @import("verify_ir.zig");
 pub const ferro = @import("ferro.zig");
 pub const ferro_types = @import("ferro_types.zig");
 pub const ferro_reader = @import("ferro_reader.zig");

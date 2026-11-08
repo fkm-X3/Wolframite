@@ -70,6 +70,11 @@ pub const LinkOptions = struct {
     subsystem: Subsystem,
     /// Emit debug info / keep a PDB next to the executable.
     debug: bool,
+    /// When true, `linkObject` prints the merged image (section sizes,
+    /// symbol addresses, relocations before/after application) to stderr
+    /// before writing the executable. A debugging aid for linker issues
+    /// such as wrong symbol addresses or displacements near the i32 limit.
+    dump: bool,
 };
 
 /// Convenient defaults for `LinkOptions`. The caller must always supply
@@ -80,6 +85,7 @@ pub fn defaultLinkOptions(target: Target) LinkOptions {
         .entry_symbol = "_main",
         .subsystem = .console,
         .debug = false,
+        .dump = false,
     };
 }
 
@@ -142,6 +148,7 @@ pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError!Li
         .entry_symbol = desc.entry,
         .subsystem = subsystem,
         .debug = desc.debug,
+        .dump = false,
     };
 }
 
