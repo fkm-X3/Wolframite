@@ -12,6 +12,8 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
 const ferro = @import("Tungsten").ferro;
+const ferro_reader = @import("Tungsten").ferro_reader;
+const check_codegen = @import("Tungsten").check_codegen;
 const manifest_mod = @import("manifest.zig");
 const compile_mod = @import("compile.zig");
 const link_mod = @import("link.zig");
@@ -69,6 +71,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "build")) return cmdBuild(gpa, io, rest);
     if (std.mem.eql(u8, command, "run")) return cmdRun(gpa, io, rest);
     if (std.mem.eql(u8, command, "update")) return cmdUpdate(gpa, io, rest);
+    if (std.mem.eql(u8, command, "check-codegen")) return cmdCheckCodegen(gpa, io, rest);
 
     reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
@@ -347,6 +350,64 @@ fn spawnOrShell(
 }
 
 // ============================================================================
+// check-codegen
+// ============================================================================
+
+/// `ore check-codegen <file>` — statically verify a Tungsten-emitted object file
+/// for byte-level codegen encoding bugs before linking.
+fn cmdCheckCodegen(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
+    if (args.len == 0) {
+        reportErr(io, "error: check-codegen requires an object file\n", .{});
+        reportErr(io, "usage: ore check-codegen <file.o>\n", .{});
+        return 2;
+    }
+    if (args.len > 1) {
+        reportErr(io, "error: unexpected argument '{s}'\n", .{args[1]});
+        return 2;
+    }
+    const path = args[0];
+    var obj = try ferro_reader.readObject(io, gpa, path);
+    defer obj.deinit(gpa);
+    var report = try check_codegen.checkObject(gpa, &obj);
+    defer report.deinit(gpa);
+
+    if (report.violations.items.len == 0) {
+        printOut(io, "check-codegen: {s}: no violations\n", .{path});
+        return 0;
+    }
+
+    reportErr(io, "check-codegen: {s}: {d} violation(s)\n", .{path, report.violations.items.len});
+    for (report.violations.items) |v| {
+        var bytes: [16]u8 = undefined;
+        var i: usize = 0;
+        while (i < v.byte_len) : (i += 1) {
+            bytes[i] = v.bytes[i];
+        }
+        reportErr(io, "  {s}:{d}: {s} (bytes: {x})\n", .{
+            path, v.offset, v.message, bytes[0..@as(usize, v.byte_len)],
+        });
+    }
+    return 1;
+}
+
+fn printCheckCodegenHelp(io: Io) void {
+    printOut(io,
+        \\Usage:
+        \\  ore check-codegen <file.o>
+        \\
+        \\Statically verify a Tungsten-emitted relocatable object file for
+        \\byte-level codegen encoding bugs (truncated immediates, missing
+        \\ModR/M bytes, bad SIB index, inconsistent REX prefixes, unresolved
+        \\branch targets) before linking.
+        \\
+        \\Exit codes:
+        \\  0  no violations
+        \\  1  one or more violations found
+        \\  2  usage error
+    , .{});
+}
+
+// ============================================================================
 // update
 // ============================================================================
 
@@ -572,6 +633,8 @@ fn printHelp(io: Io) void {
         \\  init [name]      Scaffold a new package (ore.toml + src/main.wfr)
         \\  build [file]     Compile a .wfr file and link it into an executable via Ferro
         \\  run [file]       Run a previously built executable (does not compile or link)
+        \\  check-codegen <file>
+        \\                   Statically verify a Tungsten object file for codegen bugs
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:

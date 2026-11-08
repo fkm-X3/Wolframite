@@ -1,8 +1,8 @@
 # Debug Tools: Tungsten IR Simulator
 
-Documents the IR-level interpreter / simulator (`Tool 4` from `docs/debugging.md`),
-implemented as `libs/backend/src/sim.zig`. It executes Tungsten IR directly
-without object emission or Ferro, isolating codegen bugs from linker bugs.
+Documents the IR-level interpreter / simulator, implemented as `libs/backend/src/sim.zig`. 
+It executes Tungsten IR directly without object emission or Ferro, isolating codegen bugs 
+from linker bugs.
 
 ## Purpose
 
@@ -171,9 +171,8 @@ front-end to be built on top of it.
 
 ## Relationship to other tools
 
-Per `docs/debugging.md` §4 (recommended priority), the IR simulator is the
-highest-leverage debug tool: it would have caught codegen bugs #1–#7 without
-needing to link or run native code. It complements:
+The IR simulator is the highest-leverage debug tool: it would have caught
+codegen bugs #1–#7 without needing to link or run native code. It complements:
 
 - `ore check-codegen` (Tool 3) — static byte-level verifier for object files.
 - `ore disasm` (Tool 1) — Tungsten-aware disassembler.
