@@ -13,7 +13,7 @@ reinforce what you learned in the core sections. Work through them in order.
 
 You will need:
 
-- **Zig 0.17.0** (pinned in `build.zig.zon`)
+- **Zig 0.17.1** (pinned in `build.zig.zon`)
 - **NASM** and **zig cc** on PATH if you want to *run* compiled programs
   (`ore run` / `ore build --emit-bin`). Building and testing don't need them.
 

@@ -34,7 +34,7 @@ Check versions/0.1.0.md
 
 ## Building from source
 
-Requires Zig **0.17.0**. NASM and `zig cc` must be on PATH to *run* compiled programs (`ore run` / `ore build --emit-bin` shell out to them) — building and testing don't need them.
+Requires Zig **0.17.1**. NASM and `zig cc` must be on PATH to *run* compiled programs (`ore run` / `ore build --emit-bin` shell out to them) — building and testing don't need them.
 
 ```sh
 zig build                    # build everything into zig-out/ (default step)
