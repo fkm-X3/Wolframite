@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-EXAMPLES_DIR = Path(__file__).resolve().parent / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 EXTENSIONS = {".obj", ".exe", ".ir"}
 
 
