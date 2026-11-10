@@ -18,6 +18,7 @@ pub const CodeGen = struct {
     param_count: u32,
     value_offsets: std.AutoHashMapUnmanaged(ir.Value, i32),
     alloca_offsets: std.AutoHashMapUnmanaged(u32, i32),
+    current_func_name: []const u8 = "",
 
     // Per-function block start offsets (byte offsets into obj_text) and
     // branch patch records, used to resolve branch targets and phi nodes.
@@ -138,6 +139,29 @@ pub const CodeGen = struct {
             try self.emitFunctionObject(func);
         }
 
+        // Ensure every relocation target has a symbol table entry: defined
+        // symbols (functions, globals) are already present, but externally
+        // referenced helpers (e.g. wfr_std_alloc) need an undefined entry.
+        {
+            var seen = std.StringHashMap(void).init(self.gpa);
+            defer seen.deinit();
+            for (self.obj_symbols.items) |sym| {
+                try seen.put(sym.name, {});
+            }
+            for (self.obj_relocs.items) |rel| {
+                if (seen.contains(rel.symbol)) continue;
+                try seen.put(rel.symbol, {});
+                try self.obj_symbols.append(self.gpa, .{
+                    .name = try self.gpa.dupe(u8, rel.symbol),
+                    .section_idx = 0,
+                    .value = 0,
+                    .size = 0,
+                    .binding = .global,
+                    .is_func = false,
+                });
+            }
+        }
+
         return obj_elf.ObjectInput{
             .text = self.obj_text.items,
             .data = self.obj_data.items,
@@ -155,6 +179,7 @@ pub const CodeGen = struct {
         self.branch_patches.clearRetainingCapacity();
 
         const name = self.module.strings.get(func.name);
+        self.current_func_name = name;
         const fname = try std.fmt.allocPrint(self.gpa, "_{s}", .{name});
 
         const func_start = @as(u64, @intCast(self.obj_text.items.len));
@@ -172,6 +197,8 @@ pub const CodeGen = struct {
         try self.o8(0x48);
         try self.o8(0x89);
         try self.o8(0xe5);
+
+
 
         var value_slots: u32 = self.param_count;
         var alloca_data_slots: u32 = 0;
@@ -560,6 +587,7 @@ pub const CodeGen = struct {
                 try self.o8(0x89);
                 try self.o8(0x85);
                 try self.emitI32(r);
+
             },
             .load => {
                 const r = try self.valueOffsetOf(value_idx);
@@ -596,6 +624,8 @@ pub const CodeGen = struct {
                 try self.o8(0x48);
                 try self.o8(0x89);
                 try self.o8(0x10);
+                // DEBUG int3 after store
+
             },
             .ptr_add => {
                 const r = try self.valueOffsetOf(value_idx);
@@ -616,8 +646,49 @@ pub const CodeGen = struct {
                 try self.o8(0x89);
                 try self.o8(0x85);
                 try self.emitI32(r);
+                // DEBUG int3 after ptr_add
+
             },
-            .malloc => return error.LibcNotLinked,
+            .malloc => {
+                const r = try self.valueOffsetOf(value_idx);
+                const size_off = try self.valueOff(ops[0]);
+                // VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+                try self.o8(0x48);
+                try self.o8(0x81);
+                try self.o8(0xec);
+                try self.emitI32(32); // shadow space
+                // xor rcx, rcx
+                try self.o8(0x48);
+                try self.o8(0x31);
+                try self.o8(0xc9);
+                // mov rdx, [rbp + size_off]
+                try self.o8(0x48);
+                try self.o8(0x8b);
+                try self.o8(0x95);
+                try self.emitI32(size_off);
+                // mov r8d, 0x3000
+                try self.o8(0x41);
+                try self.o8(0xb8);
+                try self.emitI32(0x3000);
+                // mov r9d, 0x04
+                try self.o8(0x41);
+                try self.o8(0xb9);
+                try self.emitI32(0x04);
+                // call VirtualAlloc
+                try self.o8(0xe8);
+                try self.relocText("VirtualAlloc", .pc32, -4);
+                try self.emitI32(0);
+                // add rsp, 32
+                try self.o8(0x48);
+                try self.o8(0x81);
+                try self.o8(0xc4);
+                try self.emitI32(32);
+                // mov [rbp + r], rax
+                try self.o8(0x48);
+                try self.o8(0x89);
+                try self.o8(0x85);
+                try self.emitI32(r);
+            },
             .global_addr => {
                 const r = try self.valueOffsetOf(value_idx);
                 const global = self.module.globals.items[ops[0]];
@@ -681,7 +752,8 @@ pub const CodeGen = struct {
                 const callee_off = try self.valueOff(ops[0]);
                 const visible_arg_count: u32 = if (ops.len > 1) @intCast(ops.len - 1) else 0;
                 const total_arg_count: u32 = visible_arg_count + 1;
-                const reg_args = [_]u8{ 0xc1, 0xc2, 0xc8, 0xc9 };
+                const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c };
+                const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d };
                 const num_stack_args_total: u32 = if (total_arg_count > 4) total_arg_count - 4 else 0;
                 var extra_stack: u32 = 32;
                 if (num_stack_args_total > 0) {
@@ -720,7 +792,7 @@ pub const CodeGen = struct {
                     }
                 }
                 // Hidden env as argument 0: mov rcx, qword [r10+8]
-                try self.o8(0x4c);
+                try self.o8(0x49);
                 try self.o8(0x8b);
                 try self.o8(0x4a);
                 try self.o8(0x08);
@@ -731,15 +803,16 @@ pub const CodeGen = struct {
                         const arg_slot = i + 1;
                         if (arg_slot < 4) {
                             const arg_off = try self.valueOff(ops[1 + i]);
-                            try self.o8(0x48);
+                            const reg_idx = arg_slot; // 1..3
+                            try self.o8(reg_rex[reg_idx]);
                             try self.o8(0x8b);
-                            try self.o8(reg_args[i]);
+                            try self.o8(reg_modrm[reg_idx]);
                             try self.emitI32(arg_off);
                         }
                     }
                 }
                 // Callee address last, then call
-                try self.o8(0x4c);
+                try self.o8(0x49);
                 try self.o8(0x8b);
                 try self.o8(0x42); // mov rax, qword [r10+0]
                 try self.o8(0x00);

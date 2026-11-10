@@ -179,6 +179,7 @@ pub const Kernel32Imports = [_][]const u8{
     "ReadFile",
     "GetLastError",
     "ExitProcess",
+    "VirtualAlloc",
     "CreateFileW",
     "AllocConsole",
 };

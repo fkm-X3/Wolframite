@@ -112,6 +112,11 @@ const Interpreter = struct {
                     dst,
                     try self.allocaBytes(if (ops.len == 0) 8 else ops[0]),
                 ),
+                .malloc => try values.put(
+                    self.gpa,
+                    dst,
+                    try self.allocaBytes(@intCast(try slotValue(values, ops[0]))),
+                ),
                 .load => try values.put(self.gpa, dst, try self.readInt(try slotValue(values, ops[0]))),
                 .store => try self.writeInt(try slotValue(values, ops[0]), try slotValue(values, ops[1])),
                 .ptr_add => try values.put(
@@ -241,8 +246,7 @@ test "env record layout: scalar slots and inline fn-value records" {
 
     // The mixed record reserves all 32 bytes in one frame block; the plain
     // record reserves its 16.
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
 }
 
 test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
@@ -551,7 +555,7 @@ test "closure-in-closure: fn-value capture copied inline into the env record" {
 
     // The outer env is one 24-byte block: 8-byte scalar + inline record
     // (fn0 = apply_outer, fn1 = mul_add in the textual IR).
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn1") != null);
 

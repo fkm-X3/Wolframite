@@ -407,7 +407,15 @@ pub const Simulator = struct {
                 try self.writeSlot(result_slot, a + b);
                 self.traceInst("ptr_add", result_slot, a + b);
             },
-            .malloc => return error.MallocUnimplemented,
+            .malloc => {
+                const size_i64 = try self.readSlot(ops[0]);
+                const size: u32 = @intCast(size_i64);
+                const slots_needed = (size + 7) / 8;
+                const base_index = @as(u32, @intCast(self.slots.items.len));
+                try self.ensureSlot(base_index + slots_needed - 1);
+                try self.writeSlot(result_slot, @intCast(base_index));
+                self.traceInst("malloc", result_slot, @intCast(base_index));
+            },
             .global_addr => {
                 const gidx = @as(usize, @intCast(ops[0]));
                 const gidx_i64: i64 = @intCast(gidx);

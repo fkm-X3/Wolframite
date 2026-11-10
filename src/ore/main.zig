@@ -218,7 +218,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
                 return 1;
             },
             link_mod.LinkError.LinkFailed => {
-                reportErr(io, "error: link failed\n", .{});
+                reportErr(io, "error: link failed (ferro link error)\n", .{});
                 return 1;
             },
             link_mod.LinkError.StdLibMissing => {

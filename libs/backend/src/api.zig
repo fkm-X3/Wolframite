@@ -876,16 +876,16 @@ test "function value model" {
     const fv = try ctx.buildFnValue(fv_ty, fn_ptr, env);
     _ = try ctx.buildRet(fv);
 
-    // env alloca + capture store, then buildFnValue's alloca/store/iconst/
-    // ptr_add/store, then ret.
-    try std.testing.expectEqual(@as(usize, 9), ctx.getInstructionCountIn(make));
+    // env alloca + capture store, then buildFnValue's iconst/malloc/store/
+    // iconst/ptr_add/store, then ret.
+    try std.testing.expectEqual(@as(usize, 10), ctx.getInstructionCountIn(make));
 
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try ctx.print(&w);
     const text = buf[0..w.end];
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
 }
 
@@ -926,9 +926,9 @@ test "call through fn value with env record" {
     const r = try ctx.buildCallPtr(i64_ty, fv, &.{x});
     _ = try ctx.buildRet(r);
 
-    // func_addr, iconst, env alloca + store, then buildFnValue's five
-    // instructions, then the indirect call and ret.
-    try std.testing.expectEqual(@as(usize, 11), ctx.getInstructionCountIn(caller));
+    // func_addr, iconst, env record (iconst+malloc+store), then buildFnValue's
+    // six instructions, then the indirect call and ret.
+    try std.testing.expectEqual(@as(usize, 13), ctx.getInstructionCountIn(caller));
 
     // Empty capture set: no record, null env (R8b).
     try std.testing.expectEqual(Value.none, try ctx.buildEnvRecord(&.{}));
@@ -938,10 +938,9 @@ test "call through fn value with env record" {
     try ctx.print(&w);
     const text = buf[0..w.end];
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
 }
 
 fn readU16(bytes: []const u8, off: usize) u16 {

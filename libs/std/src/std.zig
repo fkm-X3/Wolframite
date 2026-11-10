@@ -136,6 +136,21 @@ export fn wfr_std_panic(s: *const String) noreturn {
     os.exit(1);
 }
 
+const WFR_ARENA_SIZE: usize = 64 * 1024;
+var wfr_arena: [WFR_ARENA_SIZE]u8 linksection(".data") = undefined;
+var wfr_arena_used: usize linksection(".data") = 0;
+
+export fn wfr_std_alloc(size: usize) usize {
+    if (size == 0) return 0;
+    const windows = struct {
+        extern "kernel32" fn GetProcessHeap() callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn HeapAlloc(hHeap: ?*anyopaque, dwFlags: u32, dwBytes: usize) callconv(.winapi) ?*anyopaque;
+    };
+    const heap = windows.GetProcessHeap() orelse return 0;
+    const p = windows.HeapAlloc(heap, 0, size) orelse return 0;
+    return @intFromPtr(p);
+}
+
 /// Copy `len` bytes from `src` into `dst` and return the count, or `-1`.
 ///
 /// The non-overlapping case is all the runtime promises; nothing here checks

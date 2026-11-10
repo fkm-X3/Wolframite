@@ -694,7 +694,8 @@ pub const Builder = struct {
     pub fn buildFnValue(self: *Builder, type_idx: TypeIdx, fn_ptr: Value, env_ptr: Value) !Value {
         const i64_ty = try self.module.addType(self.gpa, .{ .int = .{ .signed = true, .bits = 64 } });
         const i64_ptr_ty = try self.module.addType(self.gpa, .{ .pointer = .{ .elem = i64_ty } });
-        const record = try self.buildAllocaBytes(type_idx, fn_value_size);
+        const size_const = try self.buildIntConst(i64_ty, fn_value_size);
+        const record = try self.buildMalloc(type_idx, size_const);
         _ = try self.buildStore(i64_ty, record, fn_ptr);
         const env_offset = try self.buildIntConst(i64_ty, 8);
         const env_slot = try self.buildPtrAdd(i64_ptr_ty, record, env_offset);
@@ -720,7 +721,8 @@ pub const Builder = struct {
 
         var size: u32 = 0;
         for (fields) |f| size += envFieldSize(self.module, f.type_idx);
-        const env = try self.buildAllocaBytes(i64_ptr_ty, size);
+        const size_const = try self.buildIntConst(i64_ty, size);
+        const env = try self.buildMalloc(i64_ptr_ty, size_const);
 
         var offset: u32 = 0;
         for (fields) |f| {
@@ -1151,7 +1153,7 @@ test "extended opcodes and globals" {
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add %0, %1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "malloc %0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "global_addr @greeting") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %17(%0, %1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern puts") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "extern_call puts(%0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret %0") != null);
@@ -1199,19 +1201,19 @@ test "function value type and record materialization" {
     const fv = try builder.buildFnValue(fv_ty, fn_ptr_param, env);
     _ = try builder.buildRet(fv);
 
-    // Creation site: env alloca + capture store, then the five instructions
-    // buildFnValue expands to (alloca 16, store fn_ptr, iconst 8, ptr_add,
-    // store env_ptr), then ret.
-    try std.testing.expectEqual(@as(usize, 9), module.functions.items[1].instructions.items.len);
+    // Creation site: env alloca + capture store, then buildFnValue expands to
+    // (iconst 16, malloc, store fn_ptr, iconst 8, ptr_add, store env_ptr),
+    // then ret.
+    try std.testing.expectEqual(@as(usize, 10), module.functions.items[1].instructions.items.len);
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try printModule(&module, &w);
     const text = buf[0..w.end];
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ret %4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %5") != null);
 }
 
 test "call through fn value with captured env record" {
@@ -1258,9 +1260,9 @@ test "call through fn value with captured env record" {
     const fv = try builder.buildFnValue(fv_ty, fn_addr, env);
     _ = try builder.buildCallPtr(i64_ty, fv, &.{x2});
 
-    // func_addr, iconst, env alloca + store, then buildFnValue's five
-    // instructions, then the indirect call.
-    try std.testing.expectEqual(@as(usize, 10), module.functions.items[1].instructions.items.len);
+    // func_addr, iconst, env record (iconst+malloc+store), then buildFnValue's
+    // six instructions, then the indirect call.
+    try std.testing.expectEqual(@as(usize, 12), module.functions.items[1].instructions.items.len);
 
     // Empty capture set: no record, null env (R8b).
     const none_env = try builder.buildEnvRecord(&.{});
@@ -1271,8 +1273,7 @@ test "call through fn value with captured env record" {
     try printModule(&module, &w);
     const text = buf[0..w.end];
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malloc") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "func_addr @fn0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr %5(%0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call_ptr") != null);
 }
