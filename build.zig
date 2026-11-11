@@ -133,9 +133,10 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(ore_exe);
 
     // wfr_std — the Wolframite runtime library. Prelude calls such as `print`
-    // lower to extern calls against this archive, which `ore` links in
-    // alongside the program's assembly. It is installed to `zig-out/lib`, which
-    // is where `src/ore/link.zig` looks for it.
+    // lower to extern calls against this archive. `ore` compiles the program to
+    // a relocatable object (Tungsten object emission) and links it against this
+    // archive into an executable via Ferro. It is installed to `zig-out/lib`,
+    // which is where `src/ore/link.zig` looks for it.
     //
     // The runtime must not link libc: it talks to the kernel directly (kernel32
     // on Windows, raw syscalls on Linux), so `.link_libc` stays false here.
