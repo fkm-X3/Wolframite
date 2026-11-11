@@ -23,8 +23,11 @@ const api = tungsten.api;
 7. [Parameter Access](#parameter-access)
 8. [Instruction Building](#instruction-building)
 9. [Output](#output)
-10. [Re-exported Types](#re-exported-types)
-11. [Design Notes](#design-notes)
+10. [Target & Object Format](#target--object-format)
+11. [Object Emission (`emitObject`)](#object-emission-emitobject)
+12. [Ferro Linker](#ferro-linker)
+13. [Re-exported Types](#re-exported-types)
+14. [Design Notes](#design-notes)
 
 ---
 
@@ -746,6 +749,238 @@ defer ctx.gpa.free(asm_text);
 ```
 
 ---
+
+## Target & Object Format
+
+### `Context.init` — the target parameter
+
+```zig
+pub fn init(gpa: Allocator, target: ferro.Target) !*Context
+```
+
+Create a new Tungsten context for a specific target platform. The `target` is fixed for the lifetime of the context and cannot be changed after creation. It determines:
+
+- the object format `emitObject` writes (ELF64 on Linux, PE/COFF on Windows),
+- the entry-point shim Ferro synthesizes (`_start` on Linux, `main` on Windows),
+- the executable container Ferro writes.
+
+`ferro.Target` is x86_64 only:
+
+| Target | Platform | Object format | File extension | Entry point Ferro synthesizes |
+|--------|----------|---------------|----------------|-------------------------------|
+| `.linux_x86_64` | Linux | ELF64 (`ET_REL`) | `.o` | `_start` → calls `_main` |
+| `.windows_x86_64` | Windows | PE/COFF | `.obj` | `main` → calls `_main` |
+
+macOS/Mach-O and other targets are out of scope.
+
+`ferro.objectFormat(target)` maps `.linux_x86_64 → .elf64` and `.windows_x86_64 → .pe_coff`. The compiler (ore's link pipeline) decides the target and passes it to both `Context.init` and Ferro's `LinkOptions.target`, so emission and link agree on format without a separate config. Ferro never derives the platform from the host OS — link semantics are explicit, per `design.md` "Determinism over Magic".
+
+### Object format contract
+
+The object format (section layout, relocation types, symbol naming) is frozen in `libs/backend/docs/adr/adr_object_format.md`. In brief:
+
+- Sections: `.text` (machine code, alloc+exec), `.data` (initialized globals/string literals, alloc+write), `.bss` (zero-initialized, no file bytes), plus `.symtab`, `.strtab`, and per-section relocation tables.
+- Relocations: `PC32` (`S + A - P`, for direct `call rel32` and `lea [rip + disp32]`) and `ADDR64` (`S + A`, for absolute 64-bit addresses). ELF64 uses RELA relocations (explicit addend); PE/COFF keeps the addend implicit at the site.
+- Symbol naming: all symbols carry a leading underscore — `_main` (program entry), `__gN` (globals/string literals), `_fnN` (fn values). Undefined externs (e.g. `wfr_std_print`) bind `GLOBAL` with `SHN_UNDEF`/section 0 and are resolved by Ferro against `wfr_std`.
+
+## Object Emission (`emitObject`)
+
+### `emitObject`
+
+```zig
+pub fn emitObject(self: *Context) ![]u8
+```
+
+Emit a relocatable object file (ELF64 on Linux, PE/COFF on Windows) for `self.target`, as decided at `Context.init`.
+
+The pipeline:
+
+1. Codegen lowers the module's IR to raw x86-64 machine-code bytes plus relocation records (`codegen.CodeGen.emitObjectModule()`), reusing the existing instruction encoding but targeting a byte buffer instead of NASM text.
+2. The object writer (`obj_elf.Writer` / `obj_pe.Writer`) lays out sections, the symbol table, the string table, and relocation entries.
+
+Returns an allocated byte slice that **the caller must free** with `ctx.gpa.free(result)`.
+
+```zig
+const ctx = try api.Context.init(std.heap.page_allocator, .linux_x86_64);
+defer ctx.deinit();
+
+const void_ty = try ctx.voidType();
+const func = try ctx.addFunction("main", void_ty, 0);
+ctx.setCurrentFunction(func);
+const entry = try ctx.appendBlock();
+ctx.setCurrentBlock(entry);
+const zero = try ctx.buildIntConst(void_ty, 0); // placeholder
+_ = try ctx.buildRet(zero);
+
+const obj_bytes = try ctx.emitObject();
+defer ctx.gpa.free(obj_bytes);
+
+// obj_bytes is an ELF64 ET_REL object on Linux, a PE/COFF object on Windows.
+```
+
+### The object input model
+
+Codegen feeds the writer an `ObjectInput`:
+
+| Field | Contents |
+|-------|----------|
+| `text` | `.text` machine-code bytes |
+| `data` | `.data` initialized globals, string literals, fn arrays |
+| `bss_size` | `.bss` zero-initialized size (no file bytes) |
+| `symbols` | defined symbols (`_main`, `__gN`, `_fnN`) and undefined externs |
+| `relocs` | `PC32` / `ADDR64` relocation records with addends |
+
+Each symbol carries its name, binding (`LOCAL`/`GLOBAL`/`WEAK`), section index (`SHN_UNDEF`/0 for undefined), value (offset within section), size, and whether it is a function.
+
+### Errors
+
+`emitObject` returns `![]u8`. The documented error is:
+
+| Error | Meaning |
+|-------|---------|
+| `ObjectEmissionError.ObjectEmissionUnimplemented` | Object emission not yet implemented (stub) |
+
+Allocation failures from the underlying arrays propagate as standard `error.OutOfMemory` etc.
+
+The object file is a **relocatable object**, not a final executable. Feed it to Ferro (`linkObject`) together with the `wfr_std` runtime archive to produce a runnable executable — see "Ferro Linker" below. There is no `nasm` invocation and no `zig cc` link step.
+
+---
+
+## Ferro Linker
+
+Ferro (Ferrotungsten: the linker Ferro added to Tungsten) is Tungsten's internal linker. It consumes Tungsten-emitted relocatable objects (ELF64 on Linux, PE/COFF on Windows) plus the Wolframite runtime archive (`wfr_std`) and produces a runnable executable — no external `nasm`, `ld`, or `zig cc`.
+
+The linker interface is frozen in `libs/backend/docs/adr/adr_ferro_linker.md`.
+
+### `linkObject`
+
+```zig
+pub fn linkObject(
+    io: std.Io,
+    gpa: Allocator,
+    object_path: []const u8,
+    runtime_lib: []const u8,
+    exe_path: []const u8,
+    options: LinkOptions,
+) !void
+```
+
+This is the front-facing Ferro entry point used by `ore` and by any Wolframite code driving the linker directly (`design.md`: link steps are explicit Zig calls, not an `ld` script).
+
+`linkObject` runs five stages:
+
+| Stage | What happens |
+|-------|--------------|
+| 1. Object reader | `readObject(object_path)` and `readObject(runtime_lib)` parse sections, the symbol table, the relocation table, and the string table (ELF64 and PE/COFF). |
+| 2. Symbol resolution | `resolveSymbols` collects defined/undefined symbols and resolves each undefined program reference against `wfr_std`. Unresolved symbols are reported as `LinkError.UndefinedSymbol` by name. |
+| 3. Relocation application | `applyRelocations` applies `PC32`/`REL32` and `ADDR64` relocations, merging `.text`/`.data`/`.bss` from the program object and the runtime into output sections. |
+| 4. Entry-point wiring | Ferro synthesizes the platform entry internally — `_start` that calls `_main` on Linux; `main` that calls `_main` on Windows (per subsystem). No external shim assembly is needed. |
+| 5. Executable writer | `writeExecutable` writes an ELF executable (Linux, with program headers/interpreter) or a PE executable (Windows). |
+
+On success `exe_path` is a runnable x86-64 executable for `options.target`. Returns a `LinkError` on failure.
+
+### `LinkOptions`
+
+```zig
+pub const LinkOptions = struct {
+    target: Target,
+    entry_symbol: []const u8,
+    subsystem: Subsystem,
+    debug: bool,
+    dump: bool,
+};
+```
+
+| Field | Description |
+|-------|-------------|
+| `target` | Target platform (`.linux_x86_64` / `.windows_x86_64`). Determines the object format read, the entry-point shim synthesized, and the executable container written. **Required** — Ferro never derives it from the host OS. |
+| `entry_symbol` | The symbol the backend names as program entry. Tungsten uses `_main`; Ferro wires this to the platform entry point. Default `"_main"` via `defaultLinkOptions`. |
+| `subsystem` | Windows subsystem (`.console` / `.gui`). Ignored on Linux. |
+| `debug` | Emit debug info / keep a PDB next to the executable. |
+| `dump` | When true, `linkObject` prints the merged image (section sizes, symbol addresses, relocations before/after application) to stderr before writing the executable — a debugging aid for linker issues such as wrong symbol addresses or displacements near the i32 limit. |
+
+```zig
+pub fn defaultLinkOptions(target: Target) LinkOptions
+```
+
+Convenient defaults: `entry_symbol = "_main"`, `subsystem = .console`, `debug = false`, `dump = false`. The caller must always supply `target` explicitly.
+
+### `LinkError`
+
+```zig
+pub const LinkError = error{
+    ObjectMissing,
+    ObjectReadFailed,
+    RuntimeLibMissing,
+    UndefinedSymbol,
+    RelocationFailed,
+    WriteFailed,
+};
+```
+
+| Error | Meaning |
+|-------|---------|
+| `ObjectMissing` | The input object file does not exist. |
+| `ObjectReadFailed` | The object file exists but could not be parsed (truncated, bad magic, unknown format). |
+| `RuntimeLibMissing` | The Wolframite runtime archive (`wfr_std`) was not found. |
+| `UndefinedSymbol` | A symbol referenced by the program object has no definition in the program object or the runtime archive. |
+| `RelocationFailed` | A relocation could not be applied (e.g. PC32 out of range). |
+| `WriteFailed` | The output executable could not be written. |
+
+Undefined-symbol and relocation errors carry enough context to surface through the Wolframite compiler as ordinary errors — no `ld` script parsing.
+
+### The Wolframite-facing link description
+
+The only front-facing part of Ferro is a **Wolframite link description**: a Wolframite source module describing the link (inputs, output, runtime lib, entry, sections) that is compiled by the **normal Wolframite compiler pipeline** (lexer → parser → resolver → typecheck → lower → Tungsten IR) and then handed to Ferro as structured arguments — not a GNU linker script parsed by Tungsten.
+
+The description is represented as `LinkDescription`:
+
+```zig
+pub const LinkDescription = struct {
+    target: []const u8,    // "linux" | "windows"
+    output: []const u8,    // executable output path
+    entry: []const u8,     // entry symbol (default "_main")
+    subsystem: []const u8, // "console" | "gui" (windows only)
+    runtime_lib: []const u8, // path to the wfr_std archive
+    input: []const u8,     // program object file to link
+    debug: bool,
+};
+```
+
+| Error | Meaning |
+|-------|---------|
+| `LinkDescriptionError.InvalidTarget` | `target` was not `"linux"` or `"windows"`. |
+| `LinkDescriptionError.InvalidSubsystem` | `subsystem` was not `"console"` or `"gui"`. |
+| `LinkDescriptionError.MissingField` | A required link field was missing or not a string literal. |
+
+```zig
+pub fn parseTarget(s: []const u8) LinkDescriptionError!Target
+pub fn parseSubsystem(s: []const u8) LinkDescriptionError!Subsystem
+pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError!LinkOptions
+```
+
+`linkOptionsFromDescription` is the "compile Wolframite → feed Ferro" mapping: the compiler fills a `LinkDescription` from source (target and subsystem parsed from their string forms) and Ferro turns it into `linkObject` arguments. The object path, runtime lib, output path, and entry symbol pass through verbatim.
+
+### Runtime archive (`wfr_std`)
+
+`wfr_std` (the Wolframite runtime, `libs/std`) is built by `zig build` as a static archive (`link_libc = false`; it talks to the kernel directly — kernel32 on Windows, raw syscalls on Linux). It is installed to `zig-out/lib`, which is where `ore` looks for it.
+
+`ore`'s `findWfrStdLib` locates the runtime, tried in order:
+
+1. Project-local `zig-out/lib` (where `zig build` installs the runtime).
+2. The install location derived from the running `ore` executable: `<exedir>/../lib` (install scripts mirror the `zig-out/` layout: `<install>/bin/ore` and `<install>/lib/wfr_std.lib`).
+3. The POSIX system path `/usr/local/wolframite/lib`.
+
+Archive names tried per platform: `wfr_std.lib`, `libwfr_std.a`, `wfr_std.a`. If none is found, `ore` reports `LinkError.StdLibMissing`; otherwise it passes the path to Ferro as `runtime_lib`, which reads it directly (no external `ld`).
+
+On Windows, kernel32 imports (`GetStdHandle`, `WriteFile`, `ReadFile`, `GetLastError`, `ExitProcess`, `VirtualAlloc`, `CreateFileW`, `AllocConsole`) are resolved via the PE import directory rather than reported as undefined (`ferro.isKernel32Import`).
+
+### Related
+
+- `libs/backend/docs/adr/adr_object_format.md` — ELF64 / PE/COFF object format, relocation types, section layout, symbol naming.
+- `libs/backend/docs/adr/adr_ferro_linker.md` — Ferro linker name, interface, and target-handling decision record.
+- `libs/backend/src/ferro.zig` — `linkObject`, `LinkOptions`, `Target`, `LinkError`, `LinkDescription`.
+- `libs/backend/src/obj_elf.zig`, `libs/backend/src/obj_pe.zig` — ELF64 and PE/COFF object writers used by `emitObject`.
 
 ## Re-exported Types
 
