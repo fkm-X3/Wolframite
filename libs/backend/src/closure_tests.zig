@@ -316,9 +316,9 @@ test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
     // The fn-value record is materialized: mov [rax], rdx.
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x10 }) != null);
     // Hidden env marshaled as argument 0: mov rcx, qword [r10+8].
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
     // Callee address loaded, then indirect call: mov rax, qword [r10+0]; call rax.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x42, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x42, 0x00 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
     // The visible argument shifts one register slot: rdx, not rcx.
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0x95 }) != null);
@@ -360,7 +360,7 @@ test "capture-only closure: zero visible args marshals env alone" {
     const bytes = try ctx.emitObject();
     defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
 }
 
@@ -410,7 +410,7 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     const bytes = try ctx.emitObject();
     defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x89, 0x8d }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x20, 0x00, 0x00, 0x00 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x28, 0x00, 0x00, 0x00 }) != null);
