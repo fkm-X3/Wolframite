@@ -65,7 +65,6 @@ pub fn resolveSymbols(
         }
     }
     if (has_unresolved) {
-        std.debug.print("Ferro: undefined symbol '{s}' not found in program or runtime archive\n", .{first_unresolved});
         return error.UndefinedSymbol;
     }
 
