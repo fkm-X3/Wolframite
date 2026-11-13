@@ -144,6 +144,14 @@ fn cmdInit(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 // build
 // ============================================================================
 
+/// Default location for a built executable: `wfr-bin/<stem>.exe`, keeping
+/// built binaries out of the source tree. Only used when the caller does not
+/// pass `-o`/`--output`.
+fn defaultBinPath(gpa: Allocator, source_path: []const u8) ![]u8 {
+    const stem = std.fs.path.stem(source_path);
+    return std.fmt.allocPrint(gpa, "wfr-bin{c}{s}.exe", .{std.fs.path.sep, stem});
+}
+
 fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var mode: compile_mod.EmitMode = .@"obj";
@@ -211,7 +219,11 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     }
 
     if (emit_bin) {
-        const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+        const exe_path = out_path orelse try defaultBinPath(gpa, source_path);
+        if (out_path == null) {
+            // Keep built binaries out of the source tree.
+            std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
+        }
         link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image) catch |err| switch (err) {
             link_mod.LinkError.CompileFailed => {
                 reportErr(io, "error: compilation failed\n", .{});
@@ -292,7 +304,7 @@ fn cmdRun(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
-    const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+    const exe_path = out_path orelse try defaultBinPath(gpa, source_path);
 
     // `ore run` only executes a binary already produced by `ore build`; it
     // never compiles or links.
@@ -681,13 +693,13 @@ fn printBuildHelp(io: Io) void {
         \\  ore build [options] [file]
         \\
         \\Compile a single Wolframite source file and link it into an
-        \\executable via Ferro. Default output is <input>.exe.
+        \\executable via Ferro. Default output is wfr-bin/<input>.exe.
         \\
         \\When no file is given, the entry from ore.toml is used.
         \\
         \\Options:
         \\  -o, --output <path>  Write the executable to <path>
-        \\                       (default: <input>.exe)
+        \\                       (default: wfr-bin/<input>.exe)
         \\      --ir             Emit textual Tungsten IR only (no link)
         \\      --obj            Emit a relocatable object file only (no link)
         \\                       (.o on Linux, .obj on Windows)
@@ -715,11 +727,11 @@ fn printRunHelp(io: Io) void {
         \\Execute a program previously built with `ore build`. `ore run` does
         \\not compile or link; the executable must already exist. When no file
         \\is given, the entry from ore.toml is used to locate the executable
-        \\ (<input>.exe). Arguments after the file are passed to the program.
+        \\ (wfr-bin/<input>.exe). Arguments after the file are passed to the program.
         \\
         \\Options:
         \\  -o, --output <path>  Run the executable at <path>
-        \\                       (default: <input>.exe)
+        \\                       (default: wfr-bin/<input>.exe)
         \\  -h, --help           Show this help
         \\
     , .{});
@@ -736,7 +748,7 @@ fn printTraceHelp(io: Io) void {
         \\
         \\Options:
         \\  -o, --output <path>  Trace the executable at <path>
-        \\                       (default: <input>.exe)
+        \\                       (default: wfr-bin/<input>.exe)
         \\  -h, --help           Show this help
         \\
     , .{});
@@ -772,7 +784,7 @@ fn cmdTrace(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
-    const exe_path = out_path orelse try replaceExt(gpa, source_path, "exe");
+    const exe_path = out_path orelse try defaultBinPath(gpa, source_path);
 
     // `ore trace` only executes a binary already produced by `ore build`.
     if (!link_mod.fileExists(io, exe_path)) {
