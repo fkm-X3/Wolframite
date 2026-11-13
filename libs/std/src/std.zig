@@ -152,7 +152,7 @@ export fn wfr_std_alloc(size: usize) usize {
         return @intFromPtr(p);
     }
     // No libc on this runtime: bump-allocate from the fixed arena.
-    const offset = std.math.alignForward(wfr_arena_used, 8);
+    const offset = std.mem.alignForward(usize, wfr_arena_used, 8);
     if (offset + size > WFR_ARENA_SIZE) return 0;
     wfr_arena_used = offset + size;
     return @intFromPtr(&wfr_arena[offset]);
