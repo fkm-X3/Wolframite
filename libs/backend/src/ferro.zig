@@ -2,8 +2,8 @@
 //!
 //! Ferro consumes Tungsten-emitted object files (ELF64 on Linux, PE/COFF on
 //! Windows) plus the Wolframite runtime archive and produces a runnable
-//! executable. It replaces the `nasm` + `zig cc` chain that `ore` used before
-//! object emission existed.
+//! executable. It replaces the external toolchain `ore` used before object
+//! emission existed.
 //!
 //! This file freezes the linker interface: the `linkObject` entry point, the
 //! `Target` / `ObjectFormat` mapping, the `LinkOptions` surface, and the

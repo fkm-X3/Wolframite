@@ -2,7 +2,7 @@
 //!
 //! Currently a single-file build tool wrapping the full compiler pipeline
 //! (see `compile.zig`), with package scaffolding (`init`), a run mode that
-//! assembles + links via Ferro (`run`, `build --emit-bin`),
+//! compiles to an object + links via Ferro (`run`, `build --emit-bin`),
 //! and a self-update command that installs new ore releases (which bundle
 //! the compiler) from GitHub (`update`).
 
