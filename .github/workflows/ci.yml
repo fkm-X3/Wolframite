@@ -20,7 +20,7 @@ jobs:
           version: 0.17.1
 
       - name: Run all tests
-        run: zig build test
+        run: zig build test -fno-llvm
 
   publish:
     needs: test
@@ -44,10 +44,10 @@ jobs:
           version: 0.17.1
 
       - name: Build ore (linux x86_64)
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dgit-sha=${{ github.sha }}
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dgit-sha=${{ github.sha }} -fno-llvm
 
       - name: Build ore (windows x86_64)
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dtarget=x86_64-windows -p zig-out-win -Dgit-sha=${{ github.sha }}
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dtarget=x86_64-windows -p zig-out-win -Dgit-sha=${{ github.sha }} -fno-llvm
 
       - name: Stage release assets
         run: |
