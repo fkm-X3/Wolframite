@@ -25,10 +25,11 @@ pub fn build(b: *std.Build) void {
         .name = "wfr_std",
         .linkage = .static,
         .root_module = mod,
+        .use_llvm = false,
     });
     b.installArtifact(lib);
 
-    const tests = b.addTest(.{ .root_module = mod });
+    const tests = b.addTest(.{ .root_module = mod, .use_llvm = false });
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run the runtime's tests");

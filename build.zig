@@ -106,6 +106,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "compiler", .module = compiler_mod },
             },
         }),
+        // Use Zig's self-hosted (built-in) backend instead of LLVM: it is
+        // significantly faster and only needs to target x86_64, which is the
+        // sole architecture the Wolframite compiler targets.
+        .use_llvm = false,
     });
 
     // This declares intent for the executable to be installed into the
@@ -129,6 +133,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = ore_build_options_mod },
             },
         }),
+        .use_llvm = false,
     });
     b.installArtifact(ore_exe);
 
@@ -150,6 +155,7 @@ pub fn build(b: *std.Build) void {
         .name = "wfr_std",
         .linkage = .static,
         .root_module = wfr_std_mod,
+        .use_llvm = false,
     });
     b.installArtifact(wfr_std_lib);
 
@@ -194,6 +200,7 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .use_llvm = false,
     });
 
     // A run step that will run the test executable.
@@ -204,6 +211,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = false,
     });
 
     // A run step that will run the second test executable.
@@ -212,18 +220,21 @@ pub fn build(b: *std.Build) void {
     // Compiler module tests
     const compiler_tests = b.addTest(.{
         .root_module = compiler_mod,
+        .use_llvm = false,
     });
     const run_compiler_tests = b.addRunArtifact(compiler_tests);
 
     // Backend (Tungsten) module tests
     const backend_tests = b.addTest(.{
         .root_module = tungsten_mod,
+        .use_llvm = false,
     });
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
     // ore CLI module tests
     const ore_tests = b.addTest(.{
         .root_module = ore_exe.root_module,
+        .use_llvm = false,
     });
     const run_ore_tests = b.addRunArtifact(ore_tests);
 
@@ -263,6 +274,7 @@ pub fn build(b: *std.Build) void {
     // Wolframite runtime tests
     const std_tests = b.addTest(.{
         .root_module = wfr_std_mod,
+        .use_llvm = false,
     });
     const run_std_tests = b.addRunArtifact(std_tests);
     run_std_tests.step.dependOn(tests_start);
