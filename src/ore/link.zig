@@ -125,6 +125,7 @@ pub fn linkBinary(
     source_path: []const u8,
     exe_path: []const u8,
     dump_image: bool,
+    test_mode: bool,
 ) LinkError!void {
     const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch return error.LinkFailed;
     defer gpa.free(obj_path);
@@ -140,7 +141,7 @@ pub fn linkBinary(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const result = compile_mod.compile(arena_alloc, source, .obj, target) catch return error.CompileFailed;
+    const result = compile_mod.compile(arena_alloc, source, .obj, target, test_mode) catch return error.CompileFailed;
     if (!result.ok) return error.CompileFailed;
 
     const obj_bytes = result.text orelse return error.CompileFailed;
@@ -214,7 +215,7 @@ test "linkBinary reports CompileFailed for source that does not compile" {
         return;
     }
 
-    if (linkBinary(io, gpa, source_path, exe_path, false)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false, false)) |_| {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.CompileFailed, err);
@@ -248,7 +249,7 @@ test "linkBinary reports StdLibMissing when the runtime archive is absent" {
         runtime_absent = false;
     } else |_| {}
 
-    if (linkBinary(io, gpa, source_path, exe_path, false)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false, false)) |_| {
         // Only reachable when a runtime is installed in the test environment.
         try std.testing.expectEqual(false, runtime_absent);
         if (std.Io.Dir.cwd().statFile(io, exe_path, .{})) |_| {} else |_| {

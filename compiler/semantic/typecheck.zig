@@ -344,8 +344,33 @@ pub const TypeChecker = struct {
                 try self.checkFnDecl(decl_idx);
             },
             .enum_decl => try self.checkEnumDecl(decl_idx),
+            .test_decl => try self.checkTestDecl(decl_idx),
             else => {},
         }
+    }
+
+    fn checkTestDecl(self: *TypeChecker, test_idx: NodeIdx) anyerror!void {
+        const test_decl = self.arena.get(test_idx);
+        const t = test_decl.test_decl;
+
+        const prev_ret = self.fn_ret_type;
+        const prev_in_fn = self.in_function;
+
+        self.in_function = true;
+        self.fn_ret_type = self.void_ty;
+        self.setNodeType(test_idx, self.void_ty);
+
+        const test_scope = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+
+        if (t.body != NodeIdx.none) {
+            try self.checkStmt(t.body);
+        }
+
+        self.scopes.popScope();
+        _ = test_scope;
+
+        self.fn_ret_type = prev_ret;
+        self.in_function = prev_in_fn;
     }
 
     fn checkEnumDecl(self: *TypeChecker, decl_idx: NodeIdx) !void {
@@ -2805,6 +2830,7 @@ pub const TypeChecker = struct {
     fn typeForParam(self: *const TypeChecker, param: prelude.ParamType) TypeIdx {
         return switch (param) {
             .string => self.string_ty,
+            .bool => self.bool_ty,
             .i64 => self.i64_ty,
             .u64 => self.u64_ty,
             .f64 => self.f64_ty,

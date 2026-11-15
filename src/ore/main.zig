@@ -75,6 +75,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "check-codegen")) return cmdCheckCodegen(gpa, io, rest);
     if (std.mem.eql(u8, command, "disasm")) return disasm_mod.cmdDisasm(gpa, io, rest);
     if (std.mem.eql(u8, command, "trace")) return cmdTrace(gpa, io, rest);
+    if (std.mem.eql(u8, command, "test")) return cmdTest(gpa, io, rest);
 
     reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
@@ -206,7 +207,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         const target = link_mod.hostTarget();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        const result = try compile_mod.compileAnnotated(arena.allocator(), source, target);
+        const result = try compile_mod.compileAnnotated(arena.allocator(), source, target, false);
         if (!result.ok) {
             reportDiagnostics(io, source_path, &result.diagnostics);
             reportErr(io, "error: compilation failed\n", .{});
@@ -224,7 +225,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             // Keep built binaries out of the source tree.
             std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
         }
-        link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image) catch |err| switch (err) {
+        link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image, false) catch |err| switch (err) {
             link_mod.LinkError.CompileFailed => {
                 reportErr(io, "error: compilation failed\n", .{});
                 return 1;
@@ -245,7 +246,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, mode, hostTarget()) catch |err| {
+    const result = compile_mod.compile(gpa, source, mode, hostTarget(), false) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -676,6 +677,7 @@ fn printHelp(io: Io) void {
         \\                   Statically verify a Tungsten object file for codegen bugs
         \\  disasm <file>
         \\                   Disassemble a Tungsten object file with relocation annotations
+        \\  test [file]      Build and run a program as an integrated test
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:
@@ -732,6 +734,109 @@ fn printRunHelp(io: Io) void {
         \\Options:
         \\  -o, --output <path>  Run the executable at <path>
         \\                       (default: wfr-bin/<input>.exe)
+        \\  -h, --help           Show this help
+        \\
+    , .{});
+}
+
+/// `ore test <file> [args...]` — build the program and run it as a test
+/// suite. A test run succeeds when the compiled program exits with status 0;
+/// any non-zero exit (or abnormal termination) is reported as a failure.
+fn cmdTest(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
+    var out_path: ?[]const u8 = null;
+    var file: ?[]const u8 = null;
+    var prog_args: std.ArrayList([]const u8) = .empty;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printTestHelp(io);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            if (i + 1 >= args.len) return flagNeedsValue(io, arg);
+            i += 1;
+            out_path = args[i];
+        } else if (arg.len > 0 and arg[0] == '-' and file == null) {
+            reportErr(io, "error: unknown option '{s}'\n", .{arg});
+            return 2;
+        } else if (file == null) {
+            file = arg;
+        } else {
+            try prog_args.append(gpa, arg);
+        }
+    }
+
+    const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
+    const exe_path = out_path orelse try defaultBinPath(gpa, source_path);
+
+    if (out_path == null) {
+        std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
+    }
+
+    link_mod.linkBinary(io, gpa, source_path, exe_path, false, true) catch |err| switch (err) {
+        link_mod.LinkError.CompileFailed => {
+            reportErr(io, "error: compilation failed\n", .{});
+            reportErr(io, "test result: FAILED (compile/link)\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.LinkFailed => {
+            reportErr(io, "error: link failed (ferro link error)\n", .{});
+            reportErr(io, "test result: FAILED (link)\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.StdLibMissing => {
+            reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
+            reportErr(io, "       run 'zig build' from the repository root first\n", .{});
+            reportErr(io, "test result: FAILED (runtime missing)\n", .{});
+            return 1;
+        },
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(gpa, exe_path);
+    try argv.appendSlice(gpa, prog_args.items);
+    const argv_slice = try argv.toOwnedSlice(gpa);
+
+    printOut(io, "test: running '{s}'\n", .{exe_path});
+
+    var child = spawnOrShell(io, gpa, exe_path, argv_slice) catch |err| {
+        reportErr(io, "error: could not start '{s}': {s}\n", .{ exe_path, @errorName(err) });
+        reportErr(io, "test result: FAILED (could not start)\n", .{});
+        return 1;
+    };
+    const term = child.wait(io) catch |err| {
+        reportErr(io, "error: could not wait for '{s}': {s}\n", .{ exe_path, @errorName(err) });
+        reportErr(io, "test result: FAILED (wait)\n", .{});
+        return 1;
+    };
+
+    switch (term) {
+        .exited => |code| {
+            if (code == 0) {
+                printOut(io, "test result: ok\n", .{});
+            } else {
+                reportErr(io, "test result: FAILED (exit code {d})\n", .{code});
+            }
+            return code;
+        },
+        else => {
+            reportErr(io, "test result: FAILED (abnormal termination)\n", .{});
+            return 1;
+        },
+    }
+}
+
+fn printTestHelp(io: Io) void {
+    printOut(io,
+        \\Usage:
+        \\  ore test [options] [file] [args...]
+        \\
+        \\Build a Wolframite program and run it as an integrated test.
+        \\The test passes when the program exits with status 0.
+        \\
+        \\Options:
+        \\  -o, --output <path>  Build/run the executable at <path>
         \\  -h, --help           Show this help
         \\
     , .{});

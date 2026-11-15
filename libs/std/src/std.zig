@@ -123,6 +123,16 @@ export fn wfr_std_string_eq(a: *const String, b: *const String) i32 {
     return if (std.mem.eql(u8, left, right)) 1 else 0;
 }
 
+/// Assert that `cond` is nonzero; panic otherwise.
+export fn wfr_std_assert(cond: i64) void {
+    if (cond != 0) return;
+    const msg = abi.stringFrom("assertion failed");
+    _ = os.writeAll(os.stderrHandle(), "panic: ");
+    _ = os.writeAll(os.stderrHandle(), abi.bytesOf(&msg));
+    _ = os.writeAll(os.stderrHandle(), "\n");
+    os.exit(1);
+}
+
 /// Write a runtime panic message to stderr and terminate with status `1`.
 ///
 /// This is the only failure path the runtime owns. It cannot return, and it

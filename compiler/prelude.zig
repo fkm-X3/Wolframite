@@ -49,6 +49,7 @@ pub const Shape = enum {
 /// indices do not exist until a program is being checked.
 pub const ParamType = enum {
     string,
+    bool,
     i64,
     u64,
     f64,
@@ -90,6 +91,14 @@ pub const roster: []const PreludeFn = &.{
         .symbol = "wfr_std_print",
         .shape = null,
         .params = &.{.string},
+        .return_type = .void,
+    },
+    .{
+        .name = "assert",
+        .kind = .io,
+        .symbol = "wfr_std_assert",
+        .shape = null,
+        .params = &.{.bool},
         .return_type = .void,
     },
     .{

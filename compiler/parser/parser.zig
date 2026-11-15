@@ -262,6 +262,10 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.parseEnumDecl();
             },
+            .test_kw => {
+                _ = self.advance();
+                return self.parseTestDecl();
+            },
             .import_kw => {
                 _ = self.advance();
                 return self.parseImportDecl();
@@ -313,6 +317,28 @@ pub const Parser = struct {
             .generic_params = generic_params,
             .params = params,
             .return_type = return_type,
+            .body = body,
+        } });
+    }
+
+    fn parseTestDecl(self: *Parser) ?NodeIdx {
+        var name: ?StringRef = null;
+        self.skipNewlinesAndSemicolons();
+        if (self.check(.string_literal)) {
+            const tok = self.advance();
+            name = self.makeStringRef(tok);
+            self.skipNewlinesAndSemicolons();
+        }
+
+        const body: NodeIdx = if (self.check(.lbrace))
+            self.parseBlock() orelse return null
+        else {
+            self.errorHere("expected '{{' for test body", .{});
+            return null;
+        };
+
+        return self.appendNode(.{ .test_decl = .{
+            .name = name,
             .body = body,
         } });
     }
@@ -1394,7 +1420,7 @@ test "parser: interface declaration is rejected" {
 
 test "parser: if expression" {
     var res = try runTest(std.testing.allocator,
-        \\fn test(x: i32) -> i32 {
+        \\fn foo(x: i32) -> i32 {
         \\    if x > 0 {
         \\        return x
         \\    } else {

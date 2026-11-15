@@ -44,7 +44,7 @@ pub const Result = struct {
 
 /// Compile `source` as a single module. All allocations come from `arena`,
 /// which must outlive the returned `text` slice.
-pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: ferro.Target) !Result {
+pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: ferro.Target, test_mode: bool) !Result {
     var diagnostics = diag_mod.Diagnostics.init(arena);
     diagnostics.owns_messages = true;
 
@@ -80,7 +80,7 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: fer
     }
 
     const ctx = try api.Context.init(arena, target);
-    try lower_mod.lowerAll(arena, &arena_obj, source, &type_pool, &diagnostics, &checker, ctx);
+    try lower_mod.lowerAll(arena, &arena_obj, source, &type_pool, &diagnostics, &checker, ctx, test_mode);
 
     if (diagnostics.hasErrors()) {
         return .{ .ok = false, .text = null, .diagnostics = diagnostics };
@@ -117,6 +117,7 @@ pub fn compileAnnotated(
     arena: Allocator,
     source: []const u8,
     target: ferro.Target,
+    test_mode: bool,
 ) !AnnotatedResult {
     var diagnostics = diag_mod.Diagnostics.init(arena);
     diagnostics.owns_messages = true;
@@ -150,7 +151,7 @@ pub fn compileAnnotated(
     }
 
     const ctx = try api.Context.init(arena, target);
-    try lower_mod.lowerAll(arena, &arena_obj, source, &type_pool, &diagnostics, &checker, ctx);
+    try lower_mod.lowerAll(arena, &arena_obj, source, &type_pool, &diagnostics, &checker, ctx, test_mode);
 
     if (diagnostics.hasErrors()) {
         return .{ .ok = false, .obj_bytes = "", .diagnostics = diagnostics };

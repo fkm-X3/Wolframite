@@ -189,6 +189,8 @@ const Materialized = union(enum) {
 const FunctionBody = union(enum) {
     /// A declared `fn` (or a monomorphized instance): the declaration node.
     decl: NodeIdx,
+    /// A declared `test`: the declaration node.
+    test_decl: NodeIdx,
     /// A lifted closure literal: the closure node. Its captures come from
     /// the closure's inferred env list.
     closure: NodeIdx,
@@ -242,6 +244,11 @@ pub const Lowerer = struct {
     /// The composition the expression being lowered materialized, if any
     /// (R31b). The binding that holds it picks it up.
     pending_materialized: ?Materialized = null,
+    test_mode: bool = false,
+    test_counter: u32 = 0,
+    test_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    test_fns: std.ArrayListUnmanaged(api.FunctionIdx) = .empty,
+    current_test_failed_ptr: ?api.Value = null,
 
     block_terminated: bool = false,
     current_block: api.BasicBlockIdx = @enumFromInt(0),
@@ -260,6 +267,7 @@ pub const Lowerer = struct {
         diagnostics: *diag.Diagnostics,
         checker: *typecheck_mod.TypeChecker,
         ctx: *api.Context,
+        test_mode: bool,
     ) !Lowerer {
         var self = Lowerer{
             .gpa = gpa,
@@ -289,6 +297,7 @@ pub const Lowerer = struct {
             .locals = .empty,
             .shadows = .empty,
             .pending_defers = .empty,
+            .test_mode = test_mode,
         };
         self.ptr_ty = try ctx.ptrType(self.i64_ty);
         self.strings = string_mod.LiteralPool.init(gpa, ctx);
@@ -298,6 +307,8 @@ pub const Lowerer = struct {
     pub fn deinit(self: *Lowerer) void {
         self.fn_by_node.deinit(self.gpa);
         self.all_functions.deinit(self.gpa);
+        self.test_names.deinit(self.gpa);
+        self.test_fns.deinit(self.gpa);
         self.params.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.shadows.deinit(self.gpa);
@@ -310,7 +321,7 @@ pub const Lowerer = struct {
         const module = self.arena.get(self.checker.module_node);
 
         // Pass 1: create every function.
-        for (module.module.decls.indices) |decl_idx| {
+        for (module.module.decls.indices, 0..) |decl_idx, decl_i| {
             const decl = self.arena.get(decl_idx);
             switch (decl.*) {
                 .fn_decl => |f| {
@@ -321,7 +332,20 @@ pub const Lowerer = struct {
                         // arguments (R21 step 4, R22).
                         continue;
                     }
+                    if (self.test_mode and std.mem.eql(u8, self.nameSlice(f.name), "main")) {
+                        // In test mode the runner synthesizes `main`; a user
+                        // `main` is left un-lowered to avoid a duplicate.
+                        continue;
+                    }
                     _ = try self.createFunction(decl_idx, self.nameSlice(f.name));
+                },
+                .test_decl => |t| {
+                    const test_name = if (t.name) |n| n.slice(self.source) else "";
+                    const name_buf = try std.fmt.allocPrint(self.gpa, "__test_{d}", .{decl_i});
+                    defer self.gpa.free(name_buf);
+                    const fidx = try self.createTestFunction(decl_idx, name_buf);
+                    try self.test_names.append(self.gpa, try self.gpa.dupe(u8, test_name));
+                    try self.test_fns.append(self.gpa, fidx);
                 },
                 else => {},
             }
@@ -341,6 +365,10 @@ pub const Lowerer = struct {
         while (i < self.all_functions.items.len) : (i += 1) {
             const f = self.all_functions.items[i];
             try self.lowerFunctionBody(f.body, f.idx);
+        }
+
+        if (self.test_mode and self.test_fns.items.len > 0) {
+            try self.generateTestMain();
         }
     }
 
@@ -364,6 +392,13 @@ pub const Lowerer = struct {
         const fidx = try self.ctx.addFunction(name, sret_ret_ir, param_count);
         try self.fn_by_node.put(self.gpa, decl_idx, fidx);
         try self.all_functions.append(self.gpa, .{ .body = .{ .decl = decl_idx }, .idx = fidx });
+        return fidx;
+    }
+
+    fn createTestFunction(self: *Lowerer, decl_idx: NodeIdx, name: []const u8) !api.FunctionIdx {
+        const ret_ir = self.void_ty;
+        const fidx = try self.ctx.addFunction(name, ret_ir, 2); // env + failed ptr
+        try self.all_functions.append(self.gpa, .{ .body = .{ .test_decl = decl_idx }, .idx = fidx });
         return fidx;
     }
 
@@ -404,6 +439,19 @@ pub const Lowerer = struct {
         self.setBlock(entry);
 
         switch (body) {
+            .test_decl => |decl_idx| {
+                const t = self.arena.get(decl_idx).test_decl;
+                self.current_test_failed_ptr = @enumFromInt(1);
+                if (t.body != NodeIdx.none) {
+                    try self.lowerStmt(t.body);
+                }
+                self.current_test_failed_ptr = null;
+                if (!self.block_terminated) {
+                    _ = try self.ctx.buildRetVoid();
+                    self.block_terminated = true;
+                }
+                return;
+            },
             .decl => |decl_idx| {
                 const f = self.arena.get(decl_idx).fn_decl;
                 const ret_ty = self.checker.nodeType(decl_idx);
@@ -444,6 +492,99 @@ pub const Lowerer = struct {
             .closure => |closure_node| try self.lowerLiftedBody(closure_node),
             .composition => |comp| try self.lowerCompositionBody(comp),
         }
+    }
+
+    fn buildStringLiteral(self: *Lowerer, bytes: []const u8) !api.Value {
+        const global = try self.strings.globalFor(bytes);
+        const repr = try self.ctx.buildAllocaBytes(self.ptr_ty, string_mod.total_size);
+        _ = try self.ctx.buildStore(self.i64_ty, repr, try self.ctx.buildIntConst(self.i64_ty, @intCast(bytes.len)));
+        const data = try self.ctx.buildGlobalAddr(self.ptr_ty, global);
+        const data_addr = try self.ctx.buildPtrAdd(self.ptr_ty, repr, try self.ctx.buildIntConst(self.i64_ty, @intCast(string_mod.data_offset)));
+        _ = try self.ctx.buildStore(self.ptr_ty, data_addr, data);
+        return repr;
+    }
+
+    fn generateTestMain(self: *Lowerer) !void {
+        const fidx = try self.ctx.addFunction("main", self.void_ty, 0);
+        self.ctx.setCurrentFunction(fidx);
+
+        const entry = try self.ctx.appendBlock();
+        self.setBlock(entry);
+
+        // Track overall failure in a stack slot.
+        const failed_slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
+        _ = try self.ctx.buildStore(self.i64_ty, failed_slot, try self.ctx.buildIntConst(self.i64_ty, 0));
+
+        const any_failed_slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
+        _ = try self.ctx.buildStore(self.i64_ty, any_failed_slot, try self.ctx.buildIntConst(self.i64_ty, 0));
+
+        for (self.test_fns.items, 0..) |test_fn, i| {
+            const name = self.test_names.items[i];
+            // Print "test: <name>".
+            const prefix = try std.fmt.allocPrint(self.gpa, "test: {s}\n", .{name});
+            defer self.gpa.free(prefix);
+            const prefix_val = try self.buildStringLiteral(prefix);
+            _ = try self.ctx.buildExternCall("wfr_std_write_string", self.void_ty, &.{prefix_val});
+
+            // Reset per-test failure flag.
+            _ = try self.ctx.buildStore(self.i64_ty, failed_slot, try self.ctx.buildIntConst(self.i64_ty, 0));
+
+            // Call test function (hidden env param).
+            const env_val = try self.ctx.buildIntConst(self.i64_ty, 0);
+            _ = try self.ctx.buildCall(test_fn, self.void_ty, &.{env_val, failed_slot});
+
+            // Check per-test failure flag.
+            const failed = try self.ctx.buildLoad(self.i64_ty, failed_slot);
+            const zero = try self.ctx.buildIntConst(self.i64_ty, 0);
+            const is_failed = try self.ctx.buildIcmp(.icmp_ne, self.i64_ty, failed, zero);
+
+            const ok_block = try self.ctx.appendBlock();
+            const fail_block = try self.ctx.appendBlock();
+            const merge_block = try self.ctx.appendBlock();
+
+            _ = try self.ctx.buildCondBr(is_failed, fail_block, ok_block);
+
+            // ok branch
+            self.setBlock(ok_block);
+            const ok_msg = try self.buildStringLiteral("  ok\n");
+            _ = try self.ctx.buildExternCall("wfr_std_write_string", self.void_ty, &.{ok_msg});
+            _ = try self.ctx.buildBr(merge_block);
+            self.terminated();
+
+            // fail branch
+            self.setBlock(fail_block);
+            const fail_msg = try self.buildStringLiteral("  FAILED\n");
+            _ = try self.ctx.buildExternCall("wfr_std_write_string", self.void_ty, &.{fail_msg});
+            _ = try self.ctx.buildStore(self.i64_ty, any_failed_slot, try self.ctx.buildIntConst(self.i64_ty, 1));
+            _ = try self.ctx.buildBr(merge_block);
+            self.terminated();
+
+            self.setBlock(merge_block);
+        }
+
+        // Final summary.
+        const any_failed = try self.ctx.buildLoad(self.i64_ty, any_failed_slot);
+        const zero = try self.ctx.buildIntConst(self.i64_ty, 0);
+        const failed_overall = try self.ctx.buildIcmp(.icmp_ne, self.i64_ty, any_failed, zero);
+
+        const fail_exit_block = try self.ctx.appendBlock();
+        const ok_exit_block = try self.ctx.appendBlock();
+        _ = try self.ctx.buildCondBr(failed_overall, fail_exit_block, ok_exit_block);
+
+        self.setBlock(fail_exit_block);
+        const summary_fail = try self.buildStringLiteral("test result: FAILED\n");
+        _ = try self.ctx.buildExternCall("wfr_std_write_string", self.void_ty, &.{summary_fail});
+        // exit(1) via wfr_std_exit
+        const one = try self.ctx.buildIntConst(self.i32_ty, 1);
+        _ = try self.ctx.buildExternCall("wfr_std_exit", self.void_ty, &.{one});
+        self.terminated();
+
+        self.setBlock(ok_exit_block);
+        const summary_ok = try self.buildStringLiteral("test result: ok\n");
+        _ = try self.ctx.buildExternCall("wfr_std_write_string", self.void_ty, &.{summary_ok});
+        const exit_zero = try self.ctx.buildIntConst(self.i32_ty, 0);
+        _ = try self.ctx.buildExternCall("wfr_std_exit", self.void_ty, &.{exit_zero});
+        self.terminated();
     }
 
     /// Emit the fallthrough return for a body that did not terminate: a void
@@ -1976,6 +2117,30 @@ pub const Lowerer = struct {
 
         switch (entry.kind) {
             .io => {
+                if (std.mem.eql(u8, entry.name, "assert")) {
+                    var vals = try self.lowerArgs(args, piped, hole);
+                    defer vals.deinit(self.gpa);
+                    const cond = vals.items[0];
+                    const zero = try self.ctx.buildIntConst(self.bool_ty, 0);
+                    const is_false = try self.ctx.buildIcmp(.icmp_eq, self.bool_ty, cond, zero);
+
+                    if (self.current_test_failed_ptr) |failed_ptr| {
+                        const store_block = try self.ctx.appendBlock();
+                        const merge_block = try self.ctx.appendBlock();
+                        _ = try self.ctx.buildCondBr(is_false, store_block, merge_block);
+
+                        self.setBlock(store_block);
+                        _ = try self.ctx.buildStore(self.i64_ty, failed_ptr, try self.ctx.buildIntConst(self.i64_ty, 1));
+                        _ = try self.ctx.buildBr(merge_block);
+                        self.terminated();
+
+                        self.setBlock(merge_block);
+                        return try self.ctx.buildIntConst(self.i64_ty, 0);
+                    }
+
+                    // Outside a test, fall back to the runtime assertion.
+                    return self.ctx.buildExternCall(entry.symbol.?, self.void_ty, vals.items);
+                }
                 var vals = try self.lowerArgs(args, piped, hole);
                 defer vals.deinit(self.gpa);
                 return self.ctx.buildExternCall(entry.symbol.?, self.void_ty, vals.items);
@@ -3172,8 +3337,9 @@ pub fn lowerAll(
     diagnostics: *diag.Diagnostics,
     checker: *typecheck_mod.TypeChecker,
     ctx: *api.Context,
+    test_mode: bool,
 ) !void {
-    var lowerer = try Lowerer.init(gpa, arena, source, type_pool, diagnostics, checker, ctx);
+    var lowerer = try Lowerer.init(gpa, arena, source, type_pool, diagnostics, checker, ctx, test_mode);
     defer lowerer.deinit();
     try lowerer.run();
 }
@@ -3285,7 +3451,7 @@ fn runLower(allocator: Allocator, source: []const u8) !TestResult {
     }
     const ctx = try api.Context.init(allocator, .linux_x86_64);
     errdefer ctx.deinit();
-    try lowerAll(allocator, &arena, source, &type_pool, &diags, &checker, ctx);
+    try lowerAll(allocator, &arena, source, &type_pool, &diags, &checker, ctx, false);
     checker.deinit();
     return .{ .arena = arena, .type_pool = type_pool, .diagnostics = diags, .ctx = ctx };
 }

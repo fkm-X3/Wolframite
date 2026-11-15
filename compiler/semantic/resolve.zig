@@ -209,8 +209,23 @@ pub const Resolver = struct {
             .fn_decl => {
                 try self.resolveFnDecl(decl_idx);
             },
+            .test_decl => {
+                try self.resolveTestDecl(decl_idx);
+            },
             else => {},
         }
+    }
+
+    fn resolveTestDecl(self: *Resolver, test_idx: NodeIdx) anyerror!void {
+        const test_decl = self.arena.get(test_idx);
+        const t = test_decl.test_decl;
+        _ = try self.scopes.pushScope(self.scopes.currentScope());
+
+        if (t.body != NodeIdx.none) {
+            try self.resolveStmt(t.body);
+        }
+
+        self.scopes.popScope();
     }
 
     fn resolveFnDecl(self: *Resolver, fn_idx: NodeIdx) anyerror!void {
@@ -604,7 +619,7 @@ pub const Resolver = struct {
                 try self.resolveMatchArms(m);
             },
             .param, .field, .enum_variant, .match_arm, .struct_init_field => {},
-            .module, .fn_decl, .struct_decl, .enum_decl, .import_decl => {},
+            .module, .fn_decl, .struct_decl, .enum_decl, .import_decl, .test_decl => {},
             .let_stmt, .return_stmt, .expr_stmt, .defer_stmt, .while_expr, .for_range, .for_each => {},
         }
     }

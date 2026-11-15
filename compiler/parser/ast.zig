@@ -125,6 +125,10 @@ pub const Node = union(enum) {
         return_type: ?NodeIdx,
         body: NodeIdx,
     },
+    test_decl: struct {
+        name: ?StringRef,
+        body: NodeIdx,
+    },
     struct_decl: struct {
         name: StringRef,
         generic_params: NodeList,
@@ -369,6 +373,13 @@ fn cloneNode(
                 .generic_params = generic_params,
                 .params = params,
                 .return_type = return_type,
+                .body = body,
+            } });
+        },
+        .test_decl => |t| {
+            const body = try cloneNode(arena, t.body, map);
+            return appendClone(arena, idx, map, .{ .test_decl = .{
+                .name = t.name,
                 .body = body,
             } });
         },

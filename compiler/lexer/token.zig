@@ -30,6 +30,7 @@ pub const TokenTag = enum(u8) {
     comptime_kw,
     move_kw,
     region_kw,
+    test_kw,
 
     // Operators
     plus,
@@ -110,6 +111,7 @@ pub const TokenTag = enum(u8) {
             .comptime_kw => "comptime",
             .move_kw => "move",
             .region_kw => "region",
+            .test_kw => "test",
             .plus => "+",
             .minus => "-",
             .star => "*",
@@ -197,6 +199,7 @@ pub const KEYWORDS = init: {
         .{ "comptime", .comptime_kw },
         .{ "move", .move_kw },
         .{ "region", .region_kw },
+        .{ "test", .test_kw },
     };
 
     const Map = std.StaticStringMap(TokenTag);
