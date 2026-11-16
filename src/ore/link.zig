@@ -1,11 +1,17 @@
 //! Link pipeline for `ore run` / `ore build --emit-bin`.
 //!
-//! Ore now compiles the source to a relocatable object (via Tungsten's object
+//! Ore compiles the source to a relocatable object (via Tungsten's object
 //! emission) and links it into an executable using Ferro — the Tungsten
 //! backend's internal linker. Runtime: prelude calls such as `print` lower to
 //! extern calls into the Wolframite runtime, `libs/std`, built by `zig build`
 //! and linked here as a static object/archive. Ferro reads the runtime
 //! alongside the program object and resolves `wfr_std_*` symbols against it.
+//!
+//! The target is always explicit — the host platform by default, or the
+//! `--target` triple chosen on the ore command line (see
+//! `docs/cross-compilation.md`). The same target drives object emission and
+//! linking, and the runtime archive is looked up per target so a cross-link
+//! never picks up a wrong-format runtime.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,14 +37,19 @@ const std_lib_dirs = [_][]const u8{
     "build/zig-out/lib",
 };
 
-/// Archive/file names for the runtime, per platform.
-const std_lib_names = [_][]const u8{
-    "wfr_std.lib",
-    "libwfr_std.a",
-    "wfr_std.a",
-};
+/// Archive/file names for the runtime, per link target. The archive format
+/// must match the target — a COFF library for Windows executables, an ELF
+/// `ar` archive for Linux ones — so only the selected target's names are
+/// tried and a cross-link never picks up a wrong-format runtime.
+fn stdLibNames(target: ferro.Target) []const []const u8 {
+    return switch (target) {
+        .windows_x86_64 => &.{"wfr_std.lib"},
+        .linux_x86_64 => &.{ "libwfr_std.a", "wfr_std.a" },
+    };
+}
 
-/// Locate the Wolframite runtime object/archive, or fail with `StdLibMissing`.
+/// Locate the Wolframite runtime object/archive for `target`, or fail with
+/// `StdLibMissing`.
 ///
 /// `ore` first tries the project-local `zig-out/` layout (where `zig build`
 /// installs the runtime), then falls back to the system-wide install location
@@ -50,10 +61,16 @@ const std_lib_names = [_][]const u8{
 ///      scripts mirror the zig-out/ layout, i.e. `<install>/bin/ore` and
 ///      `<install>/lib/wfr_std.lib`).
 ///   The POSIX system path `/usr/local/wolframite/lib`.
-fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
+///
+/// Only archive names matching `target` are tried (see `stdLibNames`), so a
+/// cross-link either finds the target's runtime or fails with a clear
+/// `StdLibMissing` instead of linking a wrong-format archive.
+fn findWfrStdLib(io: std.Io, gpa: Allocator, target: ferro.Target) LinkError![]u8 {
+    const names = stdLibNames(target);
+
     // Project-local layouts (zig-out/), tried first.
     for (std_lib_dirs) |dir| {
-        for (std_lib_names) |name| {
+        for (names) |name| {
             const candidate = std.fs.path.join(gpa, &.{ dir, name }) catch continue;
             if (fileExists(io, candidate)) return candidate;
             gpa.free(candidate);
@@ -73,7 +90,7 @@ fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
                 if (installdir) |i| {
                     const lib_dir = std.fs.path.join(gpa, &.{ i, "lib" }) catch return error.StdLibMissing;
                     defer gpa.free(lib_dir);
-                    for (std_lib_names) |name| {
+                    for (names) |name| {
                         const candidate = std.fs.path.join(gpa, &.{ lib_dir, name }) catch continue;
                         if (fileExists(io, candidate)) return candidate;
                         gpa.free(candidate);
@@ -86,7 +103,7 @@ fn findWfrStdLib(io: std.Io, gpa: Allocator) LinkError![]u8 {
     // POSIX system install location, e.g. /usr/local/wolframite/lib.
     const posix_install_dir: []const u8 = "/usr/local/wolframite/lib";
     if (std.fs.path.isAbsolute(posix_install_dir)) {
-        for (std_lib_names) |name| {
+        for (names) |name| {
             const candidate = std.fs.path.join(gpa, &.{ posix_install_dir, name }) catch continue;
             if (fileExists(io, candidate)) return candidate;
             gpa.free(candidate);
@@ -114,6 +131,11 @@ pub fn replaceExt(gpa: Allocator, path: []const u8, new_ext: []const u8) ![]u8 {
 /// Compile `source_path` to an object file at `obj_path` (via Tungsten object
 /// emission) and link it with the Wolframite runtime into `exe_path` via Ferro.
 ///
+/// `target` is the platform to build for — the host platform by default, or a
+/// `--target` triple chosen on the ore command line. The same target drives
+/// object emission and linking, so cross-compiling (`--target ... --emit-bin`)
+/// produces an executable for the target, not the host.
+///
 /// The object file is written as an intermediate alongside the executable.
 ///
 /// When `dump_image` is true, Ferro prints the merged image (section sizes,
@@ -126,14 +148,13 @@ pub fn linkBinary(
     exe_path: []const u8,
     dump_image: bool,
     test_mode: bool,
+    target: ferro.Target,
 ) LinkError!void {
-    const obj_path = replaceExt(gpa, exe_path, hostObjectExt()) catch return error.LinkFailed;
+    const obj_path = replaceExt(gpa, exe_path, targetObjectExt(target)) catch return error.LinkFailed;
     defer gpa.free(obj_path);
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .unlimited) catch return error.CompileFailed;
     defer gpa.free(source);
-
-    const target = hostTarget();
 
     // All compiler allocations (AST, types, diagnostics, object bytes) are
     // owned by this arena and released when linking completes.
@@ -152,7 +173,7 @@ pub fn linkBinary(
 
     _ = write_obj;
 
-    const wfr_std_lib = try findWfrStdLib(io, gpa);
+    const wfr_std_lib = try findWfrStdLib(io, gpa, target);
     defer gpa.free(wfr_std_lib);
 
     var opts = ferro.defaultLinkOptions(target);
@@ -162,12 +183,33 @@ pub fn linkBinary(
     }
 }
 
+/// The default object-file extension for a target: `.obj` for Windows
+/// targets, `.o` for Linux targets (mirrors Tungsten's object-format
+/// mapping). Cross-compiling with `--target` names the object after the
+/// target platform, not the host.
+pub fn targetObjectExt(target: ferro.Target) []const u8 {
+    return switch (target) {
+        .windows_x86_64 => "obj",
+        .linux_x86_64 => "o",
+    };
+}
+
 /// The default object-file extension for the host OS: `.obj` on Windows, `.o`
 /// elsewhere (mirrors Tungsten's object-format mapping).
 pub fn hostObjectExt() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => "obj",
-        else => "o",
+    return targetObjectExt(hostTarget());
+}
+
+/// The `zig build -Dtarget=` argument that builds the Wolframite runtime
+/// archive for `target` (used in cross-compilation error hints).
+///
+/// This uses zig's own `arch-os` spelling — zig's build-system target flag
+/// has no vendor component, so it differs from ore's canonical triple
+/// spelling (`x86_64-microsoft-windows` / `x86_64-unknown-linux`).
+pub fn zigTargetName(target: ferro.Target) []const u8 {
+    return switch (target) {
+        .windows_x86_64 => "x86_64-windows",
+        .linux_x86_64 => "x86_64-linux",
     };
 }
 
@@ -186,11 +228,19 @@ test "findWfrStdLib reports a missing runtime instead of guessing" {
     // The test binary runs from the build cache, where no runtime is installed,
     // so this only asserts the error is reachable and carries a name the
     // caller can report.
-    if (findWfrStdLib(testing.io, testing.allocator)) |path| {
+    if (findWfrStdLib(testing.io, testing.allocator, hostTarget())) |path| {
         testing.allocator.free(path);
     } else |err| {
         try testing.expectEqual(LinkError.StdLibMissing, err);
     }
+}
+
+test "targetObjectExt and zigTargetName follow the target platform" {
+    try testing.expectEqualStrings("obj", targetObjectExt(.windows_x86_64));
+    try testing.expectEqualStrings("o", targetObjectExt(.linux_x86_64));
+    try testing.expectEqualStrings("obj", hostObjectExt());
+    try testing.expectEqualStrings("x86_64-windows", zigTargetName(.windows_x86_64));
+    try testing.expectEqualStrings("x86_64-linux", zigTargetName(.linux_x86_64));
 }
 
 test "linkBinary reports CompileFailed for source that does not compile" {
@@ -215,7 +265,7 @@ test "linkBinary reports CompileFailed for source that does not compile" {
         return;
     }
 
-    if (linkBinary(io, gpa, source_path, exe_path, false, false)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false, false, hostTarget())) |_| {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.CompileFailed, err);
@@ -244,12 +294,12 @@ test "linkBinary reports StdLibMissing when the runtime archive is absent" {
     }
 
     var runtime_absent: bool = true;
-    if (findWfrStdLib(io, gpa)) |path| {
+    if (findWfrStdLib(io, gpa, hostTarget())) |path| {
         gpa.free(path);
         runtime_absent = false;
     } else |_| {}
 
-    if (linkBinary(io, gpa, source_path, exe_path, false, false)) |_| {
+    if (linkBinary(io, gpa, source_path, exe_path, false, false, hostTarget())) |_| {
         // Only reachable when a runtime is installed in the test environment.
         try std.testing.expectEqual(false, runtime_absent);
         if (std.Io.Dir.cwd().statFile(io, exe_path, .{})) |_| {} else |_| {

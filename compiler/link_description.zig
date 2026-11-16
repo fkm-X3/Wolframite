@@ -25,8 +25,11 @@
 //!         .debug = false,
 //!     };
 //!
-//! Required: `target`, `output`, `input`, `runtime_lib`.
-//! Optional: `entry` (defaults `_main`), `subsystem` (defaults `console`),
+//! Required: `output`, `input`, `runtime_lib`.
+//! Optional: `target` (defaults to the host platform: "linux" or "windows";
+//! accepts a bare platform name or an x86_64 target triple — canonical forms
+//! are "x86_64-unknown-linux" and "x86_64-microsoft-windows"),
+//! `entry` (defaults `_main`), `subsystem` (defaults `console`),
 //! `debug` (defaults `false`).
 //!
 //! The compiler extracts it via `compiler.link_description.compileLinkDescription`,
@@ -34,6 +37,7 @@
 //! those options to `Tungsten.ferro.linkObject` (see `libs/backend/src/ferro.zig`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("parser/ast.zig");
 const ferro = @import("Tungsten").ferro;
 const lexer_mod = @import("lexer/lexer.zig");
@@ -70,10 +74,8 @@ const field_input = "input";
 const field_debug = "debug";
 
 const required_fields = [_][]const u8{
-    field_target,
     field_output,
     field_input,
-    field_runtime_lib,
 };
 
 /// Strip the surrounding double-quotes from a string-literal lexeme.
@@ -108,9 +110,10 @@ fn unquoteStringLiteral(s: []const u8) []const u8 {
 ///         .debug = false,
 ///     };
 ///
-/// Required fields: `target`, `output`, `input`, `runtime_lib`.
-/// Optional: `entry` (defaults "_main"), `subsystem` (defaults "console"),
-/// `debug` (defaults `false`).
+/// Required fields: `output`, `input`, `runtime_lib`.
+/// Optional: `target` (defaults to the host platform; accepts a bare platform
+/// name or an x86_64 target triple), `entry` (defaults "_main"),
+/// `subsystem` (defaults "console"), `debug` (defaults `false`).
 ///
 /// Returns `NotALinkDescription` when the module is an ordinary program
 /// (defines `fn main`) or does not bind a linker-args struct. On success, all
@@ -200,8 +203,15 @@ pub fn extractLinkDescription(
         break; // only the first linker-args struct is consumed
     }
 
-    if (!seen_target or !seen_output or !seen_input or !seen_runtime_lib) {
+    if (!seen_output or !seen_input or !seen_runtime_lib) {
         return error.MissingField;
+    }
+
+    // Zero-config cross-compilation: when the target is omitted, default to
+    // the platform the compiler is running on. An explicit `target` field
+    // still selects a different platform (cross-compilation).
+    if (!seen_target) {
+        desc.target = if (builtin.os.tag == .windows) "windows" else "linux";
     }
 
     return desc;

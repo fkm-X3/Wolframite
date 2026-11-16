@@ -45,6 +45,107 @@ pub fn objectFormat(target: Target) ObjectFormat {
     };
 }
 
+// ============================================================================
+// Target triples
+// ============================================================================
+
+/// A target triple split into its components.
+///
+/// Wolframite's canonical triples are `x86_64-unknown-linux` and
+/// `x86_64-microsoft-windows`. The grammar is `arch[-vendor]-os[-abi]`, but
+/// the spelling deliberately diverges from GCC/LLVM: the runtime is libc-free,
+/// so there is no ABI component (no `gnu`/`musl`/`msvc`), and the Windows
+/// vendor is `microsoft` rather than `pc`. Foreign spellings such as
+/// `x86_64-pc-windows-msvc` are accepted and map to the same two targets.
+///
+/// Component slices borrow from the parsed string and keep their original
+/// case; matching downstream is case-insensitive.
+pub const Triple = struct {
+    /// CPU architecture. Tungsten emits x86_64 machine code, so only
+    /// `x86_64` (alias `amd64`) is accepted.
+    arch: []const u8,
+    /// Vendor component (`pc`, `unknown`, `w64`, ...). Accepted but ignored.
+    vendor: []const u8,
+    /// Operating-system component: `linux`, or a Windows alias (`windows`,
+    /// `mingw32`, `mingw`).
+    os: []const u8,
+    /// ABI / environment suffix (`gnu`, `musl`, `msvc`, ...). Accepted but
+    /// ignored: Ferro emits one object flavor per platform.
+    abi: []const u8 = "",
+
+    /// Map this triple to the `Target` Ferro links for.
+    ///
+    /// Returns `LinkDescriptionError.InvalidTarget` when the architecture is
+    /// not x86_64 or the OS is not Linux/Windows — the only platforms the
+    /// object writers and Ferro support (see `docs/adr/adr_ferro_linker.md`).
+    pub fn target(self: Triple) LinkDescriptionError!Target {
+        if (!isX86_64Arch(self.arch)) return error.InvalidTarget;
+        if (isWindowsOs(self.os)) return .windows_x86_64;
+        if (isLinuxOs(self.os)) return .linux_x86_64;
+        return error.InvalidTarget;
+    }
+};
+
+/// Parse a target triple (`arch[-vendor]-os[-abi]`) into its components. The
+/// component slices borrow from `s`.
+///
+/// The OS component is located by name rather than by position, so both the
+/// canonical form (`x86_64-unknown-linux`: arch-vendor-os) and the shorter
+/// two-part form (`x86_64-linux`: arch-os) parse to the same result.
+/// Components after the ABI are accepted and ignored.
+pub fn parseTriple(s: []const u8) LinkDescriptionError!Triple {
+    var parts: [8][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '-');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.InvalidTarget; // empty component
+        if (count == parts.len) return error.InvalidTarget; // too many components
+        parts[count] = part;
+        count += 1;
+    }
+    if (count < 2) return error.InvalidTarget;
+
+    // The architecture is the first component; find the OS among the rest.
+    var os_idx: ?usize = null;
+    for (parts[1..count], 1..) |part, i| {
+        if (isOsName(part)) {
+            os_idx = i;
+            break;
+        }
+    }
+    const os_i = os_idx orelse return error.InvalidTarget;
+
+    return .{
+        .arch = parts[0],
+        .vendor = if (os_i > 1) parts[1] else "unknown",
+        .os = parts[os_i],
+        .abi = if (count > os_i + 1) parts[os_i + 1] else "",
+    };
+}
+
+fn eqlAnyIgnoreCase(s: []const u8, names: []const []const u8) bool {
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(s, name)) return true;
+    }
+    return false;
+}
+
+fn isX86_64Arch(s: []const u8) bool {
+    return eqlAnyIgnoreCase(s, &.{ "x86_64", "amd64" });
+}
+
+fn isOsName(s: []const u8) bool {
+    return isLinuxOs(s) or isWindowsOs(s);
+}
+
+fn isLinuxOs(s: []const u8) bool {
+    return eqlAnyIgnoreCase(s, &.{"linux"});
+}
+
+fn isWindowsOs(s: []const u8) bool {
+    return eqlAnyIgnoreCase(s, &.{ "windows", "mingw32", "mingw" });
+}
+
 /// The subsystem of a Windows executable. Ignored on Linux; kept in
 /// `LinkOptions` so the Wolframite-facing link description can select console
 /// vs GUI.
@@ -101,7 +202,10 @@ pub fn defaultLinkOptions(target: Target) LinkOptions {
 /// Fields are string slices borrowed from the compiler arena; they must not
 /// outlive it.
 pub const LinkDescription = struct {
-    target: []const u8, // "linux" | "windows"
+    /// `"linux"`, `"windows"`, or an x86_64 target triple — canonical forms
+    /// are `"x86_64-unknown-linux"` and `"x86_64-microsoft-windows"` — parsed
+    /// with `parseTarget`.
+    target: []const u8,
     output: []const u8, // executable output path
     entry: []const u8, // entry symbol (default "_main")
     subsystem: []const u8, // "console" | "gui" (windows only)
@@ -120,10 +224,27 @@ pub const LinkDescriptionError = error{
     MissingField,
 };
 
-/// Parse `s` ("linux" | "windows", case-insensitive) into a `Target`.
+/// Parse `s` into a `Target`.
+///
+/// Accepted forms, all case-insensitive:
+///
+///   - the platform names `linux` and `windows`;
+///   - the canonical triples `x86_64-unknown-linux` and
+///     `x86_64-microsoft-windows` (see `Triple` for why the spelling differs
+///     from GCC/LLVM);
+///   - tolerated foreign/shorter triples such as `x86_64-pc-windows-msvc`,
+///     `x86_64-unknown-linux-gnu`, or `x86_64-linux`, which map to the same
+///     two targets. The architecture must be `x86_64` (alias `amd64`) and the
+///     OS component must be Linux or Windows; vendor/ABI components are
+///     accepted but ignored (see `Triple.target`).
 pub fn parseTarget(s: []const u8) LinkDescriptionError!Target {
     if (std.ascii.eqlIgnoreCase(s, "linux")) return .linux_x86_64;
     if (std.ascii.eqlIgnoreCase(s, "windows")) return .windows_x86_64;
+    // Anything containing '-' is parsed as a target triple.
+    if (std.mem.indexOfScalar(u8, s, '-') != null) {
+        const triple = try parseTriple(s);
+        return triple.target();
+    }
     return error.InvalidTarget;
 }
 

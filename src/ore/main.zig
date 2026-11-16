@@ -3,8 +3,10 @@
 //! Currently a single-file build tool wrapping the full compiler pipeline
 //! (see `compile.zig`), with package scaffolding (`init`), a run mode that
 //! compiles to an object + links via Ferro (`run`, `build --emit-bin`),
-//! and a self-update command that installs new ore releases (which bundle
-//! the compiler) from GitHub (`update`).
+//! zero-config cross-compilation to a target triple
+//! (`build --target <triple>`, see `docs/cross-compilation.md`), and a
+//! self-update command that installs new ore releases (which bundle the
+//! compiler) from GitHub (`update`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,7 +23,7 @@ const update_mod = @import("update.zig");
 const disasm_mod = @import("disasm.zig");
 
 const replaceExt = link_mod.replaceExt;
-const hostObjectExt = link_mod.hostObjectExt;
+const targetObjectExt = link_mod.targetObjectExt;
 const hostTarget = link_mod.hostTarget;
 
 // Include link.zig's test blocks in the ore test build, mirroring the
@@ -157,8 +159,11 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
     var mode: compile_mod.EmitMode = .@"obj";
     var emit_bin = true;
+    var emit_bin_explicit = false;
     var dump_image = false;
     var emit_annotated = false;
+    var target = hostTarget();
+    var target_given = false;
     var file: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -171,6 +176,17 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             if (i + 1 >= args.len) return flagNeedsValue(io, arg);
             i += 1;
             out_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            if (i + 1 >= args.len) return flagNeedsValue(io, arg);
+            i += 1;
+            target = ferro.parseTarget(args[i]) catch {
+                reportErr(io, "error: unknown target '{s}'\n", .{args[i]});
+                reportErr(io, "       expected 'linux', 'windows', or an x86_64 target triple\n", .{});
+                reportErr(io, "       such as 'x86_64-microsoft-windows' or\n", .{});
+                reportErr(io, "       'x86_64-unknown-linux'\n", .{});
+                return 2;
+            };
+            target_given = true;
         } else if (std.mem.eql(u8, arg, "--ir")) {
             mode = .ir;
             emit_bin = false;
@@ -179,6 +195,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
+            emit_bin_explicit = true;
         } else if (std.mem.eql(u8, arg, "--dump-image")) {
             dump_image = true;
         } else if (std.mem.eql(u8, arg, "--emit-annotated")) {
@@ -200,11 +217,18 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         return 2;
     }
 
+    // Cross-compiling with --target defaults to emitting a relocatable object
+    // for the target: that needs nothing but the compiler, while the Ferro
+    // link step also needs the target's runtime archive. --emit-bin opts into
+    // linking an executable (see docs/cross-compilation.md).
+    if (target_given and !emit_bin_explicit and !emit_annotated and mode == .@"obj") {
+        emit_bin = false;
+    }
+
     const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
 
     if (emit_annotated) {
         const source = readSource(gpa, io, source_path) orelse return 1;
-        const target = link_mod.hostTarget();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const result = try compile_mod.compileAnnotated(arena.allocator(), source, target, false);
@@ -213,7 +237,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             reportErr(io, "error: compilation failed\n", .{});
             return 1;
         }
-        const obj_path = out_path orelse try replaceExt(gpa, source_path, link_mod.hostObjectExt());
+        const obj_path = out_path orelse try replaceExt(gpa, source_path, targetObjectExt(target));
         if ((try writeBinaryFile(io, obj_path, result.obj_bytes)) != 0) return 1;
         printOut(io, "wrote {s}\n", .{ obj_path });
         return 0;
@@ -225,7 +249,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             // Keep built binaries out of the source tree.
             std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
         }
-        link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image, false) catch |err| switch (err) {
+        link_mod.linkBinary(io, gpa, source_path, exe_path, dump_image, false, target) catch |err| switch (err) {
             link_mod.LinkError.CompileFailed => {
                 reportErr(io, "error: compilation failed\n", .{});
                 return 1;
@@ -236,7 +260,12 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             },
             link_mod.LinkError.StdLibMissing => {
                 reportErr(io, "error: could not find the Wolframite runtime archive 'wfr_std'\n", .{});
-                reportErr(io, "       run 'zig build' from the repository root first\n", .{});
+                if (target != hostTarget()) {
+                    reportErr(io, "       the runtime for the {s} target is not installed\n", .{@tagName(target)});
+                    reportErr(io, "       run 'zig build -Dtarget={s}' from the repository root first\n", .{link_mod.zigTargetName(target)});
+                } else {
+                    reportErr(io, "       run 'zig build' from the repository root first\n", .{});
+                }
                 return 1;
             },
         };
@@ -246,7 +275,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 
     const source = readSource(gpa, io, source_path) orelse return 1;
 
-    const result = compile_mod.compile(gpa, source, mode, hostTarget(), false) catch |err| {
+    const result = compile_mod.compile(gpa, source, mode, target, false) catch |err| {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -266,7 +295,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return 0;
         },
         .@"obj" => {
-            const obj_path = out_path orelse try replaceExt(gpa, source_path, hostObjectExt());
+            const obj_path = out_path orelse try replaceExt(gpa, source_path, targetObjectExt(target));
             if ((try writeBinaryFile(io, obj_path, result.text.?)) != 0) return 1;
             printOut(io, "wrote {s}\n", .{obj_path});
             return 0;
@@ -696,23 +725,31 @@ fn printBuildHelp(io: Io) void {
         \\
         \\Compile a single Wolframite source file and link it into an
         \\executable via Ferro. Default output is wfr-bin/<input>.exe.
+        \\With --target, the default output is instead a relocatable object
+        \\for the target: cross-compiling needs no linker and no runtime.
         \\
         \\When no file is given, the entry from ore.toml is used.
         \\
         \\Options:
-        \\  -o, --output <path>  Write the executable to <path>
-        \\                       (default: wfr-bin/<input>.exe)
-        \\      --ir             Emit textual Tungsten IR only (no link)
-        \\      --obj            Emit a relocatable object file only (no link)
-        \\                       (.o on Linux, .obj on Windows)
-        \\      --emit-bin       Link into an executable via Ferro (default)
-        \\                       (incompatible with --ir)
-        \\      --dump-image     Print Ferro's merged image (section sizes,
-        \\                       symbol addresses, relocations before/after) to
-        \\                       stderr before writing the executable
-        \\      --emit-annotated Emit a relocatable object file (.o / .obj)
-        \\                       without asm output \
-        \\  -h, --help           Show this help
+        \\  -o, --output <path>    Write the output to <path>
+        \\                         (default: wfr-bin/<input>.exe when linking,
+        \\                         <input>.o / .obj for objects)
+        \\      --target <triple>  Cross-compile for <triple>: 'linux',
+        \\                         'windows', or an x86_64 target triple
+        \\                         such as x86_64-microsoft-windows or
+        \\                         x86_64-unknown-linux. Defaults to
+        \\                         object output; add --emit-bin to link.
+        \\      --ir               Emit textual Tungsten IR only (no link)
+        \\      --obj              Emit a relocatable object file only (no link)
+        \\                         (.o on Linux targets, .obj on Windows targets)
+        \\      --emit-bin         Link into an executable via Ferro (default
+        \\                         without --target; incompatible with --ir)
+        \\      --dump-image       Print Ferro's merged image (section sizes,
+        \\                         symbol addresses, relocations before/after)
+        \\                         to stderr before writing the executable
+        \\      --emit-annotated   Emit a relocatable object file (.o / .obj)
+        \\                         without asm output
+        \\  -h, --help             Show this help
         \\
         \\Exit codes:
         \\  0  success
@@ -774,7 +811,7 @@ fn cmdTest(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
     }
 
-    link_mod.linkBinary(io, gpa, source_path, exe_path, false, true) catch |err| switch (err) {
+    link_mod.linkBinary(io, gpa, source_path, exe_path, false, true, hostTarget()) catch |err| switch (err) {
         link_mod.LinkError.CompileFailed => {
             reportErr(io, "error: compilation failed\n", .{});
             reportErr(io, "test result: FAILED (compile/link)\n", .{});

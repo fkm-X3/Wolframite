@@ -24,6 +24,8 @@ pub const Target = ferro_types.Target;
 pub const ObjectFormat = ferro_types.ObjectFormat;
 pub const objectFormat = ferro_types.objectFormat;
 pub const Subsystem = ferro_types.Subsystem;
+pub const Triple = ferro_types.Triple;
+pub const parseTriple = ferro_types.parseTriple;
 
 pub const LinkOptions = ferro_types.LinkOptions;
 pub const defaultLinkOptions = ferro_types.defaultLinkOptions;
@@ -404,6 +406,67 @@ test "parseTarget accepts linux and windows (case-insensitive)" {
     if (parseTarget("osx")) |_| try std.testing.expect(false) else |err| {
         try std.testing.expectEqual(LinkDescriptionError.InvalidTarget, err);
     }
+}
+
+test "parseTarget accepts the canonical Wolframite triples" {
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("x86_64-unknown-linux"));
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("x86_64-microsoft-windows"));
+    // Case-insensitive.
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("X86_64-MICROSOFT-WINDOWS"));
+    // The shorter arch-os form is the same target.
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("x86_64-linux"));
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("x86_64-windows"));
+}
+
+test "parseTarget tolerates GCC/LLVM-style triple spellings" {
+    // Foreign vendor/ABI spellings map to the same two targets: the runtime
+    // is libc-free, so the ABI component carries no meaning here.
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("x86_64-pc-windows-msvc"));
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("x86_64-pc-windows-gnu"));
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("x86_64-unknown-linux-gnu"));
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("x86_64-unknown-linux-musl"));
+    // Three-part form without a vendor (arch-os-abi).
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("x86_64-linux-gnu"));
+    // MinGW triples name the OS `mingw32`; `amd64` aliases `x86_64`.
+    try std.testing.expectEqual(.windows_x86_64, try parseTarget("x86_64-w64-mingw32"));
+    try std.testing.expectEqual(.linux_x86_64, try parseTarget("amd64-pc-linux"));
+}
+
+test "parseTarget rejects triples for unsupported arches and platforms" {
+    // Not x86_64: Tungsten emits x86_64 machine code only.
+    try std.testing.expectError(error.InvalidTarget, parseTarget("aarch64-unknown-linux-gnu"));
+    try std.testing.expectError(error.InvalidTarget, parseTarget("i686-pc-windows-msvc"));
+    // Not Linux/Windows: Ferro and the object writers support those only.
+    try std.testing.expectError(error.InvalidTarget, parseTarget("x86_64-unknown-freebsd"));
+    try std.testing.expectError(error.InvalidTarget, parseTarget("x86_64-apple-darwin"));
+    // No OS component / no components at all.
+    try std.testing.expectError(error.InvalidTarget, parseTarget("x86_64-unknown"));
+    try std.testing.expectError(error.InvalidTarget, parseTarget("x86_64"));
+    try std.testing.expectError(error.InvalidTarget, parseTarget("x86_64-pc-linux-"));
+}
+
+test "parseTriple splits triple components" {
+    // Canonical Windows triple: `microsoft` vendor, no ABI component.
+    const triple = try parseTriple("x86_64-microsoft-windows");
+    try std.testing.expectEqualStrings("x86_64", triple.arch);
+    try std.testing.expectEqualStrings("microsoft", triple.vendor);
+    try std.testing.expectEqualStrings("windows", triple.os);
+    try std.testing.expectEqualStrings("", triple.abi);
+    try std.testing.expectEqual(Target.windows_x86_64, try triple.target());
+
+    // Foreign spellings keep their vendor/ABI components.
+    const foreign = try parseTriple("x86_64-pc-windows-msvc");
+    try std.testing.expectEqualStrings("pc", foreign.vendor);
+    try std.testing.expectEqualStrings("msvc", foreign.abi);
+
+    // No vendor: the OS sits right after the arch. Components keep their
+    // original case; matching is case-insensitive.
+    const bare = try parseTriple("X86_64-LINUX");
+    try std.testing.expectEqualStrings("X86_64", bare.arch);
+    try std.testing.expectEqualStrings("unknown", bare.vendor);
+    try std.testing.expectEqualStrings("LINUX", bare.os);
+    try std.testing.expectEqualStrings("", bare.abi);
+    try std.testing.expectEqual(Target.linux_x86_64, try bare.target());
 }
 
 test "parseSubsystem accepts console and gui (case-insensitive)" {

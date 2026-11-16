@@ -773,6 +773,8 @@ Create a new Tungsten context for a specific target platform. The `target` is fi
 
 macOS/Mach-O and other targets are out of scope.
 
+Targets are selected with **target triples**. Wolframite's canonical spellings are `x86_64-unknown-linux` and `x86_64-microsoft-windows` — deliberately different from GCC/LLVM, since the runtime is libc-free (no ABI component) and the Windows vendor is `microsoft` (see the `parseTarget` reference below). `ferro.parseTarget` also accepts the bare platform names `linux` / `windows` and tolerates foreign spellings such as `x86_64-pc-windows-msvc`. ore's `--target` flag and Wolframite link descriptions both go through it. `ferro.Triple` / `ferro.parseTriple` expose the parsed components (`arch`, `vendor`, `os`, `abi`).
+
 `ferro.objectFormat(target)` maps `.linux_x86_64 → .elf64` and `.windows_x86_64 → .pe_coff`. The compiler (ore's link pipeline) decides the target and passes it to both `Context.init` and Ferro's `LinkOptions.target`, so emission and link agree on format without a separate config. Ferro never derives the platform from the host OS — link semantics are explicit, per `design.md` "Determinism over Magic".
 
 ### Object format contract
@@ -937,7 +939,7 @@ The description is represented as `LinkDescription`:
 
 ```zig
 pub const LinkDescription = struct {
-    target: []const u8,    // "linux" | "windows"
+    target: []const u8,    // "linux" | "windows" | an x86_64 triple
     output: []const u8,    // executable output path
     entry: []const u8,     // entry symbol (default "_main")
     subsystem: []const u8, // "console" | "gui" (windows only)
@@ -949,15 +951,18 @@ pub const LinkDescription = struct {
 
 | Error | Meaning |
 |-------|---------|
-| `LinkDescriptionError.InvalidTarget` | `target` was not `"linux"` or `"windows"`. |
+| `LinkDescriptionError.InvalidTarget` | `target` was not `"linux"`, `"windows"`, or an accepted x86_64 triple. |
 | `LinkDescriptionError.InvalidSubsystem` | `subsystem` was not `"console"` or `"gui"`. |
 | `LinkDescriptionError.MissingField` | A required link field was missing or not a string literal. |
 
 ```zig
 pub fn parseTarget(s: []const u8) LinkDescriptionError!Target
+pub fn parseTriple(s: []const u8) LinkDescriptionError!Triple
 pub fn parseSubsystem(s: []const u8) LinkDescriptionError!Subsystem
 pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError!LinkOptions
 ```
+
+`parseTarget` accepts the bare platform names `linux` / `windows` (case-insensitive) and target triples (`arch[-vendor]-os[-abi]`). The canonical Wolframite triples are `x86_64-unknown-linux` and `x86_64-microsoft-windows` — no ABI component, because the runtime is libc-free (no `gnu`/`musl`/`msvc` distinction), and `microsoft` as the Windows vendor. This intentionally differs from GCC/LLVM spelling; foreign forms such as `x86_64-pc-windows-msvc` or `x86_64-unknown-linux-gnu` are accepted and map to the same two targets. The architecture must be `x86_64` (alias `amd64`) and the OS component must be Linux or Windows; the vendor and ABI components are accepted but ignored. `parseTriple` returns the split `Triple` components for callers that need them.
 
 `linkOptionsFromDescription` is the "compile Wolframite → feed Ferro" mapping: the compiler fills a `LinkDescription` from source (target and subsystem parsed from their string forms) and Ferro turns it into `linkObject` arguments. The object path, runtime lib, output path, and entry symbol pass through verbatim.
 
@@ -971,7 +976,7 @@ pub fn linkOptionsFromDescription(desc: LinkDescription) LinkDescriptionError!Li
 2. The install location derived from the running `ore` executable: `<exedir>/../lib` (install scripts mirror the `zig-out/` layout: `<install>/bin/ore` and `<install>/lib/wfr_std.lib`).
 3. The POSIX system path `/usr/local/wolframite/lib`.
 
-Archive names tried per platform: `wfr_std.lib`, `libwfr_std.a`, `wfr_std.a`. If none is found, `ore` reports `LinkError.StdLibMissing`; otherwise it passes the path to Ferro as `runtime_lib`, which reads it directly (no external `ld`).
+Archive names are matched per link *target* — `wfr_std.lib` for Windows targets, `libwfr_std.a` (fallback `wfr_std.a`) for Linux targets — so a cross-link (`ore build --target <triple> --emit-bin`) either finds the target's runtime or fails with `LinkError.StdLibMissing`, never a wrong-format link. If none is found, `ore` reports `LinkError.StdLibMissing`; otherwise it passes the path to Ferro as `runtime_lib`, which reads it directly (no external `ld`).
 
 On Windows, kernel32 imports (`GetStdHandle`, `WriteFile`, `ReadFile`, `GetLastError`, `ExitProcess`, `VirtualAlloc`, `CreateFileW`, `AllocConsole`) are resolved via the PE import directory rather than reported as undefined (`ferro.isKernel32Import`).
 

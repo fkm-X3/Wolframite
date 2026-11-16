@@ -48,6 +48,18 @@ zig build install-compiler   # install Wolframite + ore to the system bin dir
 
 Builds and test runs print progress and a success line (e.g. `[wolframite] all tests passed (286 tests passed)`), so if no error is shown, everything passed.
 
+### Cross-compiling
+
+`ore build --target <triple>` cross-compiles any Wolframite source file to a relocatable object for a target triple — no linker, no runtime, no config. The canonical triples are `x86_64-microsoft-windows` and `x86_64-unknown-linux` (no libc, hence no ABI suffix). Pass `--emit-bin` to also link an executable via Ferro:
+
+```sh
+zig build ore -- build --target x86_64-microsoft-windows src/main.wfr           # → src/main.obj (PE/COFF)
+zig build ore -- build --target x86_64-unknown-linux src/main.wfr               # → src/main.o   (ELF64)
+zig build ore -- build --target x86_64-microsoft-windows --emit-bin src/main.wfr  # → wfr-bin/main.exe
+```
+
+Supported targets are x86-64 Linux and Windows (bare `linux` / `windows` also work). See `docs/cross-compilation.md` for the full triple grammar and the per-target runtime archives used when linking.
+
 ### `zig build install-compiler`
 
 Compiles `Wolframite` and `ore` and installs them into the system bin directory:
