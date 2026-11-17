@@ -78,7 +78,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "disasm")) return disasm_mod.cmdDisasm(gpa, io, rest);
     if (std.mem.eql(u8, command, "trace")) return cmdTrace(gpa, io, rest);
     if (std.mem.eql(u8, command, "test")) return cmdTest(gpa, io, rest);
-
+    if (std.mem.eql(u8, command, "fmt") or std.mem.eql(u8, command, "format")) return cmdFmt(gpa, io, rest);
     reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
     return 2;
@@ -152,12 +152,12 @@ fn cmdInit(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
 /// pass `-o`/`--output`.
 fn defaultBinPath(gpa: Allocator, source_path: []const u8) ![]u8 {
     const stem = std.fs.path.stem(source_path);
-    return std.fmt.allocPrint(gpa, "wfr-bin{c}{s}.exe", .{std.fs.path.sep, stem});
+    return std.fmt.allocPrint(gpa, "wfr-bin{c}{s}.exe", .{ std.fs.path.sep, stem });
 }
 
 fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     var out_path: ?[]const u8 = null;
-    var mode: compile_mod.EmitMode = .@"obj";
+    var mode: compile_mod.EmitMode = .obj;
     var emit_bin = true;
     var emit_bin_explicit = false;
     var dump_image = false;
@@ -191,7 +191,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             mode = .ir;
             emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--obj")) {
-            mode = .@"obj";
+            mode = .obj;
             emit_bin = false;
         } else if (std.mem.eql(u8, arg, "--emit-bin")) {
             emit_bin = true;
@@ -221,7 +221,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
     // for the target: that needs nothing but the compiler, while the Ferro
     // link step also needs the target's runtime archive. --emit-bin opts into
     // linking an executable (see docs/cross-compilation.md).
-    if (target_given and !emit_bin_explicit and !emit_annotated and mode == .@"obj") {
+    if (target_given and !emit_bin_explicit and !emit_annotated and mode == .obj) {
         emit_bin = false;
     }
 
@@ -239,7 +239,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         }
         const obj_path = out_path orelse try replaceExt(gpa, source_path, targetObjectExt(target));
         if ((try writeBinaryFile(io, obj_path, result.obj_bytes)) != 0) return 1;
-        printOut(io, "wrote {s}\n", .{ obj_path });
+        printOut(io, "wrote {s}\n", .{obj_path});
         return 0;
     }
 
@@ -294,7 +294,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             printOut(io, "wrote {s}\n", .{ir_path});
             return 0;
         },
-        .@"obj" => {
+        .obj => {
             const obj_path = out_path orelse try replaceExt(gpa, source_path, targetObjectExt(target));
             if ((try writeBinaryFile(io, obj_path, result.text.?)) != 0) return 1;
             printOut(io, "wrote {s}\n", .{obj_path});
@@ -445,7 +445,7 @@ fn cmdCheckCodegen(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         return 0;
     }
 
-    reportErr(io, "check-codegen: {s}: {d} violation(s)\n", .{path, report.violations.items.len});
+    reportErr(io, "check-codegen: {s}: {d} violation(s)\n", .{ path, report.violations.items.len });
     for (report.violations.items) |v| {
         var bytes: [16]u8 = undefined;
         var i: usize = 0;
@@ -707,6 +707,7 @@ fn printHelp(io: Io) void {
         \\  disasm <file>
         \\                   Disassemble a Tungsten object file with relocation annotations
         \\  test [file]      Build and run a program as an integrated test
+        \\  fmt [file]       Format a Wolframite source file in place
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:
@@ -879,6 +880,86 @@ fn printTestHelp(io: Io) void {
     , .{});
 }
 
+// ============================================================================
+// fmt
+// ============================================================================
+
+fn cmdFmt(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
+    var check = false;
+    var to_stdout = false;
+    var file: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printFmtHelp(io);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--check")) {
+            check = true;
+        } else if (std.mem.eql(u8, arg, "--stdout")) {
+            to_stdout = true;
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--write")) {
+            // default behaviour; accepted for compatibility
+        } else if (arg.len > 0 and arg[0] == '-' and file == null) {
+            reportErr(io, "error: unknown option '{s}'\n", .{arg});
+            return 2;
+        } else if (file == null) {
+            file = arg;
+        } else {
+            reportErr(io, "error: unexpected argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+
+    const source_path = (try resolveSource(gpa, io, file)) orelse return 2;
+    const source = readSource(gpa, io, source_path) orelse return 1;
+
+    const formatted = @import("compiler").formatter.format(gpa, source) catch |err| {
+        reportErr(io, "error: could not format '{s}': {s}\n", .{ source_path, @errorName(err) });
+        return 1;
+    };
+
+    if (check) {
+        if (std.mem.eql(u8, source, formatted)) return 0;
+        reportErr(io, "error: '{s}' is not formatted\n", .{source_path});
+        return 1;
+    }
+
+    if (to_stdout) {
+        printOut(io, "{s}", .{formatted});
+        return 0;
+    }
+
+    // In-place write.
+    const f = std.Io.Dir.cwd().createFile(io, source_path, .{}) catch |err| {
+        reportErr(io, "error: could not write '{s}': {s}\n", .{ source_path, @errorName(err) });
+        return 1;
+    };
+    defer f.close(io);
+    writeFile(io, f, formatted) catch |err| {
+        reportErr(io, "error: could not write '{s}': {s}\n", .{ source_path, @errorName(err) });
+        return 1;
+    };
+    return 0;
+}
+
+fn printFmtHelp(io: Io) void {
+    printOut(io,
+        \\Usage:
+        \\  ore fmt [options] [file]
+        \\  ore format [options] [file]
+        \\
+        \\Format a Wolframite source file in place using the built-in formatter.
+        \\
+        \\Options:
+        \\      --check     Check if the file is formatted; do not write
+        \\      --stdout    Print the formatted source to stdout
+        \\  -h, --help      Show this help
+        \\
+    , .{});
+}
+
 fn printTraceHelp(io: Io) void {
     printOut(io,
         \\Usage:
@@ -957,7 +1038,7 @@ fn cmdTrace(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             return code;
         },
         else => {
-            reportErr(io, "trace: '{s}' terminated abnormally\n", .{ exe_path });
+            reportErr(io, "trace: '{s}' terminated abnormally\n", .{exe_path});
             return 1;
         },
     }
