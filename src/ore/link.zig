@@ -238,7 +238,11 @@ test "findWfrStdLib reports a missing runtime instead of guessing" {
 test "targetObjectExt and zigTargetName follow the target platform" {
     try testing.expectEqualStrings("obj", targetObjectExt(.windows_x86_64));
     try testing.expectEqualStrings("o", targetObjectExt(.linux_x86_64));
-    try testing.expectEqualStrings("obj", hostObjectExt());
+    if (builtin.os.tag == .windows) {
+        try testing.expectEqualStrings("obj", hostObjectExt());
+    } else {
+        try testing.expectEqualStrings("o", hostObjectExt());
+    }
     try testing.expectEqualStrings("x86_64-windows", zigTargetName(.windows_x86_64));
     try testing.expectEqualStrings("x86_64-linux", zigTargetName(.linux_x86_64));
 }
