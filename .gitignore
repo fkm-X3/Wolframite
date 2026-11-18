@@ -5,6 +5,5 @@ zig-out/
 
 # Tungsten's objects
 *.ir
-*.asm
 *.obj
 *.exe
