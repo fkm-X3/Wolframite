@@ -79,7 +79,7 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "trace")) return cmdTrace(gpa, io, rest);
     if (std.mem.eql(u8, command, "test")) return cmdTest(gpa, io, rest);
     if (std.mem.eql(u8, command, "fmt") or std.mem.eql(u8, command, "format")) return cmdFmt(gpa, io, rest);
-    reportErr(io, "error: unknown command '{s}'\n", .{command});
+    if (std.mem.eql(u8, command, "smelt")) return cmdSmelt(gpa, io, rest);    reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
     return 2;
 }
@@ -688,6 +688,311 @@ fn reportErr(io: Io, comptime fmt: []const u8, args: anytype) void {
     w.interface.flush() catch {};
 }
 
+// ============================================================================
+// smelt
+// ============================================================================
+
+fn cmdSmelt(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
+    var file_override: ?[]const u8 = null;
+    var command: ?[]const u8 = null;
+    var direct_file = false;
+    var prog_args: std.ArrayList([]const u8) = .empty;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printSmeltHelp(io);
+            return 0;
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+            if (i + 1 >= args.len) return flagNeedsValue(io, arg);
+            i += 1;
+            file_override = args[i];
+        } else if (arg.len > 0 and arg[0] == '-' and command == null and file_override == null) {
+            reportErr(io, "error: unknown option '{s}'\n", .{arg});
+            return 2;
+        } else if (command == null) {
+            // An existing file path (when no explicit smeltfile) is treated as
+            // a file to compile & run directly.
+            if (file_override == null) {
+                if (std.Io.Dir.cwd().access(io, arg, .{})) |_| {
+                        direct_file = true;
+                    file_override = arg;
+                } else |_| {
+                    command = arg;
+                }
+            } else {
+                command = arg;
+            }
+        } else {
+            try prog_args.append(gpa, arg);
+        }
+    }
+
+    const smelt_path = blk: {
+        if (file_override) |f| break :blk f;
+        // search default smeltfile names
+        const names = [_][]const u8{ "smeltfile", "smeltfile.wfr", "smelt", "smelt.wfr", "build", "build.wfr", "Smeltfile", "Smeltfile.wfr" };
+        for (names) |name| {
+            if (std.Io.Dir.cwd().access(io, name, .{})) |_| {
+                break :blk name;
+            } else |_| {}
+        }
+        break :blk null;
+    };
+
+    if (smelt_path == null) {
+        if (command) |c| {
+            reportErr(io, "error: no smeltfile found (looked for smeltfile.wfr, smelt.wfr, build.wfr)\n", .{});
+            reportErr(io, "       unknown command '{s}'\n", .{c});
+        } else {
+            reportErr(io, "error: no smeltfile found (looked for smeltfile.wfr, smelt.wfr, build.wfr)\n", .{});
+            reportErr(io, "hint: create a smeltfile.wfr, or pass a file: `ore smelt <file.wfr>`\n", .{});
+        }
+        return 2;
+    }
+
+    const source_path = smelt_path.?;
+
+    // Direct file mode: just compile & run it.
+    if (direct_file) {
+        return runWfrFile(gpa, io, source_path, prog_args.items);
+    }
+
+    const source = readSource(gpa, io, source_path) orelse return 1;
+
+    // No command: run the smeltfile's main (if any) or list commands.
+    if (command == null) {
+        if (containsFn(source, "main")) {
+            return runWfrFile(gpa, io, source_path, prog_args.items);
+        }
+        // list available commands
+        const cmds = @import("compiler").smeltfile.compileSmeltfile(gpa, source) catch {
+            reportErr(io, "error: could not parse smeltfile '{s}'\n", .{source_path});
+            return 1;
+        };
+        printOut(io, "smeltfile: {s}\n", .{source_path});
+        printOut(io, "available commands:\n", .{});
+        for (cmds) |cmd| {
+            printOut(io, "  {s}\n", .{cmd.name});
+        }
+        if (cmds.len == 0) {
+            printOut(io, "  (none)\n", .{});
+        }
+        printOut(io, "usage: ore smelt <command>\n", .{});
+        return 0;
+    }
+
+    const cmd_name = command.?;
+
+    // Function dispatch: if the smeltfile defines a function with that name,
+    // compile a wrapper that calls it as the entry point.
+    if (containsFn(source, cmd_name)) {
+        // Write a wrapper source combining the original + a main shim.
+        // If the original already defines `fn main`, rename it to avoid a
+        // duplicate declaration in the wrapper.
+        const renamed = if (containsFn(source, "main"))
+            std.mem.replaceOwned(u8, gpa, source, "fn main", "fn __smelt_main") catch source
+        else
+            source;
+        const wrapper_path = "smelt_wrapper.wfr";
+        const wf = std.Io.Dir.cwd().createFile(io, wrapper_path, .{}) catch |err| {
+            reportErr(io, "error: could not write wrapper: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        const shim = std.fmt.allocPrint(gpa, "\n\nfn main() -> i32 {{\n    return {s}()\n}}\n", .{cmd_name}) catch {
+            wf.close(io);
+            reportErr(io, "error: out of memory\n", .{});
+            return 1;
+        };
+        const wrapper_source = std.mem.concat(gpa, u8, &.{ renamed, shim }) catch {
+            wf.close(io);
+            reportErr(io, "error: out of memory\n", .{});
+            return 1;
+        };
+        writeFile(io, wf, wrapper_source) catch {
+            wf.close(io);
+            return 1;
+        };
+        wf.close(io);
+        const rc = runWfrFile(gpa, io, wrapper_path, prog_args.items);
+        std.Io.Dir.cwd().deleteFile(io, wrapper_path) catch {};
+        return rc;
+    }
+
+    // Declarative command: extract from smeltfile.
+    const smelt_mod = @import("compiler").smeltfile;
+    const smelt_cmd = smelt_mod.compileSmeltCommand(gpa, source, cmd_name) catch |err| {
+        reportErr(io, "error: no command '{s}' in smeltfile '{s}' ({s})\n", .{ cmd_name, source_path, @errorName(err) });
+        return 2;
+    };
+
+    // Shell command task.
+    if (smelt_cmd.command.len > 0) {
+        return runShellCommand(io, gpa, smelt_cmd.command);
+    }
+
+    if (smelt_cmd.entry.len == 0) {
+        reportErr(io, "error: command '{s}' has no 'entry' or 'command' field\n", .{cmd_name});
+        return 2;
+    }
+
+    const target = if (smelt_cmd.target.len > 0)
+        (ferro.parseTarget(smelt_cmd.target) catch {
+            reportErr(io, "error: unknown target '{s}'\n", .{smelt_cmd.target});
+            return 2;
+        })
+    else
+        hostTarget();
+
+    const output = if (smelt_cmd.output.len > 0)
+        try gpa.dupe(u8, smelt_cmd.output)
+    else
+        try defaultBinPath(gpa, smelt_cmd.entry);
+
+    if (smelt_cmd.output.len == 0) {
+        std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
+    }
+
+    link_mod.linkBinary(io, gpa, smelt_cmd.entry, output, false, smelt_cmd.test_mode, target) catch |err| switch (err) {
+        link_mod.LinkError.CompileFailed => {
+            reportErr(io, "error: compilation failed\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.LinkFailed => {
+            reportErr(io, "error: link failed\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.StdLibMissing => {
+            reportErr(io, "error: could not find wfr_std runtime\n", .{});
+            return 1;
+        },
+    };
+    printOut(io, "built {s}\n", .{output});
+
+    if (smelt_cmd.run or prog_args.items.len > 0) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(gpa, output);
+        try argv.appendSlice(gpa, prog_args.items);
+        const argv_slice = try argv.toOwnedSlice(gpa);
+        var child = spawnOrShell(io, gpa, output, argv_slice) catch |err| {
+            reportErr(io, "error: could not start '{s}': {s}\n", .{ output, @errorName(err) });
+            return 1;
+        };
+        const term = child.wait(io) catch |err| {
+            reportErr(io, "error: could not wait for '{s}': {s}\n", .{ output, @errorName(err) });
+            return 1;
+        };
+        switch (term) {
+            .exited => |code| return code,
+            else => {
+                reportErr(io, "error: program terminated abnormally\n", .{});
+                return 1;
+            },
+        }
+    }
+    return 0;
+}
+
+fn runWfrFile(gpa: Allocator, io: Io, source_path: []const u8, prog_args: []const []const u8) !u8 {
+    const exe_path = try defaultBinPath(gpa, source_path);
+    std.Io.Dir.cwd().createDirPath(io, "wfr-bin") catch {};
+    link_mod.linkBinary(io, gpa, source_path, exe_path, false, false, hostTarget()) catch |err| switch (err) {
+        link_mod.LinkError.CompileFailed => {
+            reportErr(io, "error: compilation failed\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.LinkFailed => {
+            reportErr(io, "error: link failed\n", .{});
+            return 1;
+        },
+        link_mod.LinkError.StdLibMissing => {
+            reportErr(io, "error: could not find wfr_std runtime\\n", .{});
+            return 1;
+        },
+    };
+    printOut(io, "wrote {s}\\n", .{exe_path});
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(gpa, exe_path);
+    try argv.appendSlice(gpa, prog_args);
+    const argv_slice = try argv.toOwnedSlice(gpa);
+
+    var child = spawnOrShell(io, gpa, exe_path, argv_slice) catch |err| {
+        reportErr(io, "error: could not start '{s}': {s}\\n", .{ exe_path, @errorName(err) });
+        return 1;
+    };
+    const term = child.wait(io) catch |err| {
+        reportErr(io, "error: could not wait for '{s}': {s}\\n", .{ exe_path, @errorName(err) });
+        return 1;
+    };
+    switch (term) {
+        .exited => |code| return code,
+        else => {
+            reportErr(io, "error: program terminated abnormally\\n", .{});
+            return 1;
+        },
+    }
+}
+
+fn containsFn(source: []const u8, name: []const u8) bool {
+    // crude: look for "fn <name>" 
+    var buf: [256]u8 = undefined;
+    if (name.len + 4 > buf.len) return false;
+    var i: usize = 0;
+    buf[i] = 'f'; i += 1;
+    buf[i] = 'n'; i += 1;
+    buf[i] = ' '; i += 1;
+    for (name) |c| { buf[i] = c; i += 1; }
+    const needle = buf[0..i];
+    return std.mem.indexOf(u8, source, needle) != null;
+}
+
+fn runShellCommand(io: Io, gpa: Allocator, cmd: []const u8) !u8 {
+    _ = gpa;
+    const shell_cmd = switch (builtin.os.tag) {
+        .windows => "cmd",
+        else => "sh",
+    };
+    const shell_arg = switch (builtin.os.tag) {
+        .windows => "/c",
+        else => "-c",
+    };
+    var child = std.process.spawn(io, .{
+        .argv = &.{ shell_cmd, shell_arg, cmd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        reportErr(io, "error: could not start shell command: {s}\\n", .{@errorName(err)});
+        return 1;
+    };
+    const term = child.wait(io) catch |err| {
+        reportErr(io, "error: could not wait: {s}\\n", .{@errorName(err)});
+        return 1;
+    };
+    switch (term) {
+        .exited => |code| return code,
+        else => return 1,
+    }
+}
+
+fn printSmeltHelp(io: Io) void {
+    printOut(io,
+        \\Usage:
+        \\  ore smelt [options] [command] [args...]
+        \\
+        \\Run a command defined in a smeltfile (smeltfile.wfr by default).
+        \\A smeltfile is a normal Wolframite module: commands may be functions
+        \\  (invoked by name) or declarative tasks with an 'entry' field.
+        \\
+        \\Options:
+        \\  -f, --file <path>  Use <path> as the smeltfile
+        \\  -h, --help         Show this help
+        \\
+    , .{});
+}
+
 fn printHelp(io: Io) void {
     printOut(io,
         \\ore {s} — the Wolframite package manager
@@ -708,6 +1013,7 @@ fn printHelp(io: Io) void {
         \\                   Disassemble a Tungsten object file with relocation annotations
         \\  test [file]      Build and run a program as an integrated test
         \\  fmt [file]       Format a Wolframite source file in place
+        \\  smelt [command]  Run a command defined in a smeltfile
         \\  update           Update ore (and its bundled compiler) from GitHub releases
         \\
         \\Options:

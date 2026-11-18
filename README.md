@@ -40,6 +40,7 @@ Requires Zig **0.17.1** to compiling from source. Building, running, and testing
 zig build                    # build everything into zig-out/ (default step)
 zig build run                # build and run the app
 zig build ore -- <args>      # run the ore CLI
+zig build ore -- smelt       # run a smeltfile task
 zig build test               # run all tests
 zig build test-compiler      # run compiler-only tests (fast)
 zig build test-std           # run Wolframite runtime tests

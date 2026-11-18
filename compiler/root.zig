@@ -11,6 +11,8 @@ pub const generics = @import("semantic/generics.zig");
 pub const typecheck = @import("semantic/typecheck.zig");
 pub const codegen = @import("codegen/lower.zig");
 pub const link_description = @import("link_description.zig");
+pub const smeltfile = @import("smeltfile.zig");
+pub const smelt = @import("smeltfile.zig");
 pub const formatter = @import("formatter.zig");
 pub const fmt = @import("formatter.zig");
 test {
@@ -27,5 +29,6 @@ test {
     _ = @import("semantic/typecheck.zig");
     _ = @import("codegen/lower.zig");
     _ = @import("link_description.zig");
+    _ = @import("smeltfile.zig");
 _ = @import("formatter.zig");
 _ = @import("fmt.zig");}

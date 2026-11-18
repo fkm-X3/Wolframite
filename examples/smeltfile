@@ -1,0 +1,21 @@
+//! Smeltfile example — task definitions for `ore smelt`.
+//!
+//! Run with:
+//!   ore smelt greet        # run a shell command
+//!   ore smelt build       # build examples/hello.wfr
+
+struct Task {
+    entry: String,
+    output: String,
+    command: String,
+    run: bool,
+}
+
+let greet = Task {
+    .command = "echo hello from smelt",
+}
+
+let build = Task {
+    .entry = "examples/hello.wfr",
+    .output = "wfr-bin/hello.exe",
+}
