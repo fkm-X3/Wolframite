@@ -30,7 +30,7 @@ pub const EmitMode = enum {
     /// Textual Tungsten IR.
     ir,
     /// Relocatable object file (ELF64 on Linux, PE/COFF on Windows).
-    @"obj",
+    obj,
 };
 
 pub const Result = struct {
@@ -50,8 +50,9 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: fer
 
     var lex = lexer_mod.Lexer.init(arena, source);
     const tokens = lex.tokenize() catch |err| {
+        const loc = if (lex.error_pos) |off| diag_mod.locationFromOffset(source, off) else null;
         const msg = std.fmt.allocPrint(arena, "failed to tokenize: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
-        try diagnostics.add(.@"error", .lexer, msg, null);
+        try diagnostics.add(.@"error", .lexer, msg, loc);
         return .{ .ok = false, .text = null, .diagnostics = diagnostics };
     };
 
@@ -93,7 +94,7 @@ pub fn compile(arena: Allocator, source: []const u8, mode: EmitMode, target: fer
             try ctx.print(&allocating.writer);
             return .{ .ok = true, .text = try allocating.toOwnedSlice(), .diagnostics = diagnostics };
         },
-        .@"obj" => {
+        .obj => {
             const bytes = try ctx.emitObject();
             return .{ .ok = true, .text = bytes, .diagnostics = diagnostics };
         },
@@ -124,8 +125,9 @@ pub fn compileAnnotated(
 
     var lex = lexer_mod.Lexer.init(arena, source);
     const tokens = lex.tokenize() catch |err| {
+        const loc = if (lex.error_pos) |off| diag_mod.locationFromOffset(source, off) else null;
         const msg = std.fmt.allocPrint(arena, "failed to tokenize: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
-        try diagnostics.add(.@"error", .lexer, msg, null);
+        try diagnostics.add(.@"error", .lexer, msg, loc);
         return .{ .ok = false, .obj_bytes = "", .diagnostics = diagnostics };
     };
 

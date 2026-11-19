@@ -79,7 +79,8 @@ fn runCommand(gpa: Allocator, io: Io, command: []const u8, rest: []const []const
     if (std.mem.eql(u8, command, "trace")) return cmdTrace(gpa, io, rest);
     if (std.mem.eql(u8, command, "test")) return cmdTest(gpa, io, rest);
     if (std.mem.eql(u8, command, "fmt") or std.mem.eql(u8, command, "format")) return cmdFmt(gpa, io, rest);
-    if (std.mem.eql(u8, command, "smelt")) return cmdSmelt(gpa, io, rest);    reportErr(io, "error: unknown command '{s}'\n", .{command});
+    if (std.mem.eql(u8, command, "smelt")) return cmdSmelt(gpa, io, rest);
+    reportErr(io, "error: unknown command '{s}'\n", .{command});
     printHelp(io);
     return 2;
 }
@@ -233,7 +234,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         defer arena.deinit();
         const result = try compile_mod.compileAnnotated(arena.allocator(), source, target, false);
         if (!result.ok) {
-            reportDiagnostics(io, source_path, &result.diagnostics);
+            reportDiagnostics(io, source_path, source, &result.diagnostics);
             reportErr(io, "error: compilation failed\n", .{});
             return 1;
         }
@@ -279,7 +280,7 @@ fn cmdBuild(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
         reportErr(io, "error: {s}\n", .{@errorName(err)});
         return 1;
     };
-    reportDiagnostics(io, source_path, &result.diagnostics);
+    reportDiagnostics(io, source_path, source, &result.diagnostics);
 
     if (!result.ok) {
         reportErr(io, "error: compilation failed\n", .{});
@@ -647,26 +648,11 @@ fn writeBinaryFile(io: Io, path: []const u8, data: []const u8) !u8 {
     return 0;
 }
 
-fn reportDiagnostics(io: Io, path: []const u8, diagnostics: *const diag_mod.Diagnostics) void {
-    for (diagnostics.items.items) |item| {
-        var buf: [4096]u8 = undefined;
-        var w: Io.File.Writer = .init(.stderr(), io, &buf);
-        if (item.location) |loc| {
-            w.interface.print("{s}:{d}:{d}: {s} [{s}]: {s}\n", .{
-                path,                 loc.line,
-                loc.column,           @tagName(item.severity),
-                @tagName(item.phase), item.message,
-            }) catch {};
-        } else {
-            w.interface.print("{s}: {s} [{s}]: {s}\n", .{
-                path,
-                @tagName(item.severity),
-                @tagName(item.phase),
-                item.message,
-            }) catch {};
-        }
-        w.interface.flush() catch {};
-    }
+fn reportDiagnostics(io: Io, path: []const u8, source: []const u8, diagnostics: *const diag_mod.Diagnostics) void {
+    var buf: [4096]u8 = undefined;
+    var w: Io.File.Writer = .init(.stderr(), io, &buf);
+    diagnostics.render(&w.interface, source, path) catch {};
+    w.interface.flush() catch {};
 }
 
 fn flagNeedsValue(io: Io, flag: []const u8) u8 {
@@ -716,7 +702,7 @@ fn cmdSmelt(gpa: Allocator, io: Io, args: []const []const u8) !u8 {
             // a file to compile & run directly.
             if (file_override == null) {
                 if (std.Io.Dir.cwd().access(io, arg, .{})) |_| {
-                        direct_file = true;
+                    direct_file = true;
                     file_override = arg;
                 } else |_| {
                     command = arg;
@@ -936,14 +922,20 @@ fn runWfrFile(gpa: Allocator, io: Io, source_path: []const u8, prog_args: []cons
 }
 
 fn containsFn(source: []const u8, name: []const u8) bool {
-    // crude: look for "fn <name>" 
+    // crude: look for "fn <name>"
     var buf: [256]u8 = undefined;
     if (name.len + 4 > buf.len) return false;
     var i: usize = 0;
-    buf[i] = 'f'; i += 1;
-    buf[i] = 'n'; i += 1;
-    buf[i] = ' '; i += 1;
-    for (name) |c| { buf[i] = c; i += 1; }
+    buf[i] = 'f';
+    i += 1;
+    buf[i] = 'n';
+    i += 1;
+    buf[i] = ' ';
+    i += 1;
+    for (name) |c| {
+        buf[i] = c;
+        i += 1;
+    }
     const needle = buf[0..i];
     return std.mem.indexOf(u8, source, needle) != null;
 }

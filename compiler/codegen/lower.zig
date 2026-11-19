@@ -251,7 +251,7 @@ pub const Lowerer = struct {
     current_test_failed_ptr: ?api.Value = null,
 
     block_terminated: bool = false,
-    current_block: api.BasicBlockIdx = @enumFromInt(0),
+    current_block: api.BasicBlockIdx = @fromBackingInt(@intCast(0)),
     /// The hidden sret parameter slot for the current function, when it
     /// returns an aggregate by value. Set in `lowerFunctionBody` and read by
     /// `lowerReturn`/`defaultRet` (docs/semantics.md §6.3 R17).
@@ -441,7 +441,7 @@ pub const Lowerer = struct {
         switch (body) {
             .test_decl => |decl_idx| {
                 const t = self.arena.get(decl_idx).test_decl;
-                self.current_test_failed_ptr = @enumFromInt(1);
+                self.current_test_failed_ptr = @fromBackingInt(@intCast(1));
                 if (t.body != NodeIdx.none) {
                     try self.lowerStmt(t.body);
                 }
@@ -466,14 +466,14 @@ pub const Lowerer = struct {
                 if (sret) {
                     // sret occupies slot 0, env shifts to slot 1, visible
                     // params start at slot 2.
-                    self.sret_slot = @enumFromInt(0);
+                    self.sret_slot = @fromBackingInt(@intCast(0));
                     self.sret_ty = ret_ty;
                     visible_start += 1;
                 }
                 for (f.params.indices, 0..) |param_idx, i| {
                     const param = self.arena.get(param_idx);
                     try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
-                        .value = @enumFromInt(visible_start + i),
+                        .value = @fromBackingInt(@intCast(visible_start + i)),
                         .ty = try self.paramType(param.param.ty),
                     });
                 }
@@ -531,7 +531,7 @@ pub const Lowerer = struct {
 
             // Call test function (hidden env param).
             const env_val = try self.ctx.buildIntConst(self.i64_ty, 0);
-            _ = try self.ctx.buildCall(test_fn, self.void_ty, &.{env_val, failed_slot});
+            _ = try self.ctx.buildCall(test_fn, self.void_ty, &.{ env_val, failed_slot });
 
             // Check per-test failure flag.
             const failed = try self.ctx.buildLoad(self.i64_ty, failed_slot);
@@ -599,7 +599,9 @@ pub const Lowerer = struct {
             var offset: u32 = 0;
             while (offset < size) {
                 const dst_addr = try self.ctx.buildPtrAdd(
-                    self.ptr_ty, sret, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                    self.ptr_ty,
+                    sret,
+                    try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
                 );
                 _ = try self.ctx.buildStore(self.i64_ty, dst_addr, try self.ctx.buildIntConst(self.i64_ty, 0));
                 offset += 8;
@@ -863,11 +865,15 @@ pub const Lowerer = struct {
                 var offset: u64 = 0;
                 while (offset < size) {
                     const src_addr = try self.ctx.buildPtrAdd(
-                        self.ptr_ty, val, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                        self.ptr_ty,
+                        val,
+                        try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
                     );
                     const loaded = try self.ctx.buildLoad(self.i64_ty, src_addr);
                     const dst_addr = try self.ctx.buildPtrAdd(
-                        self.ptr_ty, slot, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                        self.ptr_ty,
+                        slot,
+                        try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
                     );
                     _ = try self.ctx.buildStore(self.i64_ty, dst_addr, loaded);
                     offset += 8;
@@ -932,11 +938,15 @@ pub const Lowerer = struct {
                 var offset: u32 = 0;
                 while (offset < size) {
                     const src_addr = try self.ctx.buildPtrAdd(
-                        self.ptr_ty, val, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                        self.ptr_ty,
+                        val,
+                        try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
                     );
                     const loaded = try self.ctx.buildLoad(self.i64_ty, src_addr);
                     const dst_addr = try self.ctx.buildPtrAdd(
-                        self.ptr_ty, sret, try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+                        self.ptr_ty,
+                        sret,
+                        try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
                     );
                     _ = try self.ctx.buildStore(self.i64_ty, dst_addr, loaded);
                     offset += 8;
@@ -3320,11 +3330,12 @@ pub const Lowerer = struct {
         return ref.slice(self.source);
     }
 
-    fn codegenError(self: *Lowerer, _: NodeIdx, comptime fmt: []const u8, args: anytype) void {
+    fn codegenError(self: *Lowerer, node: NodeIdx, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.allocPrint(self.gpa, fmt, args) catch |err| {
             std.debug.panic("OOM in codegen: {s}", .{@errorName(err)});
         };
-        self.diagnostics.add(.@"error", .codegen, msg, null) catch {};
+        const loc = diag.locationFromNode(self.arena, self.source, node);
+        self.diagnostics.add(.@"error", .codegen, msg, loc) catch {};
     }
 };
 
@@ -3798,7 +3809,7 @@ test "lower: emit object for a module" {
     try std.testing.expectEqual(1, bytes[5]); // ELFDATA2LSB
     // _main's body: mov rax, 42; ...; ret.
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xc3 }) != null); // ret
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{0xc3}) != null); // ret
 }
 
 test "lower: if expression produces a phi at the merge" {

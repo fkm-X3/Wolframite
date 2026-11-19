@@ -106,11 +106,11 @@ pub const Resolver = struct {
     }
 
     fn errorAt(self: *Resolver, node: NodeIdx, comptime fmt: []const u8, args: anytype) void {
-        _ = node;
         const msg = std.fmt.allocPrint(self.allocator, fmt, args) catch |err| {
             std.debug.panic("OOM in resolver: {s}", .{@errorName(err)});
         };
-        self.diagnostics.add(.@"error", .semantic, msg, null) catch {};
+        const loc = diag.locationFromNode(self.arena, self.source, node);
+        self.diagnostics.add(.@"error", .semantic, msg, loc) catch {};
     }
 
     /// Reject a declaration or binding that takes a prelude name.

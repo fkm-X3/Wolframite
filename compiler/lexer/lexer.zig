@@ -9,6 +9,8 @@ pub const Lexer = struct {
     pos: u32,
     tokens: std.ArrayListUnmanaged(Token),
     allocator: Allocator,
+    /// Byte offset of the construct that triggered the last lexer error, if any.
+    error_pos: ?u32 = null,
 
     pub fn init(allocator: Allocator, source: []const u8) Lexer {
         return .{
@@ -24,6 +26,7 @@ pub const Lexer = struct {
     }
 
     pub fn tokenize(self: *Lexer) ![]Token {
+        self.error_pos = null;
         while (self.pos < self.source.len) {
             const ch = self.source[self.pos];
 
@@ -102,6 +105,7 @@ pub const Lexer = struct {
     }
 
     fn skipBlockComment(self: *Lexer) !void {
+        const start = self.pos;
         self.pos += 2;
         var depth: u32 = 1;
         while (self.pos < self.source.len and depth > 0) {
@@ -117,6 +121,7 @@ pub const Lexer = struct {
             }
         }
         if (depth > 0) {
+            self.error_pos = start;
             return error.UnterminatedBlockComment;
         }
     }
@@ -192,12 +197,16 @@ pub const Lexer = struct {
                 closed = true;
                 break;
             } else if (ch == '\n' or ch == '\r') {
+                self.error_pos = start;
                 return error.UnterminatedString;
             } else {
                 self.pos += 1;
             }
         }
-        if (!closed) return error.UnterminatedString;
+        if (!closed) {
+            self.error_pos = start;
+            return error.UnterminatedString;
+        }
 
         const tag: TokenTag = if (quote == '"') .string_literal else .char_literal;
         try self.tokens.append(self.allocator, .{

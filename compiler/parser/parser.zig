@@ -33,7 +33,7 @@ const Precedence = enum(u8) {
     postfix,
 
     fn toInt(p: Precedence) u8 {
-        return @intFromEnum(p);
+        return @backingInt(p);
     }
 };
 
@@ -158,11 +158,12 @@ pub const Parser = struct {
         };
     }
 
-    fn errorTok(self: *Parser, _: Token, comptime fmt: []const u8, args: anytype) void {
+    fn errorTok(self: *Parser, tok: Token, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.allocPrint(self.allocator, fmt, args) catch |err| {
             std.debug.panic("OOM in parser error: {s}", .{@errorName(err)});
         };
-        self.diagnostics.add(.@"error", .parser, msg, null) catch {};
+        const loc = diag.locationFromOffset(self.source, tok.start);
+        self.diagnostics.add(.@"error", .parser, msg, loc) catch {};
     }
 
     fn errorHere(self: *Parser, comptime fmt: []const u8, args: anytype) void {
@@ -957,12 +958,29 @@ pub const Parser = struct {
 
     fn parseInfix(self: *Parser, left: NodeIdx, tok: Token, prec: u8) NodeIdx {
         switch (tok.tag) {
-            .plus, .minus, .star, .slash, .percent,
-            .amp, .pipe, .caret,
-            .eq_eq, .bang_eq, .lt, .gt, .lt_eq, .gt_eq,
-            .amp_amp, .pipe_pipe,
-            .lshift, .rshift,
-            .eq, .plus_eq, .minus_eq, .star_eq, .slash_eq,
+            .plus,
+            .minus,
+            .star,
+            .slash,
+            .percent,
+            .amp,
+            .pipe,
+            .caret,
+            .eq_eq,
+            .bang_eq,
+            .lt,
+            .gt,
+            .lt_eq,
+            .gt_eq,
+            .amp_amp,
+            .pipe_pipe,
+            .lshift,
+            .rshift,
+            .eq,
+            .plus_eq,
+            .minus_eq,
+            .star_eq,
+            .slash_eq,
             => {
                 const op = tokenToBinaryOp(tok.tag);
                 const next_min = if (isRightAssoc(tok.tag)) prec else prec + 1;

@@ -295,11 +295,12 @@ pub const TypeChecker = struct {
         return ref.slice(self.source);
     }
 
-    fn errorAt(self: *TypeChecker, _: NodeIdx, comptime fmt: []const u8, args: anytype) void {
+    fn errorAt(self: *TypeChecker, node: NodeIdx, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.allocPrint(self.allocator, fmt, args) catch |err| {
             std.debug.panic("OOM in typechecker: {s}", .{@errorName(err)});
         };
-        self.diagnostics.add(.@"error", .semantic, msg, null) catch {};
+        const loc = diag.locationFromNode(self.arena, self.source, node);
+        self.diagnostics.add(.@"error", .semantic, msg, loc) catch {};
     }
 
     fn setNodeType(self: *TypeChecker, node: NodeIdx, ty: TypeIdx) void {
@@ -658,7 +659,7 @@ pub const TypeChecker = struct {
     /// on the same key (R20a).
     fn instanceKey(self: *const TypeChecker, decl_idx: NodeIdx, args: []const TypeIdx) u64 {
         var h: u64 = 0xcbf29ce484222325;
-        h = (h ^ @as(u64, @intFromEnum(decl_idx))) *% 0x100000001b3;
+        h = (h ^ @as(u64, @backingInt(decl_idx))) *% 0x100000001b3;
         for (args) |arg| {
             h = (h ^ generics_mod.typeHash(self.type_pool, arg)) *% 0x100000001b3;
         }
@@ -1768,7 +1769,7 @@ pub const TypeChecker = struct {
     /// same instance land on the same key (R20a).
     fn appKey(self: *const TypeChecker, decl_node: NodeIdx, args: []const TypeIdx) u64 {
         var h: u64 = 0xcbf29ce484222325;
-        h = (h ^ @as(u64, @intFromEnum(decl_node))) *% 0x100000001b3;
+        h = (h ^ @as(u64, @backingInt(decl_node))) *% 0x100000001b3;
         for (args) |arg| {
             h = (h ^ generics_mod.typeHash(self.type_pool, arg)) *% 0x100000001b3;
         }
@@ -3951,7 +3952,7 @@ fn findPrintCall(arena: *const AstArena, source: []const u8) ?NodeIdx {
         if (node != .call) continue;
         const callee = arena.get(node.call.func);
         if (callee.* != .identifier) continue;
-        if (std.mem.eql(u8, callee.identifier.slice(source), "print")) return @enumFromInt(i);
+        if (std.mem.eql(u8, callee.identifier.slice(source), "print")) return @fromBackingInt(@intCast(i));
     }
     return null;
 }
@@ -4286,7 +4287,7 @@ fn nthClosure(arena: *const AstArena, n: usize) ?NodeIdx {
     var i: usize = 1;
     while (i < arena.nodes.items.len) : (i += 1) {
         if (arena.nodes.items[i] != .closure) continue;
-        if (seen == n) return @enumFromInt(i);
+        if (seen == n) return @fromBackingInt(@intCast(i));
         seen += 1;
     }
     return null;

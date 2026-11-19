@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const ferro = @import("Tungsten").ferro;
 const compile_mod = @import("compile.zig");
+const diag_mod = @import("compiler").diagnostics;
 
 pub const LinkError = error{
     /// `wfr_std` could not be located on disk.
@@ -163,7 +164,13 @@ pub fn linkBinary(
     const arena_alloc = arena.allocator();
 
     const result = compile_mod.compile(arena_alloc, source, .obj, target, test_mode) catch return error.CompileFailed;
-    if (!result.ok) return error.CompileFailed;
+    if (!result.ok) {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.File.Writer = .init(.stderr(), io, &buf);
+        result.diagnostics.render(&w.interface, source, source_path) catch {};
+        w.interface.flush() catch {};
+        return error.CompileFailed;
+    }
 
     const obj_bytes = result.text orelse return error.CompileFailed;
     const write_obj = std.Io.Dir.cwd().writeFile(io, .{
