@@ -329,6 +329,7 @@ pub const Writer = struct {
             const r_type = switch (r.kind) {
                 .pc32 => CoffRelocRel32,
                 .addr64 => CoffRelocAddr64,
+                .abs32 => CoffRelocRel32,
             };
             // For PE/COFF, addend is implicit at the site; r.addend is ignored.
             var reloc_cursor = if (r.section_idx == 1) text_reloc_cursor else data_reloc_cursor;

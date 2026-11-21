@@ -6,13 +6,14 @@ const Object = ferro_types.Object;
 const ResolvedSymbol = ferro_types.ResolvedSymbol;
 const ResolvedSymbols = ferro_types.ResolvedSymbols;
 const LinkError = ferro_types.LinkError;
+const Target = ferro_types.Target;
 
 pub fn resolveSymbols(
     program: *Object,
     runtime: *Object,
-    _: []const u8,
+    target: Target,
     gpa: Allocator,
-) LinkError !ResolvedSymbols {
+) LinkError!ResolvedSymbols {
     // Map of runtime-defined symbols: name → (section, value).
     var runtime_defined: std.StringHashMap(ResolvedSymbol) =
         std.StringHashMap(ResolvedSymbol).init(gpa);
@@ -54,14 +55,14 @@ pub fn resolveSymbols(
         }
     }
 
-    // Allow Windows kernel32 imports to remain undefined: they are resolved via
-    // the PE import table rather than the runtime archive.
+    // Allow target OS imports to remain undefined: they are resolved via the
+    // platform import table (PE import directory on Windows) rather than the
+    // runtime archive. On Linux there are no such imports, so any remaining
+    // undefined symbol is a hard error.
     var has_unresolved: bool = false;
-    var first_unresolved: []const u8 = "";
     for (result.undefined.items) |name| {
-        if (!ferro_types.isKernel32Import(name)) {
+        if (!ferro_types.isOsImport(name, target)) {
             has_unresolved = true;
-            if (first_unresolved.len == 0) first_unresolved = name;
         }
     }
     if (has_unresolved) {

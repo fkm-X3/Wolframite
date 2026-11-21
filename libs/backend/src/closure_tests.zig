@@ -315,13 +315,13 @@ test "closure round-trip: capture, func_addr pairing, call-through-ptr" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8d, 0x05 }) != null);
     // The fn-value record is materialized: mov [rax], rdx.
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x10 }) != null);
-    // Hidden env marshaled as argument 0: mov rcx, qword [r10+8].
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
+    // Hidden env marshaled as argument 0: mov rdi, qword [r10+8].
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x7a, 0x08 }) != null);
     // Callee address loaded, then indirect call: mov rax, qword [r10+0]; call rax.
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x42, 0x00 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
-    // The visible argument shifts one register slot: rdx, not rcx.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0x95 }) != null);
+    // The visible argument shifts one register slot: rsi, not rdi.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x8b, 0xb5 }) != null);
 }
 
 test "capture-only closure: zero visible args marshals env alone" {
@@ -360,7 +360,7 @@ test "capture-only closure: zero visible args marshals env alone" {
     const bytes = try ctx.emitObject();
     defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x7a, 0x08 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0xff, 0xd0 }) != null);
 }
 
@@ -369,24 +369,24 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     defer ctx.deinit();
 
     const i64_ty = try ctx.intType(true, 64);
-    // Five visible args: with the hidden env the callee reads six, so the
-    // last two spill past the four register slots.
-    const sig = try ctx.funcType(i64_ty, &.{ i64_ty, i64_ty, i64_ty, i64_ty, i64_ty });
+    // Seven visible args: with the hidden env the callee reads eight, so the
+    // last two spill past the six SysV register slots.
+    const sig = try ctx.funcType(i64_ty, &.{ i64_ty, i64_ty, i64_ty, i64_ty, i64_ty, i64_ty, i64_ty });
     const fv_ty = try ctx.fnValueType(sig);
 
-    const lifted = try ctx.addFunction("sum_with_capture", i64_ty, 6);
+    const lifted = try ctx.addFunction("sum_with_capture", i64_ty, 8);
     ctx.setCurrentFunction(lifted);
     {
         const entry = try ctx.appendBlock();
         ctx.setCurrentBlock(entry);
         var acc = try ctx.buildLoad(i64_ty, ctx.getParam(0)); // hidden env
-        inline for (1..6) |i| {
+        inline for (1..8) |i| {
             acc = try ctx.buildAdd(i64_ty, acc, ctx.getParam(i));
         }
         _ = try ctx.buildRet(acc);
     }
 
-    const run = try ctx.addFunction("run", i64_ty, 5);
+    const run = try ctx.addFunction("run", i64_ty, 7);
     ctx.setCurrentFunction(run);
     const entry = try ctx.appendBlock();
     ctx.setCurrentBlock(entry);
@@ -396,13 +396,13 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     const env = try ctx.buildEnvRecord(&.{.{ .type_idx = i64_ty, .value = hundred }});
     const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
     const args = [_]Value{
-        ctx.getParam(0), ctx.getParam(1), ctx.getParam(2), ctx.getParam(3), ctx.getParam(4),
+        ctx.getParam(0), ctx.getParam(1), ctx.getParam(2), ctx.getParam(3), ctx.getParam(4), ctx.getParam(5), ctx.getParam(6),
     };
     _ = try ctx.buildRet(try ctx.buildCallPtr(i64_ty, fv, &args));
 
     var interp = Interpreter.init(std.testing.allocator, &ctx.module);
     defer interp.deinit();
-    try std.testing.expectEqual(@as(i64, 115), try interp.call(run, &.{ 1, 2, 3, 4, 5 }));
+    try std.testing.expectEqual(@as(i64, 128), try interp.call(run, &.{ 1, 2, 3, 4, 5, 6, 7 }));
 
     // Object round-trip: hidden env marshaled as argument 0; visible args
     // fill rdx/r8/r9 and spill to stack slots 32 and 40 (after the 32-byte
@@ -410,10 +410,9 @@ test "multi-arg closure: hidden env plus stack-spilled visible args" {
     const bytes = try ctx.emitObject();
     defer ctx.gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x4a, 0x08 }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x4c, 0x89, 0x8d }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x20, 0x00, 0x00, 0x00 }) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x28, 0x00, 0x00, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x49, 0x8b, 0x7a, 0x08 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 0x48, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00 }) != null);
 }
 
 test "nested closure: inner closure created and called inside an outer closure body" {

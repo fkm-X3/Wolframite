@@ -39,6 +39,7 @@ pub const linkOptionsFromDescription = ferro_types.linkOptionsFromDescription;
 pub const LinkError = ferro_types.LinkError;
 pub const Kernel32Imports = ferro_types.Kernel32Imports;
 pub const isKernel32Import = ferro_types.isKernel32Import;
+pub const isOsImport = ferro_types.isOsImport;
 
 pub const Symbol = ferro_types.Symbol;
 pub const Binding = ferro_types.Binding;
@@ -178,6 +179,7 @@ fn dumpObjectRelocs(
         const kind_name = switch (rel.kind) {
             .pc32 => "PC32",
             .addr64 => "ADDR64",
+            .abs32 => "ABS32",
         };
         switch (rel.kind) {
             .pc32 => {
@@ -186,6 +188,10 @@ fn dumpObjectRelocs(
                 disp_after = s_va_i64 + rel.addend - p_va_i64;
             },
             .addr64 => {
+                const s_merged_i64: i64 = @intCast(s_merged);
+                disp_after = s_merged_i64 + rel.addend;
+            },
+            .abs32 => {
                 const s_merged_i64: i64 = @intCast(s_merged);
                 disp_after = s_merged_i64 + rel.addend;
             },
@@ -334,7 +340,7 @@ pub fn linkObject(
     var runtime = try readObject(io, gpa, runtime_lib);
     defer runtime.deinit(gpa);
 
-    var resolved = try resolveSymbols(&object, &runtime, options.entry_symbol, gpa);
+    var resolved = try resolveSymbols(&object, &runtime, options.target, gpa);
     defer resolved.deinit(gpa);
 
     var image = try applyRelocations(&object, &runtime, &resolved, gpa, options.target);
@@ -742,7 +748,7 @@ test "resolveSymbols resolves an undefined program symbol against the runtime" {
     var runtime = try readObject(io, gpa, rt_path);
     defer runtime.deinit(gpa);
 
-    var resolved = try resolveSymbols(&program, &runtime, "_main", gpa);
+    var resolved = try resolveSymbols(&program, &runtime, .linux_x86_64, gpa);
     defer resolved.deinit(gpa);
 
     try std.testing.expectEqual(0, resolved.undefined.items.len);
@@ -808,7 +814,7 @@ test "resolveSymbols reports UndefinedSymbol when the runtime does not define it
     var runtime = try readObject(io, gpa, rt_path);
     defer runtime.deinit(gpa);
 
-    if (resolveSymbols(&program, &runtime, "_main", gpa)) |_| {
+    if (resolveSymbols(&program, &runtime, .linux_x86_64, gpa)) |_| {
         try std.testing.expect(false);
     } else |err| {
         try std.testing.expectEqual(LinkError.UndefinedSymbol, err);
@@ -879,7 +885,7 @@ test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
     var runtime = try readObject(io, gpa, rt_path);
     defer runtime.deinit(gpa);
 
-    var resolved = try resolveSymbols(&program, &runtime, "_main", gpa);
+    var resolved = try resolveSymbols(&program, &runtime, .linux_x86_64, gpa);
     defer resolved.deinit(gpa);
 
     var image = try applyRelocations(&program, &runtime, &resolved, gpa, .linux_x86_64);
@@ -924,6 +930,8 @@ test "writeExecutableElf produces an ELF executable whose _start calls _main" {
         .import_thunks = .empty,
         .import_desc_addr = 0,
         .import_desc_size = 0,
+        .abs32_sites = .empty,
+        .addr64_sites = .empty,
     };
 
     const buf = try writeExecutableElf(&image, 42, gpa);
@@ -933,8 +941,8 @@ test "writeExecutableElf produces an ELF executable whose _start calls _main" {
     try std.testing.expectEqualSlices(u8, buf[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
     try std.testing.expectEqual(2, readU16(buf, 16));      // e_type = ET_EXEC
     try std.testing.expectEqual(62, readU16(buf, 18));     // e_machine = EM_X86_64
-    // e_entry = vaddr of _start = 0x400000 + start_offset(2) = 0x400002.
-    try std.testing.expectEqual(0x400002, readU64(buf, 24));
+    // e_entry = vaddr of _start = 0x4000b0 + start_offset(2) = 0x4000b2.
+    try std.testing.expectEqual(0x4000b2, readU64(buf, 24));
 
     // Two PT_LOAD program headers at offset 64.
     try std.testing.expectEqual(1, readU32(buf, 64 + 0));  // p_type = PT_LOAD (.text)
@@ -971,6 +979,8 @@ test "writeExecutable reports UndefinedSymbol when entry symbol is absent" {
         .import_thunks = .empty,
         .import_desc_addr = 0,
         .import_desc_size = 0,
+        .abs32_sites = .empty,
+        .addr64_sites = .empty,
     };
     const opts = defaultLinkOptions(.linux_x86_64);
     if (writeExecutable(&image, "no-such-entry.exe", opts, gpa, io)) |_| {
@@ -1041,7 +1051,7 @@ test "linkObject writes an ELF executable whose entry _start calls _main" {
     try std.testing.expectEqualSlices(u8, exe_bytes[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
     try std.testing.expectEqual(2, readU16(exe_bytes, 16)); // ET_EXEC
     // e_entry = 0x400000 + start_offset. merged .text = prog(1) + rt(1) = 2, _start at offset 2.
-    try std.testing.expectEqual(0x400002, readU64(exe_bytes, 24));
+    try std.testing.expectEqual(0x4000b2, readU64(exe_bytes, 24));
 
     const text_file_off: u64 = 64 + 2 * 56;
     const stub_off = text_file_off + 2; // after 2 bytes of merged .text
@@ -1136,6 +1146,66 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     try std.testing.expectEqual(0xc3, exe_bytes[stub_off + 5]); // C3 = ret
 }
 
+test "phase3: linux link of an object referencing a Windows import fails with UndefinedSymbol" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const obj_elf = @import("obj_elf.zig");
+
+    var prog_text = [_]u8{ 0xc3 };
+    const prog_symbols = &.{
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "VirtualAlloc", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
+            .binding = .global, .is_func = false },
+    };
+    const prog_input = obj_elf.ObjectInput{
+        .text = &prog_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = prog_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var prog_w = obj_elf.Writer.init(gpa);
+    defer prog_w.deinit();
+    const prog_bytes = try prog_w.writeObject(prog_input);
+    defer gpa.free(prog_bytes);
+    const prog_path = "phase3_linux_import_prog.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
+
+    const rt_text = [_]u8{ 0x90 };
+    const rt_symbols = &.{
+        obj_elf.Symbol{ .name = "other", .section_idx = 1, .value = 0, .size = 1,
+            .binding = .global, .is_func = false },
+    };
+    const rt_input = obj_elf.ObjectInput{
+        .text = &rt_text,
+        .data = &[_]u8{},
+        .bss_size = 0,
+        .symbols = rt_symbols,
+        .relocs = &[_]obj_elf.Reloc{},
+    };
+    var rt_w = obj_elf.Writer.init(gpa);
+    defer rt_w.deinit();
+    const rt_bytes = try rt_w.writeObject(rt_input);
+    defer gpa.free(rt_bytes);
+    const rt_path = "phase3_linux_import_rt.o";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rt_path, .data = rt_bytes });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, rt_path) catch {};
+
+    var program = try readObject(io, gpa, prog_path);
+    defer program.deinit(gpa);
+    var runtime = try readObject(io, gpa, rt_path);
+    defer runtime.deinit(gpa);
+
+    // resolveSymbols must reject VirtualAlloc on Linux.
+    if (resolveSymbols(&program, &runtime, .linux_x86_64, gpa)) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(LinkError.UndefinedSymbol, err);
+    }
+}
+
 test "writeExecutablePe produces a PE executable whose main calls _main" {
     const gpa = std.testing.allocator;
 
@@ -1154,6 +1224,8 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
         .import_thunks = .empty,
         .import_desc_addr = 0,
         .import_desc_size = 0,
+        .abs32_sites = .empty,
+        .addr64_sites = .empty,
     };
 
     const buf = try writeExecutablePe(&image, 10, .console, gpa);

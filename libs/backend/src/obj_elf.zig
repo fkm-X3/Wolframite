@@ -57,6 +57,7 @@ pub const ShnUndef: u16 = 0;
 
 const RelocX86_64_64: u32 = 1;
 const RelocX86_64_PC32: u32 = 2;
+const RelX86_64_32: u32 = 10;
 
 // ============================================================================
 // Input model
@@ -335,6 +336,7 @@ pub const Writer = struct {
             const r_type = switch (r.kind) {
                 .pc32 => RelocX86_64_PC32,
                 .addr64 => RelocX86_64_64,
+                .abs32 => RelX86_64_32,
             };
             // r_offset(u64) r_info(u64) r_addend(i64) = 24 bytes.
             try self.putU64(r.offset);

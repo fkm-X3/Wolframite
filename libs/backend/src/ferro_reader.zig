@@ -111,6 +111,9 @@ const StBindingWeak: u8 = 2;
 
 const RelX86_64_64: u32 = 1;
 const RelX86_64_PC32: u32 = 2;
+const RelX86_64_PLT32: u32 = 4;
+const RelX86_64_32: u32 = 10;
+const RelX86_64_32S: u32 = 11;
 
 /// Read a NUL-terminated string from `strtab` at `off`.
 fn cstr(strtab: []const u8, off: usize) []const u8 {
@@ -260,8 +263,9 @@ fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
             const sym_idx = @as(usize, @intCast(r_info >> 32));
             const sym_name = if (sym_idx < obj.symbols.items.len) obj.symbols.items[sym_idx].name else "";
             const kind: RelocKind = switch (@as(u32, @intCast(r_info & 0xFFFF_FFFF))) {
-                RelX86_64_PC32 => .pc32,
+                RelX86_64_PC32, RelX86_64_PLT32 => .pc32,
                 RelX86_64_64 => .addr64,
+                RelX86_64_32, RelX86_64_32S => .abs32,
                 else => .addr64,
             };
             try obj.relocations.append(gpa, .{
@@ -471,6 +475,18 @@ fn strtabName(strtab: []const u8, offset: u64) []const u8 {
 // Platform archive reader
 // ============================================================================
 
+fn isDataLikeSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".data") or
+        std.mem.eql(u8, name, ".rdata") or
+        std.mem.eql(u8, name, ".rodata") or
+        std.mem.eql(u8, name, ".data.rel.ro") or
+        std.mem.eql(u8, name, ".tdata");
+}
+
+fn isBssLikeSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".bss") or std.mem.eql(u8, name, ".tbss");
+}
+
 /// Read a relocatable object file, transparently unwrapping platform archive
 /// containers (ELF `ar` / COFF `.lib`) so callers can pass either a bare
 /// object or an archive such as `wfr_std.lib`.
@@ -558,7 +574,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             for (m.sections.items) |sec| {
                 if (std.mem.eql(u8, sec.name, ".text")) {
                     text_len += sec.size;
-                } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
+                } else if (isDataLikeSection(sec.name)) {
                     data_len += sec.size;
                 }
             }
@@ -580,7 +596,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             var pos: u64 = 0;
             for (members.items) |m| {
                 for (m.sections.items) |sec| {
-                    if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
+                    if (isDataLikeSection(sec.name)) {
                         for (sec.content, 0..) |b, i| merged_data[pos + @as(usize, i)] = b;
                         pos += sec.size;
                     }
@@ -615,12 +631,36 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             .content = merged_data,
         });
     }
+    // .bss section (merged, no file bytes).
+    var total_bss: u64 = 0;
+    for (members.items) |m| {
+        for (m.sections.items) |sec| {
+            if (isBssLikeSection(sec.name)) total_bss += sec.size;
+        }
+    }
+    if (total_bss > 0) {
+        var empty: [0]u8 = undefined;
+        try obj.sections.append(gpa, .{
+            .name = ".bss",
+            .offset = 0,
+            .size = total_bss,
+            .flags = 0,
+            .type_ = 0,
+            .content = empty[0..],
+        });
+    }
 
     // Symbols.
     for (members.items) |m| {
-        var member_data_size: u64 = 0;
+        // Compute per-section byte offset within this member's data region.
+        var section_data_off = std.StringHashMap(u64).init(gpa);
+        defer section_data_off.deinit();
+        var running: u64 = 0;
         for (m.sections.items) |sec| {
-            if (std.mem.eql(u8, sec.name, ".data")) member_data_size += sec.size;
+            if (isDataLikeSection(sec.name)) {
+                section_data_off.put(sec.name, running) catch {};
+                running += sec.size;
+            }
         }
         for (m.symbols.items) |sym| {
             if (sym.name.len == 0) continue;
@@ -632,28 +672,26 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             } else if (std.mem.eql(u8, sym.section.?, ".text")) {
                 sec = ".text";
                 value = cum_text + sym.value;
-            } else if (std.mem.eql(u8, sym.section.?, ".data")) {
+            } else if (isDataLikeSection(sym.section.?)) {
                 sec = ".data";
-                value = cum_data + sym.value;
-            } else if (std.mem.eql(u8, sym.section.?, ".rdata")) {
-                sec = ".data";
-                value = cum_data + member_data_size + sym.value;
+                const base = section_data_off.get(sym.section.?) orelse 0;
+                value = cum_data + base + sym.value;
             } else {
                 continue;
             }
             try obj.symbols.append(gpa, .{
                 .name = try gpa.dupe(u8, sym.name),
                 .section = sec,
+                .binding = sym.binding,
                 .value = value,
                 .size = sym.size,
-                .binding = sym.binding,
             });
         }
         // Advance cumulative offsets past this member's sections.
         for (m.sections.items) |sec| {
             if (std.mem.eql(u8, sec.name, ".text")) {
                 cum_text += sec.size;
-            } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
+            } else if (isDataLikeSection(sec.name)) {
                 cum_data += sec.size;
             }
         }
@@ -667,19 +705,25 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     cum_text = 0;
     cum_data = 0;
     for (members.items) |m| {
-        var member_data_size: u64 = 0;
+        // Per-section data offset within this member.
+        var section_data_off = std.StringHashMap(u64).init(gpa);
+        defer section_data_off.deinit();
+        var running: u64 = 0;
         for (m.sections.items) |sec| {
-            if (std.mem.eql(u8, sec.name, ".data")) member_data_size += sec.size;
+            if (isDataLikeSection(sec.name)) {
+                section_data_off.put(sec.name, running) catch {};
+                running += sec.size;
+            }
         }
         for (m.relocations.items) |rel| {
-            const sec_name = if (rel.section_idx > 0 and rel.section_idx <= m.sections.items.len)
-                m.sections.items[rel.section_idx - 1].name
+            const sec_name = if (rel.section_idx < m.sections.items.len)
+                m.sections.items[rel.section_idx].name
             else
                 "";
-            if (!std.mem.eql(u8, sec_name, ".text") and !std.mem.eql(u8, sec_name, ".data") and !std.mem.eql(u8, sec_name, ".rdata")) continue;
+            if (!std.mem.eql(u8, sec_name, ".text") and !isDataLikeSection(sec_name)) continue;
             // Remap to Ferro's two-section model: .text -> 1, .data -> 2.
             const new_section_idx: u16 = if (std.mem.eql(u8, sec_name, ".text")) 1 else 2;
-            const off_base = if (new_section_idx == 1) cum_text else (cum_data + (if (std.mem.eql(u8, sec_name, ".rdata")) member_data_size else 0));
+            const off_base = if (new_section_idx == 1) cum_text else (cum_data + (section_data_off.get(sec_name) orelse 0));
             try obj.relocations.append(gpa, .{
                 .section_idx = new_section_idx,
                 .offset = rel.offset + off_base,
@@ -691,7 +735,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         for (m.sections.items) |sec| {
             if (std.mem.eql(u8, sec.name, ".text")) {
                 cum_text += sec.size;
-            } else if (std.mem.eql(u8, sec.name, ".data") or std.mem.eql(u8, sec.name, ".rdata")) {
+            } else if (isDataLikeSection(sec.name)) {
                 cum_data += sec.size;
             }
         }

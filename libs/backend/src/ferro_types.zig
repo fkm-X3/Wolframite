@@ -303,15 +303,25 @@ pub const Kernel32Imports = [_][]const u8{
     "VirtualAlloc",
     "CreateFileW",
     "AllocConsole",
+    "GetProcessHeap",
+    "HeapAlloc",
 };
 
-/// Returns true when `name` is a Windows kernel32 import that should be
-/// resolved via the PE import directory rather than reported as undefined.
-pub fn isKernel32Import(name: []const u8) bool {
+/// Target-aware predicate: on Windows, `name` is an OS import (kernel32)
+/// resolved via the PE import directory; on Linux there are no such imports
+/// (the runtime talks to the OS via raw syscalls), so this always returns
+/// false for `.linux_x86_64`.
+pub fn isOsImport(name: []const u8, target: Target) bool {
+    if (target == .linux_x86_64) return false;
     for (Kernel32Imports) |k| {
         if (std.mem.eql(u8, name, k)) return true;
     }
     return false;
+}
+
+/// Backwards-compatible alias for the Windows-only predicate.
+pub fn isKernel32Import(name: []const u8) bool {
+    return isOsImport(name, .windows_x86_64);
 }
 
 // ============================================================================
@@ -355,6 +365,8 @@ pub const RelocKind = enum(u8) {
     pc32,
     /// Absolute 64-bit: `S + A`.
     addr64,
+    /// Absolute 32-bit (signed): `S + A` (R_X86_64_32 / R_X86_64_32S).
+    abs32,
 };
 
 /// A section recorded in an object file. `content` borrows from `Object.file_bytes`
@@ -458,6 +470,10 @@ pub const MergedImage = struct {
     import_desc_addr: u64,
     /// Size in bytes of the import directory (descriptors incl. terminator).
     import_desc_size: u64,
+    /// Offsets (within merged .text) of R_X86_64_32/S absolute 32-bit reloc sites.
+    abs32_sites: std.ArrayList(u64),
+    /// Offsets (within merged .data) of R_X86_64_64 absolute 64-bit reloc sites.
+    addr64_sites: std.ArrayList(u64),
 
     pub fn deinit(self: *MergedImage, gpa: Allocator) void {
         for (self.import_thunks.items) |thunk| gpa.free(thunk.name);
@@ -465,5 +481,7 @@ pub const MergedImage = struct {
         gpa.free(self.data);
         self.symbols.deinit();
         self.import_thunks.deinit(gpa);
+        self.abs32_sites.deinit(gpa);
+        self.addr64_sites.deinit(gpa);
     }
 };

@@ -37,7 +37,9 @@ fn applyReloc(
     buf: []u8,
     symbols: *std.StringHashMap(ResolvedSymbol),
     gap: u64,
+    target: ferro_types.Target,
 ) !void {
+    _ = target;
     const sym_addr = symbols.get(rel.symbol) orelse return error.RelocationFailed;
     // Convert merged addresses to virtual-address offsets (relative to the
     // text section base) so cross-section references account for any alignment
@@ -68,11 +70,23 @@ fn applyReloc(
         },
         .addr64 => {
             // S + A.
-            const addend_u64: u64 = @intCast(rel.addend);
-            const abs: u64 = s + addend_u64;
+            const addend_u64: u64 = @bitCast(rel.addend);
+            const abs: u64 = s +% addend_u64;
             if (off + 8 > buf.len) return error.RelocationFailed;
             const bytes = std.mem.asBytes(&abs);
             for (bytes, 0..8) |b, i| {
+                buf[off + i] = b;
+            }
+        },
+        .abs32 => {
+            // S + A, 32-bit absolute.
+            const addend_i64: i64 = rel.addend;
+            const abs: i64 = @as(i64, @bitCast(s)) +% addend_i64;
+            if (abs < @as(i64, std.math.minInt(i32)) or abs > @as(i64, std.math.maxInt(i32))) return error.RelocationFailed;
+            if (off + 4 > buf.len) return error.RelocationFailed;
+            const v: i32 = @intCast(abs);
+            const bytes = std.mem.asBytes(&v);
+            for (bytes, 0..4) |b, i| {
                 buf[off + i] = b;
             }
         },
@@ -136,6 +150,8 @@ pub fn applyRelocations(
     // ---- Collect genuinely-undefined symbols (program then runtime). ----
     var undef_names = std.ArrayList([]const u8).empty;
     defer undef_names.deinit(gpa);
+    var prog_undef_names = std.ArrayList([]const u8).empty;
+    defer prog_undef_names.deinit(gpa);
 
     const appendUndef = struct {
         fn f(list: *std.ArrayList([]const u8), gpa2: Allocator, name: []const u8) !void {
@@ -149,6 +165,7 @@ pub fn applyRelocations(
     for (program.relocations.items) |rel| {
         if (symbolNeedsStub(program, runtime, resolved, rel.symbol)) {
             try appendUndef(&undef_names, gpa, rel.symbol);
+            try appendUndef(&prog_undef_names, gpa, rel.symbol);
         }
     }
     for (runtime.relocations.items) |rel| {
@@ -157,21 +174,26 @@ pub fn applyRelocations(
         }
     }
 
-    // Split undefined symbols into kernel32 imports vs. plain stubs.
+    // Split undefined symbols into OS imports (Windows kernel32) vs. unresolved.
+    // On Linux (or for any non-import name) there are no import thunks: an
+    // undefined symbol referenced by the *program* is a hard error rather
+    // than a silent `ret` stub. Symbols that only the runtime archive
+    // references internally (e.g. compiler-rt helpers) keep a `ret` stub.
     var import_names = std.ArrayList([]const u8).empty;
     defer import_names.deinit(gpa);
-    for (undef_names.items) |name| {
-        if (ferro_types.isKernel32Import(name)) {
-            try import_names.append(gpa, name);
-        }
-    }
-
-    // Compute stub total size: 6 bytes per import thunk, 1 byte per plain stub.
     var stub_total_size: u64 = 0;
     for (undef_names.items) |name| {
-        if (ferro_types.isKernel32Import(name)) {
+        if (ferro_types.isOsImport(name, target)) {
+            try import_names.append(gpa, name);
             stub_total_size += 6;
         } else {
+            // Is this name referenced by the program object?
+            var from_prog = false;
+            for (prog_undef_names.items) |pn| {
+                if (std.mem.eql(u8, pn, name)) { from_prog = true; break; }
+            }
+            if (from_prog) return error.UndefinedSymbol;
+            // Runtime-internal: keep a 1-byte `ret` stub.
             stub_total_size += 1;
         }
     }
@@ -216,16 +238,16 @@ pub fn applyRelocations(
     var cur: u64 = merged_text_size;
     for (undef_names.items) |name| {
         try stub_offsets.put(name, cur);
-        if (ferro_types.isKernel32Import(name)) {
+        if (ferro_types.isOsImport(name, target)) {
             cur += 6;
         } else {
             cur += 1;
         }
     }
 
-    // Fill plain stubs with `ret`.
+    // Fill runtime-internal stubs with `ret`.
     for (undef_names.items) |name| {
-        if (ferro_types.isKernel32Import(name)) continue;
+        if (ferro_types.isOsImport(name, target)) continue;
         const off = stub_offsets.get(name).?;
         merged_text[@as(usize, off)] = 0xc3; // ret
         try symbols.put(name, .{ .section = ".text", .value = off });
@@ -430,18 +452,35 @@ pub fn applyRelocations(
     }
 
 
+    var abs32_sites = std.ArrayList(u64).empty;
+    var addr64_sites = std.ArrayList(u64).empty;
+    errdefer abs32_sites.deinit(gpa);
+    errdefer addr64_sites.deinit(gpa);
+
     // ---- Apply relocations: program object ----
     for (program.relocations.items) |rel| {
         const buf = if (rel.section_idx == 1) merged_text else merged_data;
         const base = if (rel.section_idx == 1) @as(u64, 0) else data_base;
-        applyReloc(&rel, base, buf, &symbols, data_va_gap) catch {};
+        applyReloc(&rel, base, buf, &symbols, data_va_gap, target) catch {};
+        if (rel.kind == .abs32 and rel.section_idx == 1) {
+            try abs32_sites.append(gpa, rel.offset);
+        }
+        if (rel.kind == .addr64 and rel.section_idx == 2) {
+            try addr64_sites.append(gpa, rel.offset);
+        }
     }
 
     // ---- Apply relocations: runtime object ----
     for (runtime.relocations.items) |rel| {
         const buf = if (rel.section_idx == 1) merged_text[prog_text_size..] else merged_data[prog_data_size..];
         const base = if (rel.section_idx == 1) prog_text_size else data_base + prog_data_size;
-        applyReloc(&rel, base, buf, &symbols, data_va_gap) catch {};
+        applyReloc(&rel, base, buf, &symbols, data_va_gap, target) catch {};
+        if (rel.kind == .abs32 and rel.section_idx == 1) {
+            try abs32_sites.append(gpa, prog_text_size + rel.offset);
+        }
+        if (rel.kind == .addr64 and rel.section_idx == 2) {
+            try addr64_sites.append(gpa, data_base + prog_data_size + rel.offset);
+        }
     }
 
 
@@ -452,7 +491,9 @@ pub fn applyRelocations(
         .symbols = symbols,
         .import_thunks = import_thunks,
         .import_desc_addr = import_desc_addr,
-        .import_desc_size = 40,
+        .import_desc_size = if (import_desc_addr != 0) 40 else 0,
+        .abs32_sites = abs32_sites,
+        .addr64_sites = addr64_sites,
     };
 }
 

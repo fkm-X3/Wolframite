@@ -169,6 +169,7 @@ fn relocKindName(kind: RelocKind) []const u8 {
     return switch (kind) {
         .pc32 => "PC32",
         .addr64 => "ADDR64",
+        .abs32 => "ABS32",
     };
 }
 

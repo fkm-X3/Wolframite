@@ -3,6 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ferro_types = @import("ferro_types.zig");
 const MergedImage = ferro_types.MergedImage;
+const ferro_reader = @import("ferro_reader.zig");
+const readU32 = ferro_reader.readU32;
+const readU64 = ferro_reader.readU64;
 
 // ============================================================================
 // ELF64 executable writer (Linux)
@@ -117,7 +120,11 @@ pub fn writeExecutableElf(
     // `_main` address comes from symbol resolution. Both are relative to image base
     // 0, so the `call _main` displacement is `main_addr - start_offset - 5`; the
     // vaddr base (0x400000) cancels at runtime.
-    const text_vaddr: u64 = 0x400000;
+    const ehdr_size: u64 = 64;
+    const phdr_count: u64 = 2;
+    const phdr_size: u64 = 56 * phdr_count;
+    const header_size: u64 = ehdr_size + phdr_size;
+    const text_vaddr: u64 = 0x400000 + header_size;
     const start_offset = text_size;
     const stub = try buildLinuxStartStub(gpa, entry_symbol_addr, start_offset);
     defer gpa.free(stub);
@@ -130,10 +137,7 @@ pub fn writeExecutableElf(
 
     const data_vaddr = text_vaddr + full_text_size;
 
-    const ehdr_size: u64 = 64;
-    const phdr_count: u64 = 2;
-    const phdr_size: u64 = 56 * phdr_count;
-    const text_file_off = ehdr_size + phdr_size;
+    const text_file_off = header_size;
     const data_file_off = text_file_off + full_text_size;
     const total_size = data_file_off + data_size;
 
@@ -148,7 +152,7 @@ pub fn writeExecutableElf(
         .e_version = 1,
         .e_entry = text_vaddr + start_offset,
         .e_phoff = ehdr_size,
-        .e_shoff = total_size, // section headers appended at end (optional)
+        .e_shoff = 0, // no section headers
         .e_flags = 0,
         .e_ehsize = 64,
         .e_phentsize = 56,
@@ -205,9 +209,29 @@ pub fn writeExecutableElf(
     for (full_text, 0..full_text.len) |b, i| {
         buf[text_file_off + @as(u64, i)] = b;
     }
+    // Patch absolute 32-bit reloc sites in .text: add the ELF base.
+    for (image.abs32_sites.items) |site| {
+        const off = text_file_off + site;
+        const cur = readU32(buf, @intCast(off));
+        const patched: u32 = @truncate(@as(u64, cur) + 0x4000be);
+        buf[off] = @truncate(patched);
+        buf[off + 1] = @truncate(patched >> 8);
+        buf[off + 2] = @truncate(patched >> 16);
+        buf[off + 3] = @truncate(patched >> 24);
+    }
     // ---- .data content ----
     for (data, 0..data.len) |b, i| {
         buf[data_file_off + @as(u64, i)] = b;
+    }
+    // Patch absolute 64-bit reloc sites in .data: add the ELF base.
+    for (image.addr64_sites.items) |site| {
+        const off = data_file_off + site;
+        const cur = readU64(buf, @intCast(off));
+        const patched = cur + 0x4000be;
+        var i: u6 = 0;
+        while (i < 8) : (i += 1) {
+            buf[off + i] = @truncate(patched >> (i * 8));
+        }
     }
 
     return buf;

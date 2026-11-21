@@ -243,19 +243,27 @@ pub const CodeGen = struct {
             }
         }
 
-        // Stack-passed parameters (index >= 4).
+        // Stack-passed parameters (index >= 4 on Win64, >= 6 on SysV).
         {
-            var i: u32 = 4;
+            const first_stack: u32 = if (self.module.target == .linux_x86_64) 6 else 4;
+            const stack_base: u32 = if (self.module.target == .linux_x86_64) 16 else 48;
+            var i: u32 = first_stack;
             while (i < self.param_count) : (i += 1) {
                 const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
-                // mov rax, qword [rsp + 48 + (i-4)*8] (modrm 0x84 + SIB 0x04 + disp32)
-                try self.o8(0x48);
-                try self.o8(0x8b);
-                try self.o8(0x84);
-                try self.o8(0x24);
-                const disp_raw: u32 = 48 + (i - 4) * 8;
-                try self.emitI32(@bitCast(disp_raw));
-                // mov [rbp + off], rax (modrm 0x85 + disp32)
+                const disp_raw: u32 = stack_base + (i - first_stack) * 8;
+                if (self.module.target == .linux_x86_64) {
+                    // mov rax, qword [rbp + disp] ( SysV: stack args at rbp+16... )
+                    try self.o8(0x48);
+                    try self.o8(0x8b);
+                    try self.o8(0x85);
+                    try self.emitI32(@bitCast(disp_raw));
+                } else {
+                    try self.o8(0x48);
+                    try self.o8(0x8b);
+                    try self.o8(0x84);
+                    try self.o8(0x24);
+                    try self.emitI32(@bitCast(disp_raw));
+                }
                 try self.o8(0x48);
                 try self.o8(0x89);
                 try self.o8(0x85);
@@ -271,9 +279,25 @@ pub const CodeGen = struct {
             try self.emitI32(@intCast(frame_size));
         }
 
-        const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c }; // rcx, rdx, r8, r9
-        const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d }; // [rbp+disp32] for rcx/rdx/r8/r9
-        {
+        if (self.module.target == .linux_x86_64) {
+            // SysV: RDI, RSI, RDX, RCX, R8, R9
+            const sysv_rex = [_]u8{ 0x48, 0x48, 0x48, 0x48, 0x4c, 0x4c };
+            const sysv_modrm = [_]u8{ 0xbf, 0xb6, 0xba, 0xb9, 0x8d, 0x8d }; // mov [rbp+off], rdi/rsi/rdx/rcx/r8/r9? placeholder
+            // Actually emit: mov [rbp+off], reg  (store from reg). Use 0x89 with modrm reg encoding:
+            // rdi=7 -> modrm 0xbf? mod=10,reg=7,r/m=5 => 0xbf yes. rsi=6 -> 0xb5? mod=10,reg=6 => 0xb5. rdx=2 -> 0x95? mod=10,reg=2 => 0x95. rcx=1 -> 0x8d? mod=10,reg=1 => 0x8d. r8=8 (REX.B) handled via rex 0x4c and reg 0 -> 0x85. r9 -> 0x8d with rex.
+            const sysv_store_modrm = [_]u8{ 0xbd, 0xb5, 0x95, 0x8d, 0x85, 0x8d };
+            _ = sysv_modrm;
+            var i: u32 = 0;
+            while (i < self.param_count and i < 6) : (i += 1) {
+                const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
+                try self.o8(sysv_rex[i]);
+                try self.o8(0x89);
+                try self.o8(sysv_store_modrm[i]);
+                try self.emitI32(off);
+            }
+        } else {
+            const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c }; // rcx, rdx, r8, r9
+            const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d }; // [rbp+disp32]
             var i: u32 = 0;
             while (i < self.param_count and i < 4) : (i += 1) {
                 const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
@@ -651,38 +675,21 @@ pub const CodeGen = struct {
             },
             .malloc => {
                 const r = try self.valueOffsetOf(value_idx);
-                const size_off = try self.valueOff(ops[0]);
-                // VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
-                try self.o8(0x48);
-                try self.o8(0x81);
-                try self.o8(0xec);
-                try self.emitI32(32); // shadow space
-                // xor rcx, rcx
-                try self.o8(0x48);
-                try self.o8(0x31);
-                try self.o8(0xc9);
-                // mov rdx, [rbp + size_off]
-                try self.o8(0x48);
-                try self.o8(0x8b);
-                try self.o8(0x95);
-                try self.emitI32(size_off);
-                // mov r8d, 0x3000
-                try self.o8(0x41);
-                try self.o8(0xb8);
-                try self.emitI32(0x3000);
-                // mov r9d, 0x04
-                try self.o8(0x41);
-                try self.o8(0xb9);
-                try self.emitI32(0x04);
-                // call VirtualAlloc
+                // Route heap allocation through wfr_std_alloc(size) — the runtime
+                // handles OS details per target (HeapAlloc on Windows, bump arena
+                // on Linux). Standard 1-argument call preamble.
+                var call_ops = [_]u32{ 0, ops[0] };
+                const extra_stack = try self.emitCallSetupObject(&call_ops, 1);
+                // call wfr_std_alloc (relocation)
                 try self.o8(0xe8);
-                try self.relocText("VirtualAlloc", .pc32, -4);
-                try self.emitI32(0);
-                // add rsp, 32
-                try self.o8(0x48);
-                try self.o8(0x81);
-                try self.o8(0xc4);
-                try self.emitI32(32);
+                try self.relocText("wfr_std_alloc", .pc32, -4);
+                try self.emitI32(0); // placeholder
+                if (extra_stack > 0) {
+                    try self.o8(0x48);
+                    try self.o8(0x81);
+                    try self.o8(0xc4);
+                    try self.emitI32(@intCast(extra_stack));
+                }
                 // mov [rbp + r], rax
                 try self.o8(0x48);
                 try self.o8(0x89);
@@ -752,84 +759,170 @@ pub const CodeGen = struct {
                 const callee_off = try self.valueOff(ops[0]);
                 const visible_arg_count: u32 = if (ops.len > 1) @intCast(ops.len - 1) else 0;
                 const total_arg_count: u32 = visible_arg_count + 1;
-                const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c };
-                const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d };
-                const num_stack_args_total: u32 = if (total_arg_count > 4) total_arg_count - 4 else 0;
-                var extra_stack: u32 = 32;
-                if (num_stack_args_total > 0) {
-                    extra_stack += num_stack_args_total * 8;
-                    if (extra_stack % 16 != 0) extra_stack += 8;
-                }
-                if (extra_stack > 0) {
-                    try self.o8(0x48);
-                    try self.o8(0x81);
-                    try self.o8(0xec);
-                    try self.emitI32(@intCast(extra_stack));
-                }
-                // mov r10, [rbp + callee_off]
-                try self.o8(0x4c);
-                try self.o8(0x8b);
-                try self.o8(0x95);
-                try self.emitI32(callee_off);
-                // Stack args first
-                {
-                    var i: u32 = 0;
-                    while (i < visible_arg_count) : (i += 1) {
-                        const arg_slot = i + 1;
-                        if (arg_slot >= 4) {
-                            const stack_pos: i32 = 32 + @as(i32, @intCast(arg_slot - 4)) * 8;
-                            const arg_off = try self.valueOff(ops[1 + i]);
-                            try self.o8(0x48);
-                            try self.o8(0x8b);
-                            try self.o8(0x85);
-                            try self.emitI32(arg_off);
-                            try self.o8(0x48);
-                            try self.o8(0x89);
-                            try self.o8(0x84);
-                            try self.o8(0x24);
-                            try self.emitI32(stack_pos);
+
+                if (self.module.target == .linux_x86_64) {
+                    // SysV path.
+                    const reg_rex = [_]u8{ 0x48, 0x48, 0x48, 0x48, 0x4c, 0x4c };
+                    const reg_modrm_store = [_]u8{ 0xbd, 0xb5, 0x95, 0x8d, 0x85, 0x8d }; // mov reg, [rbp+disp]
+                    const num_stack_args_total: u32 = if (total_arg_count > 6) total_arg_count - 6 else 0;
+                    var extra_stack: u32 = 0;
+                    if (num_stack_args_total > 0) {
+                        extra_stack = num_stack_args_total * 8;
+                        if (extra_stack % 16 != 0) extra_stack += 8;
+                    }
+                    if (extra_stack > 0) {
+                        try self.o8(0x48);
+                        try self.o8(0x81);
+                        try self.o8(0xec);
+                        try self.emitI32(@intCast(extra_stack));
+                    }
+                    // mov r10, [rbp + callee_off]
+                    try self.o8(0x4c);
+                    try self.o8(0x8b);
+                    try self.o8(0x95);
+                    try self.emitI32(callee_off);
+                    // Stack args first
+                    {
+                        var i: u32 = 0;
+                        while (i < visible_arg_count) : (i += 1) {
+                            const arg_slot = i + 1;
+                            if (arg_slot >= 6) {
+                                const stack_pos: i32 = @intCast((arg_slot - 6) * 8);
+                                const arg_off = try self.valueOff(ops[1 + i]);
+                                try self.o8(0x48);
+                                try self.o8(0x8b);
+                                try self.o8(0x85);
+                                try self.emitI32(arg_off);
+                                try self.o8(0x48);
+                                try self.o8(0x89);
+                                try self.o8(0x84);
+                                try self.o8(0x24);
+                                try self.emitI32(stack_pos);
+                            }
                         }
                     }
-                }
-                // Hidden env as argument 0: mov rcx, qword [r10+8]
-                try self.o8(0x49);
-                try self.o8(0x8b);
-                try self.o8(0x4a);
-                try self.o8(0x08);
-                // Visible args in register slots
-                {
-                    var i: u32 = 0;
-                    while (i < visible_arg_count) : (i += 1) {
-                        const arg_slot = i + 1;
-                        if (arg_slot < 4) {
-                            const arg_off = try self.valueOff(ops[1 + i]);
-                            const reg_idx = arg_slot; // 1..3
-                            try self.o8(reg_rex[reg_idx]);
-                            try self.o8(0x8b);
-                            try self.o8(reg_modrm[reg_idx]);
-                            try self.emitI32(arg_off);
+                    // Hidden env as argument 0: mov rdi, qword [r10+8]
+                    try self.o8(0x49);
+                    try self.o8(0x8b);
+                    try self.o8(0x7a);
+                    try self.o8(0x08);
+
+                    // Visible args in register slots 1..5
+                    {
+                        var i: u32 = 0;
+                        while (i < visible_arg_count) : (i += 1) {
+                            const arg_slot = i + 1;
+                            if (arg_slot < 6 and arg_slot >= 1) {
+                                const arg_off = try self.valueOff(ops[1 + i]);
+                                const reg_idx = arg_slot; // 1..5
+                                try self.o8(reg_rex[reg_idx]);
+                                try self.o8(0x8b);
+                                try self.o8(reg_modrm_store[reg_idx]);
+                                try self.emitI32(arg_off);
+                            }
                         }
                     }
-                }
-                // Callee address last, then call
-                try self.o8(0x49);
-                try self.o8(0x8b);
-                try self.o8(0x42); // mov rax, qword [r10+0]
-                try self.o8(0x00);
-                try self.o8(0xff);
-                try self.o8(0xd0); // call rax
-                if (extra_stack > 0) {
-                    try self.o8(0x48);
-                    try self.o8(0x81);
-                    try self.o8(0xc4);
-                    try self.emitI32(@intCast(extra_stack));
-                }
-                if (inst.producesValue()) {
-                    const r = try self.valueOffsetOf(value_idx);
-                    try self.o8(0x48);
-                    try self.o8(0x89);
-                    try self.o8(0x85);
-                    try self.emitI32(r);
+                    // Callee address last, then call
+                    try self.o8(0x49);
+                    try self.o8(0x8b);
+                    try self.o8(0x42); // mov rax, qword [r10+0]
+                    try self.o8(0x00);
+                    try self.o8(0xff);
+                    try self.o8(0xd0); // call rax
+                    if (extra_stack > 0) {
+                        try self.o8(0x48);
+                        try self.o8(0x81);
+                        try self.o8(0xc4);
+                        try self.emitI32(@intCast(extra_stack));
+                    }
+                    if (inst.producesValue()) {
+                        const r = try self.valueOffsetOf(value_idx);
+                        try self.o8(0x48);
+                        try self.o8(0x89);
+                        try self.o8(0x85);
+                        try self.emitI32(r);
+                    }
+                } else {
+                    // Win64 path (original).
+                    const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c };
+                    const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d };
+                    const num_stack_args_total: u32 = if (total_arg_count > 4) total_arg_count - 4 else 0;
+                    var extra_stack: u32 = 32;
+                    if (num_stack_args_total > 0) {
+                        extra_stack += num_stack_args_total * 8;
+                        if (extra_stack % 16 != 0) extra_stack += 8;
+                    }
+                    if (extra_stack > 0) {
+                        try self.o8(0x48);
+                        try self.o8(0x81);
+                        try self.o8(0xec);
+                        try self.emitI32(@intCast(extra_stack));
+                    }
+                    // mov r10, [rbp + callee_off]
+                    try self.o8(0x4c);
+                    try self.o8(0x8b);
+                    try self.o8(0x95);
+                    try self.emitI32(callee_off);
+                    // Stack args first
+                    {
+                        var i: u32 = 0;
+                        while (i < visible_arg_count) : (i += 1) {
+                            const arg_slot = i + 1;
+                            if (arg_slot >= 4) {
+                                const stack_pos: i32 = 32 + @as(i32, @intCast(arg_slot - 4)) * 8;
+                                const arg_off = try self.valueOff(ops[1 + i]);
+                                try self.o8(0x48);
+                                try self.o8(0x8b);
+                                try self.o8(0x85);
+                                try self.emitI32(arg_off);
+                                try self.o8(0x48);
+                                try self.o8(0x89);
+                                try self.o8(0x84);
+                                try self.o8(0x24);
+                                try self.emitI32(stack_pos);
+                            }
+                        }
+                    }
+                    // Hidden env as argument 0: mov rcx, qword [r10+8]
+                    try self.o8(0x49);
+                    try self.o8(0x8b);
+                    try self.o8(0x4a);
+                    try self.o8(0x08);
+                    // Visible args in register slots
+                    {
+                        var i: u32 = 0;
+                        while (i < visible_arg_count) : (i += 1) {
+                            const arg_slot = i + 1;
+                            if (arg_slot < 4) {
+                                const arg_off = try self.valueOff(ops[1 + i]);
+                                const reg_idx = arg_slot; // 1..3
+                                try self.o8(reg_rex[reg_idx]);
+                                try self.o8(0x8b);
+                                try self.o8(reg_modrm[reg_idx]);
+                                try self.emitI32(arg_off);
+                            }
+                        }
+                    }
+                    // Callee address last, then call
+                    try self.o8(0x49);
+                    try self.o8(0x8b);
+                    try self.o8(0x42); // mov rax, qword [r10+0]
+                    try self.o8(0x00);
+                    try self.o8(0xff);
+                    try self.o8(0xd0); // call rax
+                    if (extra_stack > 0) {
+                        try self.o8(0x48);
+                        try self.o8(0x81);
+                        try self.o8(0xc4);
+                        try self.emitI32(@intCast(extra_stack));
+                    }
+                    if (inst.producesValue()) {
+                        const r = try self.valueOffsetOf(value_idx);
+                        try self.o8(0x48);
+                        try self.o8(0x89);
+                        try self.o8(0x85);
+                        try self.emitI32(r);
+                    }
                 }
             },
             .extern_call => {
@@ -877,6 +970,64 @@ pub const CodeGen = struct {
     /// Shared call preamble for object emission: reserve shadow space + stack
     /// arg space, marshal args into registers/stack. Returns bytes reserved.
     fn emitCallSetupObject(self: *@This(), ops: []const u32, arg_count: u32) !u32 {
+        if (self.module.target == .linux_x86_64) {
+            // SysV: RDI, RSI, RDX, RCX, R8, R9 (6 regs), no shadow space.
+            const reg_rex = [_]u8{ 0x48, 0x48, 0x48, 0x48, 0x4c, 0x4c };
+            const reg_modrm = [_]u8{ 0xbd, 0xb5, 0x95, 0x8d, 0x85, 0x8d }; // mov reg, [rbp+disp]
+            // Here we load arg into register: mov reg, [rbp+arg_off]. modrm reg field = target reg.
+            // rdi=7 -> bf? Wait mov r64, r/m64: opcode 0x8b, modrm = mod(10)<<6 | reg<<3 | r/m(5). reg=rdi(7) => 0xbf. yes.
+            const num_reg_args: u32 = @min(arg_count, 6);
+            const num_stack_args: u32 = if (arg_count > 6) arg_count - 6 else 0;
+
+            var extra_stack: u32 = 0;
+            if (num_stack_args > 0) {
+                extra_stack = num_stack_args * 8;
+                if (extra_stack % 16 != 0) extra_stack += 8;
+            }
+            // Ensure 16-byte alignment of RSP before call: if no stack args, allocate 0? 
+            // SysV requires RSP 16-aligned before call; caller's RSP already aligned if frame is.
+            // But to be safe, if extra_stack==0, no adjustment needed.
+
+            if (extra_stack > 0) {
+                try self.o8(0x48);
+                try self.o8(0x81);
+                try self.o8(0xec);
+                try self.emitI32(@intCast(extra_stack));
+            }
+
+            {
+                var i: u32 = 0;
+                while (i < num_reg_args) : (i += 1) {
+                    const arg_off = try self.valueOff(ops[1 + i]);
+                    try self.o8(reg_rex[i]);
+                    try self.o8(0x8b);
+                    try self.o8(reg_modrm[i]);
+                    try self.emitI32(arg_off);
+                }
+            }
+
+            {
+                var i: u32 = arg_count;
+                while (i > 6) {
+                    i -= 1;
+                    const arg_off = try self.valueOff(ops[1 + i]);
+                    const stack_pos: i32 = @intCast((i - 6) * 8);
+                    try self.o8(0x48);
+                    try self.o8(0x8b);
+                    try self.o8(0x85);
+                    try self.emitI32(arg_off);
+                    try self.o8(0x48);
+                    try self.o8(0x89);
+                    try self.o8(0x84);
+                    try self.o8(0x24);
+                    try self.emitI32(stack_pos);
+                }
+            }
+
+            return extra_stack;
+        }
+
+        // Win64 path (original).
         const reg_rex = [_]u8{ 0x48, 0x48, 0x4c, 0x4c };
         const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d }; // [rbp+disp32] for rcx/rdx/r8/r9
         const num_reg_args: u32 = @min(arg_count, 4);
@@ -1218,6 +1369,65 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
     try std.testing.expectEqual(2, r_type); // R_X86_64_PC32
     // addend = -4: disp is relative to the instruction after the 4-byte placeholder.
     try std.testing.expectEqual(-4, readI64(bytes, rela_off + 16));
+}
+
+test "phase3: closure+prelude program has only wfr_std_ undefined symbols (ELF64)" {
+    const api = @import("api.zig");
+    const ctx = try api.Context.init(std.testing.allocator, .linux_x86_64);
+    defer ctx.deinit();
+
+    const i32_ty = try ctx.intType(true, 32);
+    const i64_ty = try ctx.intType(true, 64);
+    const ptr_ty = try ctx.ptrType(i32_ty);
+    const sig = try ctx.funcType(i32_ty, &.{i32_ty});
+    const fv_ty = try ctx.fnValueType(sig);
+
+    // Lifted closure body.
+    const lifted = try ctx.addFunction("lifted", i32_ty, 2);
+    ctx.setCurrentFunction(lifted);
+    {
+        const entry = try ctx.appendBlock();
+        ctx.setCurrentBlock(entry);
+        const env_param = ctx.getParam(0);
+        const x = ctx.getParam(1);
+        const captured = try ctx.buildLoad(i32_ty, env_param);
+        _ = try ctx.buildRet(try ctx.buildAdd(i32_ty, captured, x));
+    }
+
+    const site = try ctx.addFunction("site", i32_ty, 0);
+    ctx.setCurrentFunction(site);
+    const entry = try ctx.appendBlock();
+    ctx.setCurrentBlock(entry);
+
+    const fn_addr = try ctx.buildFuncAddr(i64_ty, lifted);
+    const forty = try ctx.buildIntConst(i32_ty, 40);
+    const env = try ctx.buildEnvRecord(&.{.{ .type_idx = i32_ty, .value = forty }});
+    const fv = try ctx.buildFnValue(fv_ty, fn_addr, env);
+    _ = try ctx.buildCallPtr(i32_ty, fv, &.{try ctx.buildIntConst(i32_ty, 2)});
+
+    // prelude IO: print a string global.
+    const str_global = try ctx.addStringGlobal("__g0", "hi");
+    const gaddr = try ctx.buildGlobalAddr(ptr_ty, str_global);
+    const void_ty = try ctx.voidType();
+    _ = try ctx.buildExternCall("wfr_std_print", void_ty, &.{gaddr});
+
+    const zero = try ctx.buildIntConst(i32_ty, 0);
+    _ = try ctx.buildRet(zero);
+
+    // Emit object module directly.
+    var cg = CodeGen.init(std.testing.allocator, &ctx.module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+
+    // Every undefined symbol must start with wfr_std_.
+    for (input.symbols) |sym| {
+        if (sym.section_idx != 0) continue; // defined symbols have section_idx != 0
+        try std.testing.expect(std.mem.startsWith(u8, sym.name, "wfr_std_"));
+    }
+    // No relocation may reference VirtualAlloc.
+    for (input.relocs) |rel| {
+        try std.testing.expect(!std.mem.eql(u8, rel.symbol, "VirtualAlloc"));
+    }
 }
 
 test "object emission: function call between two functions (ELF64)" {
