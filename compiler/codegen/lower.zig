@@ -367,7 +367,12 @@ pub const Lowerer = struct {
             try self.lowerFunctionBody(f.body, f.idx);
         }
 
-        if (self.test_mode and self.test_fns.items.len > 0) {
+        // In test mode the runner synthesizes `main` even when the file has
+        // no test declarations: the user `main` was skipped above, so without
+        // this the object would have no entry point at all and every link
+        // would fail with a missing `_main`. Zero tests simply report
+        // "test result: ok" (matching `zig test` on a test-less file).
+        if (self.test_mode) {
             try self.generateTestMain();
         }
     }

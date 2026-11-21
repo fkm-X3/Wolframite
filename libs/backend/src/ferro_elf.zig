@@ -209,11 +209,13 @@ pub fn writeExecutableElf(
     for (full_text, 0..full_text.len) |b, i| {
         buf[text_file_off + @as(u64, i)] = b;
     }
-    // Patch absolute 32-bit reloc sites in .text: add the ELF base.
+    // Patch absolute 32-bit reloc sites in .text: the sites hold merged-image
+    // offsets (base 0), the image loads at `text_vaddr`, and there is no
+    // relocation processing after load (ET_EXEC, no PIE), so add the base.
     for (image.abs32_sites.items) |site| {
         const off = text_file_off + site;
         const cur = readU32(buf, @intCast(off));
-        const patched: u32 = @truncate(@as(u64, cur) + 0x4000be);
+        const patched: u32 = @truncate(@as(u64, cur) + text_vaddr);
         buf[off] = @truncate(patched);
         buf[off + 1] = @truncate(patched >> 8);
         buf[off + 2] = @truncate(patched >> 16);
@@ -223,11 +225,14 @@ pub fn writeExecutableElf(
     for (data, 0..data.len) |b, i| {
         buf[data_file_off + @as(u64, i)] = b;
     }
-    // Patch absolute 64-bit reloc sites in .data: add the ELF base.
+    // Patch absolute 64-bit reloc sites in .data: the sites hold
+    // merged-.data-relative values, whose real VA base is
+    // `data_vaddr = text_vaddr + full_text_size`; the merged base they were
+    // written against is `text.len`, so the delta is `text_vaddr + stub`.
     for (image.addr64_sites.items) |site| {
         const off = data_file_off + site;
         const cur = readU64(buf, @intCast(off));
-        const patched = cur + 0x4000be;
+        const patched = cur + text_vaddr + stub.len;
         var i: u6 = 0;
         while (i < 8) : (i += 1) {
             buf[off + i] = @truncate(patched >> (i * 8));
@@ -245,4 +250,3 @@ pub fn writeExecutableElfToFile(
 ) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = exe_path, .data = buf });
 }
-

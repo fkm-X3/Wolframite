@@ -296,6 +296,7 @@ const CoffRelocSize: u64 = 10;
 
 const CoffRelocAddr64: u16 = 1; // IMAGE_REL_AMD64_ADDR64
 const CoffRelocRel32: u16 = 4; // IMAGE_REL_AMD64_REL32
+const CoffRelocSecrel: u16 = 11; // IMAGE_REL_AMD64_SECREL
 
 /// Read a PE/COFF object from `bytes` (a raw object, not an archive).
 fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) !Object {
@@ -387,22 +388,36 @@ fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) 
             const r_type = readU16(reloc_data, @intCast(roff + 8));
             var sym_name: []const u8 = "";
             if (sym_index < num_symbols) sym_name = coffSymNameAt(sym_data, strtab, sym_index);
-            const kind: RelocKind = switch (r_type) {
-                CoffRelocRel32 => .pc32,
-                CoffRelocAddr64 => .addr64,
-                else => .addr64,
-            };
-            try obj.relocations.append(gpa, .{
-                .section_idx = @truncate(si + 1), // COFF sections are 1-based
-                .offset = r_offset,
-                .symbol = sym_name,
-                .kind = kind,
-                // PE/COFF addend is implicit at the site. For PC32 relocations,
-                // the addend must be -4: the call displacement is relative to
-                // the next instruction (after the 4-byte placeholder), but the
-                // relocation site is at the placeholder itself.
-                .addend = if (kind == .pc32) -4 else 0,
-            });
+            // PE/COFF addend is implicit at the site. For PC32 relocations,
+            // the addend must be -4: the call displacement is relative to
+            // the next instruction (after the 4-byte placeholder), but the
+            // relocation site is at the placeholder itself.
+            switch (r_type) {
+                CoffRelocAddr64 => try obj.relocations.append(gpa, .{
+                    .section_idx = @truncate(si + 1), // COFF sections are 1-based
+                    .offset = r_offset,
+                    .symbol = sym_name,
+                    .kind = .addr64,
+                    .addend = 0,
+                }),
+                CoffRelocRel32 => try obj.relocations.append(gpa, .{
+                    .section_idx = @truncate(si + 1),
+                    .offset = r_offset,
+                    .symbol = sym_name,
+                    .kind = .pc32,
+                    .addend = -4,
+                }),
+                CoffRelocSecrel => {
+                    // SECREL carries the target's offset within its own
+                    // section. Ferro's two-section model cannot express it
+                    // for symbols outside `.text`/`.data` (the runtime uses
+                    // SECREL for `.tls$` TLS variables), and misapplying it
+                    // would corrupt the site. Leave the site as emitted.
+                },
+                // Anything else cannot be represented in Ferro's model;
+                // failing loudly beats silently writing garbage.
+                else => return error.ObjectReadFailed,
+            }
         }
     }
 
@@ -511,6 +526,14 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     // ---- Pass 1: parse each object member into a standalone Object. ----
     var members = std.ArrayList(Object).empty;
     defer members.deinit(gpa);
+    // On any error after this point, free every member parsed so far (their
+    // buffers and, on the member-parse error path, the member path string).
+    errdefer {
+        for (members.items) |*m| {
+            gpa.free(m.path);
+            m.deinit(gpa);
+        }
+    }
 
     var off: usize = 8;
     while (off + ArHeaderSize <= file_bytes.len) {
@@ -531,19 +554,21 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
         if (member_data.len == 0) continue;
 
         if (member_data.len >= 2 and readU16(member_data, 0) == 0x8664) {
-            const member = try readCoffObjectFromBytes(
-                gpa,
-                std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed,
-                member_data,
-            );
-            try members.append(gpa, member);
+            const member_path = std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed;
+            if (readCoffObjectFromBytes(gpa, member_path, member_data)) |member| {
+                try members.append(gpa, member);
+            } else |err| {
+                gpa.free(member_path);
+                return err;
+            }
         } else if (member_data.len >= 4 and std.mem.eql(u8, member_data[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' })) {
-            const member = try readElfObject(
-                gpa,
-                std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed,
-                member_data,
-            );
-            try members.append(gpa, member);
+            const member_path = std.fmt.allocPrint(gpa, "{s}[member]", .{path}) catch return error.ObjectReadFailed;
+            if (readElfObject(gpa, member_path, member_data)) |member| {
+                try members.append(gpa, member);
+            } else |err| {
+                gpa.free(member_path);
+                return err;
+            }
         }
         // else: non-object archive member (symbol/string table) — skip.
     }
@@ -716,8 +741,21 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             }
         }
         for (m.relocations.items) |rel| {
-            const sec_name = if (rel.section_idx < m.sections.items.len)
-                m.sections.items[rel.section_idx].name
+            // Section indexes are format-specific: COFF relocation entries
+            // reference sections by 1-based section number, ELF relocations
+            // by 0-based index into the section list. Translate both to an
+            // index into this member's section list before looking the
+            // section up. (Getting this wrong silently drops every `.text`
+            // relocation of a Zig-built archive member — its sections are
+            // ordered .bss/.data/.rdata/.text/.tls$, so a 1-based `.text`
+            // index lands on `.tls$` — and misapplies `.rdata` relocations
+            // as `.text` ones.)
+            const member_sec_idx: usize = switch (m.format) {
+                .pe_coff => @as(usize, rel.section_idx) - 1,
+                .elf64 => @as(usize, rel.section_idx),
+            };
+            const sec_name = if (member_sec_idx < m.sections.items.len)
+                m.sections.items[member_sec_idx].name
             else
                 "";
             if (!std.mem.eql(u8, sec_name, ".text") and !isDataLikeSection(sec_name)) continue;
@@ -742,12 +780,12 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     }
 
     // Release per-member containers now that their data has been merged.
+    // `deinit` frees each member's `file_bytes` (ELF members' section
+    // contents borrow from it too, and they used to leak here); symbol and
+    // relocation names are borrowed, not owned, so they are not freed.
     for (members.items) |*m| {
         gpa.free(m.path);
-        m.sections.deinit(gpa);
-        m.symbols.deinit(gpa);
-        m.relocations.deinit(gpa);
-        if (m.format == .pe_coff) gpa.free(m.file_bytes);
+        m.deinit(gpa);
     }
 
     owned = false;
@@ -761,4 +799,245 @@ fn sectionSizeOrZero(dst: *Object, name: []const u8) u64 {
         if (std.mem.eql(u8, sec.name, name)) total += sec.size;
     }
     return total;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+fn testPutU32(list: *std.ArrayList(u8), gpa: Allocator, v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try list.appendSlice(gpa, &b);
+}
+
+fn testPutU16(list: *std.ArrayList(u8), gpa: Allocator, v: u16) !void {
+    var b: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b, v, .little);
+    try list.appendSlice(gpa, &b);
+}
+
+/// Build a minimal COFF object with the section order a Zig-built static
+/// library member uses (.bss/.data/.rdata/.text/.tls$) — the layout that
+/// exposed the 1-based/0-based relocation merge bug.
+fn testBuildCoffMember(gpa: Allocator) ![]u8 {
+    var b = std.ArrayList(u8).empty;
+    errdefer b.deinit(gpa);
+
+    const data_raw: [8]u8 = @splat(1);
+    const rdata_raw: [8]u8 = @splat(2);
+    const text_raw: [16]u8 = @splat(0x90);
+    const raw_total = data_raw.len + rdata_raw.len + text_raw.len;
+    const reloc_total = 3 * 10; // 1 (.rdata) + 2 (.text)
+    const num_symbols = 4;
+    const header_size = 20 + 5 * 40;
+    const ptr_symtab: u32 = header_size + raw_total + reloc_total;
+    // String table: 4-byte size dword plus "GetStdHandle\0" — the import
+    // name exceeds COFF's 8-byte inline name field, so it is stored as a
+    // standard long name (offset with the high bit set).
+    const long_name = "GetStdHandle";
+    const long_name_off: u32 = 4;
+    const strtab_size: u32 = long_name_off + long_name.len + 1;
+
+    // COFF file header.
+    try testPutU16(&b, gpa, 0x8664); // machine
+    try testPutU16(&b, gpa, 5); // number of sections
+    try testPutU32(&b, gpa, 0); // time date stamp
+    try testPutU32(&b, gpa, ptr_symtab);
+    try testPutU32(&b, gpa, num_symbols);
+    try testPutU16(&b, gpa, 0); // size of optional header
+    try testPutU16(&b, gpa, 0); // characteristics
+
+    // Section headers. Relocations reference symbols by index:
+    // 0 = SomeData (.data), 1 = SomeString (.rdata), 2 = SomeFunc (.text),
+    // 3 = GetStdHandle (undefined).
+    const sections = [_]struct {
+        name: []const u8,
+        raw_size: u32,
+        raw_ptr: u32,
+        reloc_ptr: u32,
+        nreloc: u16,
+        chars: u32,
+    }{
+        .{ .name = ".bss", .raw_size = 0, .raw_ptr = 0, .reloc_ptr = 0, .nreloc = 0, .chars = 0xC0000080 },
+        .{ .name = ".data", .raw_size = data_raw.len, .raw_ptr = header_size, .reloc_ptr = 0, .nreloc = 0, .chars = 0xC0000040 },
+        .{ .name = ".rdata", .raw_size = rdata_raw.len, .raw_ptr = header_size + data_raw.len, .reloc_ptr = ptr_symtab - reloc_total, .nreloc = 1, .chars = 0x40000040 },
+        .{ .name = ".text", .raw_size = text_raw.len, .raw_ptr = header_size + data_raw.len + rdata_raw.len, .reloc_ptr = ptr_symtab - 2 * 10, .nreloc = 2, .chars = 0x60000020 },
+        .{ .name = ".tls$", .raw_size = 0, .raw_ptr = 0, .reloc_ptr = 0, .nreloc = 0, .chars = 0xC0000040 },
+    };
+    for (sections) |s| {
+        var name: [8]u8 = @splat(0);
+        @memcpy(name[0..s.name.len], s.name);
+        try b.appendSlice(gpa, &name);
+        try testPutU32(&b, gpa, 0); // virtual size
+        try testPutU32(&b, gpa, 0); // virtual address
+        try testPutU32(&b, gpa, s.raw_size);
+        try testPutU32(&b, gpa, s.raw_ptr);
+        try testPutU32(&b, gpa, s.reloc_ptr);
+        try testPutU32(&b, gpa, 0); // line numbers
+        try testPutU16(&b, gpa, s.nreloc);
+        try testPutU16(&b, gpa, 0);
+        try testPutU32(&b, gpa, s.chars);
+    }
+
+    // Section raw data.
+    try b.appendSlice(gpa, &data_raw);
+    try b.appendSlice(gpa, &rdata_raw);
+    try b.appendSlice(gpa, &text_raw);
+
+    // Relocations: .rdata (1): pointer to SomeData; .text (2): call to
+    // SomeFunc (REL32) and pointer to SomeData (ADDR64).
+    try testPutU32(&b, gpa, 0); // .rdata+0
+    try testPutU32(&b, gpa, 0); // SomeData
+    try testPutU16(&b, gpa, 1); // ADDR64
+    try testPutU32(&b, gpa, 0); // .text+0
+    try testPutU32(&b, gpa, 2); // SomeFunc
+    try testPutU16(&b, gpa, 4); // REL32
+    try testPutU32(&b, gpa, 8); // .text+8
+    try testPutU32(&b, gpa, 0); // SomeData
+    try testPutU16(&b, gpa, 1); // ADDR64
+
+    // Symbol table (18 bytes each, no aux records). "GetStdHandle" uses the
+    // long-name form: a dword offset into the string table with the high
+    // bit set, followed by four zero bytes.
+    const symbols = [_]struct {
+        name: []const u8,
+        long: bool = false,
+        value: u32,
+        section: u16,
+        storage: u8,
+    }{
+        .{ .name = "SomeData", .value = 0, .section = 2, .storage = 2 },
+        .{ .name = "SomeStr", .value = 0, .section = 3, .storage = 2 },
+        .{ .name = "SomeFunc", .value = 0, .section = 4, .storage = 2 },
+        .{ .name = long_name, .long = true, .value = 0, .section = 0, .storage = 2 },
+    };
+    for (symbols) |s| {
+        var name: [8]u8 = @splat(0);
+        if (s.long) {
+            std.mem.writeInt(u32, name[0..4], 0x8000_0000 | long_name_off, .little);
+        } else {
+            @memcpy(name[0..s.name.len], s.name);
+        }
+        try b.appendSlice(gpa, &name);
+        try testPutU32(&b, gpa, s.value);
+        try testPutU16(&b, gpa, s.section);
+        try testPutU16(&b, gpa, 0); // type
+        try b.append(gpa, s.storage);
+        try b.append(gpa, 0); // aux count
+    }
+
+    // String table (size dword + the long name).
+    try testPutU32(&b, gpa, strtab_size);
+    try b.appendSlice(gpa, long_name);
+    try b.append(gpa, 0);
+    return b.toOwnedSlice(gpa);
+}
+
+test "archive merge keeps COFF member relocations (1-based section numbers)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // Wrap the COFF member in an ar archive (no symbol index members).
+    const member = try testBuildCoffMember(gpa);
+    defer gpa.free(member);
+    var lib = std.ArrayList(u8).empty;
+    defer lib.deinit(gpa);
+    try lib.appendSlice(gpa, "!<arch>\n");
+    var hdr: [60]u8 = @splat(' ');
+    @memcpy(hdr[0..8], "coff.obj");
+    var size_buf: [10]u8 = undefined;
+    const size_str = try std.fmt.bufPrint(&size_buf, "{d}", .{member.len});
+    @memcpy(hdr[48 .. 48 + size_str.len], size_str);
+    hdr[58] = '`';
+    hdr[59] = '\n';
+    try lib.appendSlice(gpa, &hdr);
+    try lib.appendSlice(gpa, member);
+
+    const lib_path = "ferro_reader_coff_merge_test.lib";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lib_path, .data = lib.items });
+    defer std.Io.Dir.cwd().deleteFile(io, lib_path) catch {};
+
+    var obj = try readArchiveObject(io, gpa, lib_path);
+    defer obj.deinit(gpa);
+
+    // Merged sections: .text (16) then .data (8 .data + 8 .rdata = 16).
+    try testing.expectEqual(@as(usize, 2), obj.sections.items.len);
+    try testing.expectEqualStrings(".text", obj.sections.items[0].name);
+    try testing.expectEqual(@as(u64, 16), obj.sections.items[0].size);
+    try testing.expectEqualStrings(".data", obj.sections.items[1].name);
+    try testing.expectEqual(@as(u64, 16), obj.sections.items[1].size);
+
+    // Symbols keep their sections; .rdata symbols land in .data behind the
+    // member's .data bytes.
+    var found_string = false;
+    for (obj.symbols.items) |sym| {
+        if (std.mem.eql(u8, sym.name, "SomeStr")) {
+            found_string = true;
+            try testing.expectEqualStrings(".data", sym.section.?);
+            try testing.expectEqual(@as(u64, 8), sym.value);
+        }
+        if (std.mem.eql(u8, sym.name, "GetStdHandle")) {
+            try testing.expect(sym.section == null);
+        }
+    }
+    try testing.expect(found_string);
+
+    // All three relocations survive, retargeted to Ferro's two-section
+    // model with correct merged offsets:
+    //   .rdata+0 (pointer to SomeData)  -> .data+8
+    //   .text+0 (call SomeFunc, REL32)  -> .text+0, pc32, addend -4
+    //   .text+8 (pointer to SomeData)   -> .text+8, addr64
+    try testing.expectEqual(@as(usize, 3), obj.relocations.items.len);
+    const rel0 = obj.relocations.items[0];
+    try testing.expectEqual(@as(u16, 2), rel0.section_idx);
+    try testing.expectEqual(@as(u64, 8), rel0.offset);
+    try testing.expectEqualStrings("SomeData", rel0.symbol);
+    try testing.expectEqual(RelocKind.addr64, rel0.kind);
+    const rel1 = obj.relocations.items[1];
+    try testing.expectEqual(@as(u16, 1), rel1.section_idx);
+    try testing.expectEqual(@as(u64, 0), rel1.offset);
+    try testing.expectEqualStrings("SomeFunc", rel1.symbol);
+    try testing.expectEqual(RelocKind.pc32, rel1.kind);
+    try testing.expectEqual(@as(i64, -4), rel1.addend);
+    const rel2 = obj.relocations.items[2];
+    try testing.expectEqual(@as(u16, 1), rel2.section_idx);
+    try testing.expectEqual(@as(u64, 8), rel2.offset);
+    try testing.expectEqualStrings("SomeData", rel2.symbol);
+    try testing.expectEqual(RelocKind.addr64, rel2.kind);
+}
+
+test "COFF reader rejects unsupported relocation types instead of misapplying them" {
+    const gpa = testing.allocator;
+
+    // Same member builder, but corrupt the first .rdata relocation's type
+    // (1 = ADDR64) into an unsupported one (2 = ADDR32): the reader must
+    // fail loudly rather than silently treat it as an 8-byte pointer.
+    const member = try testBuildCoffMember(gpa);
+    defer gpa.free(member);
+    var bad = member;
+    const first_reloc_type = 20 + 5 * 40 + 8 + 8 + 16 + 8; // header + raw + .rdata reloc offset
+    bad[first_reloc_type] = 2;
+    bad[first_reloc_type + 1] = 0;
+
+    var lib = std.ArrayList(u8).empty;
+    defer lib.deinit(gpa);
+    try lib.appendSlice(gpa, "!<arch>\n");
+    var hdr: [60]u8 = @splat(' ');
+    @memcpy(hdr[0..8], "coff.obj");
+    var size_buf: [10]u8 = undefined;
+    const size_str = try std.fmt.bufPrint(&size_buf, "{d}", .{bad.len});
+    @memcpy(hdr[48 .. 48 + size_str.len], size_str);
+    hdr[58] = '`';
+    hdr[59] = '\n';
+    try lib.appendSlice(gpa, &hdr);
+    try lib.appendSlice(gpa, bad);
+
+    const lib_path = "ferro_reader_coff_badreloc_test.lib";
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = lib.items });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, lib_path) catch {};
+
+    try testing.expectError(error.ObjectReadFailed, readArchiveObject(testing.io, gpa, lib_path));
 }

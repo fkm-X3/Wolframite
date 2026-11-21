@@ -55,7 +55,9 @@ fn buildWindowsMainStub(
     main_rel_addr: u64,
     stub_rel_addr: u64,
 ) ![]u8 {
-    const stub_size: usize = 6;
+    // Must stay in sync with `ferro_types.pe_entry_stub_size`, which the
+    // relocation model uses to compute .data's virtual address.
+    const stub_size: usize = @intCast(ferro_types.pe_entry_stub_size);
     var stub = try gpa.alloc(u8, stub_size);
     // call _main (E8 = call rel32)
     stub[0] = 0xe8;
@@ -145,65 +147,113 @@ pub fn writeExecutablePe(
     for (buf) |*b| b.* = 0;
     var pos: u64 = 0;
 
-    buf[0] = 'M'; buf[1] = 'Z';
+    buf[0] = 'M';
+    buf[1] = 'Z';
     putU32At(buf, 60, 64); // e_lfanew = offset to PE signature
     pos = 64;
 
     // ---- PE signature "PE\0\0" ----
-    buf[pos] = 'P'; buf[pos + 1] = 'E'; buf[pos + 2] = 0; buf[pos + 3] = 0;
+    buf[pos] = 'P';
+    buf[pos + 1] = 'E';
+    buf[pos + 2] = 0;
+    buf[pos + 3] = 0;
     pos += 4;
 
     // ---- COFF file header (20 bytes) ----
-    putU16At(buf, pos, 0x8664); pos += 2; // machine
-    putU16At(buf, pos, sec_count); pos += 2;
-    putU32At(buf, pos, 0); pos += 4; // time_date_stamp
-    putU32At(buf, pos, 0); pos += 4; // pointer_to_symbol_table
-    putU32At(buf, pos, 0); pos += 4; // number_of_symbols
-    putU16At(buf, pos, PeSizeOfOptionalHeader); pos += 2;
-    putU16At(buf, pos, PeCharacteristicsExecImage | PeCharacteristicsRelocsStripped | PeCharacteristicsLargeAddressAware); pos += 2;
+    putU16At(buf, pos, 0x8664);
+    pos += 2; // machine
+    putU16At(buf, pos, sec_count);
+    pos += 2;
+    putU32At(buf, pos, 0);
+    pos += 4; // time_date_stamp
+    putU32At(buf, pos, 0);
+    pos += 4; // pointer_to_symbol_table
+    putU32At(buf, pos, 0);
+    pos += 4; // number_of_symbols
+    putU16At(buf, pos, PeSizeOfOptionalHeader);
+    pos += 2;
+    putU16At(buf, pos, PeCharacteristicsExecImage | PeCharacteristicsRelocsStripped | PeCharacteristicsLargeAddressAware);
+    pos += 2;
 
     // ---- Optional header (PE32+, 240 bytes) ----
-    putU16At(buf, pos, PeMagic); pos += 2; // magic
+    putU16At(buf, pos, PeMagic);
+    pos += 2; // magic
     pos += 2; // linker version (major/minor = 0)
-    putU32At(buf, pos, @as(u32, @intCast(full_text_size))); pos += 4; // size_of_code
-    putU32At(buf, pos, @as(u32, @intCast(data_size))); pos += 4; // size_of_initialized_data
-    putU32At(buf, pos, @intCast(image.bss_size)); pos += 4; // size_of_uninitialized_data
-    putU32At(buf, pos, @as(u32, @intCast(address_of_entry_point & 0xFFFF_FFFF))); pos += 4; // address_of_entry_point (low 32)
-    putU32At(buf, pos, @as(u32, @intCast(text_sec_vaddr_final))); pos += 4; // base_of_code
-    putU64At(buf, pos, PeImageBase); pos += 8; // image_base
-    putU32At(buf, pos, PeSecAlign); pos += 4; // section_alignment
-    putU32At(buf, pos, PeFileAlign); pos += 4; // file_alignment
-    putU16At(buf, pos, 6); pos += 2; // os_major (Windows Vista+)
-    putU16At(buf, pos, 0); pos += 2; // os_minor
-    putU16At(buf, pos, 0); pos += 2; // image_major
-    putU16At(buf, pos, 0); pos += 2; // image_minor
-    putU16At(buf, pos, 6); pos += 2; // subsystem_major
-    putU16At(buf, pos, 0); pos += 2; // subsystem_minor
-    putU32At(buf, pos, 0); pos += 4; // win32_version_value = 0
-    putU32At(buf, pos, @as(u32, @intCast(size_of_image))); pos += 4; // size_of_image
-    putU32At(buf, pos, @as(u32, @intCast(size_of_headers))); pos += 4; // size_of_headers
-    putU32At(buf, pos, 0); pos += 4; // checksum
-    putU16At(buf, pos, subsystem_val); pos += 2; // subsystem
-    putU16At(buf, pos, 0x8160); pos += 2; // dll_characteristics (NX_COMPAT | DYNAMIC_BASE | HIGH_ENTROPY_VA | TERMINAL_SERVER_AWARE)
-    putU64At(buf, pos, 0x1000000); pos += 8; // size_of_stack_reserve (16 MB, match ore.exe)
-    putU64At(buf, pos, 0x1000); pos += 8; // size_of_stack_commit
-    putU64At(buf, pos, 0x100000); pos += 8; // size_of_heap_reserve
-    putU64At(buf, pos, 0x1000); pos += 8; // size_of_heap_commit
-    putU32At(buf, pos, 0); pos += 4; // loader_flags
-    putU32At(buf, pos, PeNumberOfRvaAndSizes); pos += 4; // number_of_rva_and_sizes
+    putU32At(buf, pos, @as(u32, @intCast(full_text_size)));
+    pos += 4; // size_of_code
+    putU32At(buf, pos, @as(u32, @intCast(data_size)));
+    pos += 4; // size_of_initialized_data
+    putU32At(buf, pos, @intCast(image.bss_size));
+    pos += 4; // size_of_uninitialized_data
+    putU32At(buf, pos, @as(u32, @intCast(address_of_entry_point & 0xFFFF_FFFF)));
+    pos += 4; // address_of_entry_point (low 32)
+    putU32At(buf, pos, @as(u32, @intCast(text_sec_vaddr_final)));
+    pos += 4; // base_of_code
+    putU64At(buf, pos, PeImageBase);
+    pos += 8; // image_base
+    putU32At(buf, pos, PeSecAlign);
+    pos += 4; // section_alignment
+    putU32At(buf, pos, PeFileAlign);
+    pos += 4; // file_alignment
+    putU16At(buf, pos, 6);
+    pos += 2; // os_major (Windows Vista+)
+    putU16At(buf, pos, 0);
+    pos += 2; // os_minor
+    putU16At(buf, pos, 0);
+    pos += 2; // image_major
+    putU16At(buf, pos, 0);
+    pos += 2; // image_minor
+    putU16At(buf, pos, 6);
+    pos += 2; // subsystem_major
+    putU16At(buf, pos, 0);
+    pos += 2; // subsystem_minor
+    putU32At(buf, pos, 0);
+    pos += 4; // win32_version_value = 0
+    putU32At(buf, pos, @as(u32, @intCast(size_of_image)));
+    pos += 4; // size_of_image
+    putU32At(buf, pos, @as(u32, @intCast(size_of_headers)));
+    pos += 4; // size_of_headers
+    putU32At(buf, pos, 0);
+    pos += 4; // checksum
+    putU16At(buf, pos, subsystem_val);
+    pos += 2; // subsystem
+    // dll_characteristics: NX_COMPAT | TERMINAL_SERVER_AWARE. Deliberately
+    // NOT DYNAMIC_BASE/HIGH_ENTROPY_VA: the image is emitted with
+    // relocs-stripped and a fixed preferred base, and Ferro writes absolute
+    // pointers for that base. With no .reloc section the loader could not
+    // fix anything up after moving the image, so ASLR must be off.
+    putU16At(buf, pos, 0x0120);
+    pos += 2;
+    putU64At(buf, pos, 0x1000000);
+    pos += 8; // size_of_stack_reserve (16 MB, match ore.exe)
+    putU64At(buf, pos, 0x1000);
+    pos += 8; // size_of_stack_commit
+    putU64At(buf, pos, 0x100000);
+    pos += 8; // size_of_heap_reserve
+    putU64At(buf, pos, 0x1000);
+    pos += 8; // size_of_heap_commit
+    putU32At(buf, pos, 0);
+    pos += 4; // loader_flags
+    putU32At(buf, pos, PeNumberOfRvaAndSizes);
+    pos += 4; // number_of_rva_and_sizes
     // data directories: 16 x 8 bytes. Entry 1 = import table (if present).
     const import_desc_rva: u64 = if (image.import_desc_addr > image.text.len)
         data_sec_vaddr + (image.import_desc_addr - image.text.len)
-    else 0;
+    else
+        0;
     const import_desc_size: u64 = if (import_desc_rva != 0) image.import_desc_size else 0;
     var di: u32 = 0;
     while (di < PeNumberOfRvaAndSizes) : (di += 1) {
         if (di == 1) {
-            putU32At(buf, pos, @as(u32, @intCast(import_desc_rva & 0xFFFFFFFF))); pos += 4;
-            putU32At(buf, pos, @as(u32, @intCast(import_desc_size & 0xFFFFFFFF))); pos += 4;
+            putU32At(buf, pos, @as(u32, @intCast(import_desc_rva & 0xFFFFFFFF)));
+            pos += 4;
+            putU32At(buf, pos, @as(u32, @intCast(import_desc_size & 0xFFFFFFFF)));
+            pos += 4;
         } else {
-            putU32At(buf, pos, 0); pos += 4;
-            putU32At(buf, pos, 0); pos += 4;
+            putU32At(buf, pos, 0);
+            pos += 4;
+            putU32At(buf, pos, 0);
+            pos += 4;
         }
     }
 
@@ -225,9 +275,9 @@ pub fn writeExecutablePe(
         for (0..8) |k| {
             buf[soff + @as(u64, k)] = if (k < sec_names[si].len) sec_names[si][k] else 0;
         }
-        putU32At(buf, soff + 8, @as(u32, @intCast(sec_vsizes[si])));       // virtual_size
-        putU32At(buf, soff + 12, @as(u32, @intCast(sec_vaddrs[si])));      // virtual_address
-        putU32At(buf, soff + 16, @as(u32, @intCast(sec_raw_sizes[si])));   // size_of_raw_data
+        putU32At(buf, soff + 8, @as(u32, @intCast(sec_vsizes[si]))); // virtual_size
+        putU32At(buf, soff + 12, @as(u32, @intCast(sec_vaddrs[si]))); // virtual_address
+        putU32At(buf, soff + 16, @as(u32, @intCast(sec_raw_sizes[si]))); // size_of_raw_data
         putU32At(buf, soff + 20, if (sec_raw_sizes[si] == 0) 0 else @as(u32, @intCast(sec_file_offs[si]))); // pointer_to_raw_data
         putU32At(buf, soff + 24, 0); // pointer_to_relocations (unused)
         putU32At(buf, soff + 28, 0); // pointer_to_line_numbers
@@ -250,6 +300,26 @@ pub fn writeExecutablePe(
     for (data, 0..data.len) |b, i| {
         buf[data_file_off + @as(u64, i)] = b;
     }
+    // Absolute 64-bit pointers in .data were written as merged-image
+    // offsets (base 0) by the relocation applier. The image loads at
+    // `PeImageBase` with .text at `PeSecAlign` and (relocs being stripped)
+    // the base never moves, so add the delta the loader won't. Import IAT
+    // slots are not in this list: the loader patches those itself.
+    for (image.addr64_sites.items) |site| {
+        const off = data_file_off + site;
+        const cur = readU64(buf, @intCast(off));
+        const patched = cur + PeImageBase + PeSecAlign;
+        putU64At(buf, off, patched);
+    }
 
     return buf;
+}
+
+fn readU64(buf: []const u8, pos: u64) u64 {
+    var v: u64 = 0;
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) {
+        v |= @as(u64, buf[pos + @as(u64, i)]) << i * 8;
+    }
+    return v;
 }

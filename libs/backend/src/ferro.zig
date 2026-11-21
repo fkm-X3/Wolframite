@@ -38,6 +38,9 @@ pub const linkOptionsFromDescription = ferro_types.linkOptionsFromDescription;
 
 pub const LinkError = ferro_types.LinkError;
 pub const Kernel32Imports = ferro_types.Kernel32Imports;
+pub const OsImportDll = ferro_types.OsImportDll;
+pub const os_import_dll_order = ferro_types.os_import_dll_order;
+pub const osImportDll = ferro_types.osImportDll;
 pub const isKernel32Import = ferro_types.isKernel32Import;
 pub const isOsImport = ferro_types.isOsImport;
 
@@ -65,7 +68,6 @@ const readU16 = ferro_reader.readU16;
 const readU32 = ferro_reader.readU32;
 const readU64 = ferro_reader.readU64;
 const readI64 = ferro_reader.readI64;
-
 
 /// Resolve every undefined symbol in `program` against `runtime`.
 ///
@@ -197,20 +199,15 @@ fn dumpObjectRelocs(
             },
         }
 
-        const near_i32_limit = rel.kind == .pc32 and (
-            @abs(disp_after - i32_min) <= near_limit or
-            @abs(disp_after - i32_max) <= near_limit
-        );
+        const near_i32_limit = rel.kind == .pc32 and (@abs(disp_after - i32_min) <= near_limit or
+            @abs(disp_after - i32_max) <= near_limit);
 
         _ = w.interface.print(
             "  {s} {s}+0x{x} -> {s} (0x{x}) | kind={s} addend={d} | before_disp={d} after_disp={d}{s}\n",
             .{
-                section_name, section_name, rel.offset,
-                if (sym_addr) |a| a.section else "?",
-                if (sym_addr) |a| a.value else 0,
-                kind_name, rel.addend,
-                rel.addend,
-                disp_after,
+                section_name,                                       section_name,                     rel.offset,
+                if (sym_addr) |a| a.section else "?",               if (sym_addr) |a| a.value else 0, kind_name,
+                rel.addend,                                         rel.addend,                       disp_after,
                 if (near_i32_limit) "  <-- near i32 limit" else "",
             },
         ) catch {};
@@ -224,7 +221,7 @@ fn dumpObjectRelocs(
             hex_buf[hex_len * 2 + 1] = nibbles[@intCast(before[i] & 0x0f)];
             hex_len += 1;
         }
-        _ = w.interface.print("    before bytes: {s}\n", .{hex_buf[0..hex_len * 2]}) catch {};
+        _ = w.interface.print("    before bytes: {s}\n", .{hex_buf[0 .. hex_len * 2]}) catch {};
     }
 }
 
@@ -525,12 +522,9 @@ test "readObject reads an ELF64 object Tungsten emitted (sections, symbols, relo
     const data_bytes = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0 };
 
     const symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6,
-            .binding = .global, .is_func = false },
-        obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6, .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
 
     const relocs = &.{
@@ -600,12 +594,9 @@ test "readObject reads a PE/COFF object (sections, symbols, relocations)" {
 
     // COFF section numbers are 1-based: .text=1, .data=2, .bss=3, 0=undefined.
     const symbols = &.{
-        obj_pe.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
-            .binding = .global, .is_func = true },
-        obj_pe.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6,
-            .binding = .global, .is_func = false },
-        obj_pe.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_pe.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4, .binding = .global, .is_func = true },
+        obj_pe.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 6, .binding = .global, .is_func = false },
+        obj_pe.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
 
     const relocs = &.{
@@ -702,10 +693,8 @@ test "resolveSymbols resolves an undefined program symbol against the runtime" {
     // Program object: _main defined in .text, puts undefined.
     const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 };
     const prog_symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_input = obj_elf.ObjectInput{
         .text = &prog_text,
@@ -725,8 +714,7 @@ test "resolveSymbols resolves an undefined program symbol against the runtime" {
     // Runtime object: puts defined in .text (section 1).
     const rt_text = [_]u8{ 0x90, 0x90 };
     const rt_symbols = &.{
-        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2, .binding = .global, .is_func = false },
     };
     const rt_input = obj_elf.ObjectInput{
         .text = &rt_text,
@@ -768,10 +756,8 @@ test "resolveSymbols reports UndefinedSymbol when the runtime does not define it
     // Program object: _main defined, nosuch_symbol undefined.
     const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 };
     const prog_symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "nosuch_symbol", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "nosuch_symbol", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_input = obj_elf.ObjectInput{
         .text = &prog_text,
@@ -791,8 +777,7 @@ test "resolveSymbols reports UndefinedSymbol when the runtime does not define it
     // Runtime object: does not define nosuch_symbol.
     const rt_text = [_]u8{ 0x90, 0x90 };
     const rt_symbols = &.{
-        obj_elf.Symbol{ .name = "other", .section_idx = 0, .value = 0, .size = 2,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "other", .section_idx = 0, .value = 0, .size = 2, .binding = .global, .is_func = false },
     };
     const rt_input = obj_elf.ObjectInput{
         .text = &rt_text,
@@ -833,12 +818,9 @@ test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
     const prog_text = [_]u8{ 0x48, 0x89, 0xf8, 0xc3 }; // mov rax, rdi; ret
     const prog_data = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // 8-byte placeholder for __g0 address
     const prog_symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 8,
-            .binding = .global, .is_func = false },
-        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 4, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "__g0", .section_idx = 2, .value = 0, .size = 8, .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_relocs = &.{
         obj_elf.Reloc{ .section_idx = 1, .offset = 0, .symbol = "puts", .kind = .pc32, .addend = -4 },
@@ -862,8 +844,7 @@ test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
     // Runtime object: puts defined at .text offset 0.
     const rt_text = [_]u8{ 0x90, 0x90 };
     const rt_symbols = &.{
-        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 2, .binding = .global, .is_func = false },
     };
     const rt_input = obj_elf.ObjectInput{
         .text = &rt_text,
@@ -939,27 +920,27 @@ test "writeExecutableElf produces an ELF executable whose _start calls _main" {
 
     // ELF header: ET_EXEC executable, x86-64.
     try std.testing.expectEqualSlices(u8, buf[0..4], &[_]u8{ 0x7f, 'E', 'L', 'F' });
-    try std.testing.expectEqual(2, readU16(buf, 16));      // e_type = ET_EXEC
-    try std.testing.expectEqual(62, readU16(buf, 18));     // e_machine = EM_X86_64
+    try std.testing.expectEqual(2, readU16(buf, 16)); // e_type = ET_EXEC
+    try std.testing.expectEqual(62, readU16(buf, 18)); // e_machine = EM_X86_64
     // e_entry = vaddr of _start = 0x4000b0 + start_offset(2) = 0x4000b2.
     try std.testing.expectEqual(0x4000b2, readU64(buf, 24));
 
     // Two PT_LOAD program headers at offset 64.
-    try std.testing.expectEqual(1, readU32(buf, 64 + 0));  // p_type = PT_LOAD (.text)
+    try std.testing.expectEqual(1, readU32(buf, 64 + 0)); // p_type = PT_LOAD (.text)
     try std.testing.expectEqual(1, readU32(buf, 64 + 56)); // p_type = PT_LOAD (.data)
 
     // .text content at file offset 64 + 2*56 = 176, followed by the _start stub.
     const text_file_off: u64 = 64 + 2 * 56;
-    try std.testing.expectEqualSlices(u8, buf[text_file_off..text_file_off + 2], &[_]u8{ 0x90, 0x90 });
+    try std.testing.expectEqualSlices(u8, buf[text_file_off .. text_file_off + 2], &[_]u8{ 0x90, 0x90 });
 
     const stub_off = text_file_off + 2;
     try std.testing.expectEqual(0xe8, buf[stub_off]); // E8 = call rel32
     // disp = main_addr(42) - start_offset(2) - 5 = 35 = 0x23 (little-endian).
-    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x23, 0x00, 0x00, 0x00 });
+    try std.testing.expectEqualSlices(u8, buf[stub_off + 1 .. stub_off + 5], &[_]u8{ 0x23, 0x00, 0x00, 0x00 });
     // mov edi,eax; mov eax,60; syscall
     try std.testing.expectEqualSlices(
         u8,
-        buf[stub_off + 5..stub_off + 14],
+        buf[stub_off + 5 .. stub_off + 14],
         &[_]u8{ 0x89, 0xc7, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05 },
     );
 }
@@ -969,7 +950,7 @@ test "writeExecutable reports UndefinedSymbol when entry symbol is absent" {
     const io = std.testing.io;
     var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
     defer symbols.deinit();
-    var prog_text = [_]u8{ 0x90 };
+    var prog_text = [_]u8{0x90};
     var prog_data = [_]u8{};
     var image = MergedImage{
         .text = &prog_text,
@@ -996,12 +977,10 @@ test "linkObject writes an ELF executable whose entry _start calls _main" {
     const obj_elf = @import("obj_elf.zig");
 
     // Program object: _main (ret) in .text, puts undefined.
-    var prog_text = [_]u8{ 0xc3 };
+    var prog_text = [_]u8{0xc3};
     const prog_symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "puts", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_input = obj_elf.ObjectInput{
         .text = &prog_text,
@@ -1019,10 +998,9 @@ test "linkObject writes an ELF executable whose entry _start calls _main" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
 
     // Runtime object: puts (nop) defined in .text.
-    const rt_text = [_]u8{ 0x90 };
+    const rt_text = [_]u8{0x90};
     const rt_symbols = &.{
-        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = false },
     };
     const rt_input = obj_elf.ObjectInput{
         .text = &rt_text,
@@ -1057,7 +1035,7 @@ test "linkObject writes an ELF executable whose entry _start calls _main" {
     const stub_off = text_file_off + 2; // after 2 bytes of merged .text
     try std.testing.expectEqual(0xe8, exe_bytes[stub_off]); // call rel32
     // disp = main_addr(0) - start_offset(2) - 5 = -7 = 0xfffffff9 (little-endian: f9 ff ff ff).
-    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
+    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1 .. stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
 }
 
 test "linkObject writes a PE executable whose entry main calls _main" {
@@ -1066,12 +1044,10 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     const obj_pe = @import("obj_pe.zig");
 
     // Program object: _main (ret) in .text, puts undefined.
-    var prog_text = [_]u8{ 0xc3 };
+    var prog_text = [_]u8{0xc3};
     const prog_symbols = &.{
-        obj_pe.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = true },
-        obj_pe.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_pe.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = true },
+        obj_pe.Symbol{ .name = "puts", .section_idx = 0, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_input = obj_pe.ObjectInput{
         .text = &prog_text,
@@ -1089,10 +1065,9 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
 
     // Runtime object: puts (nop) defined in .text.
-    const rt_text = [_]u8{ 0x90 };
+    const rt_text = [_]u8{0x90};
     const rt_symbols = &.{
-        obj_pe.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = false },
+        obj_pe.Symbol{ .name = "puts", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = false },
     };
     const rt_input = obj_pe.ObjectInput{
         .text = &rt_text,
@@ -1142,7 +1117,7 @@ test "linkObject writes a PE executable whose entry main calls _main" {
     try std.testing.expectEqual(0xe8, exe_bytes[stub_off]); // E8 = call rel32
     // disp = main_rel_addr(0) - stub_rel_addr(2) - 5 = -7 = 0xfffffff9 (little-endian: f9 ff ff ff).
     // (Both addresses are VA-relative with the 0x1000 .text base, which cancels.)
-    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1..stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
+    try std.testing.expectEqualSlices(u8, exe_bytes[stub_off + 1 .. stub_off + 5], &[_]u8{ 0xf9, 0xff, 0xff, 0xff });
     try std.testing.expectEqual(0xc3, exe_bytes[stub_off + 5]); // C3 = ret
 }
 
@@ -1151,12 +1126,10 @@ test "phase3: linux link of an object referencing a Windows import fails with Un
     const io = std.testing.io;
     const obj_elf = @import("obj_elf.zig");
 
-    var prog_text = [_]u8{ 0xc3 };
+    var prog_text = [_]u8{0xc3};
     const prog_symbols = &.{
-        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = true },
-        obj_elf.Symbol{ .name = "VirtualAlloc", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "_main", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = true },
+        obj_elf.Symbol{ .name = "VirtualAlloc", .section_idx = obj_elf.ShnUndef, .value = 0, .size = 0, .binding = .global, .is_func = false },
     };
     const prog_input = obj_elf.ObjectInput{
         .text = &prog_text,
@@ -1173,10 +1146,9 @@ test "phase3: linux link of an object referencing a Windows import fails with Un
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = prog_path, .data = prog_bytes });
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, prog_path) catch {};
 
-    const rt_text = [_]u8{ 0x90 };
+    const rt_text = [_]u8{0x90};
     const rt_symbols = &.{
-        obj_elf.Symbol{ .name = "other", .section_idx = 1, .value = 0, .size = 1,
-            .binding = .global, .is_func = false },
+        obj_elf.Symbol{ .name = "other", .section_idx = 1, .value = 0, .size = 1, .binding = .global, .is_func = false },
     };
     const rt_input = obj_elf.ObjectInput{
         .text = &rt_text,
@@ -1214,7 +1186,7 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
     defer symbols.deinit();
     try symbols.put("_main", .{ .section = ".text", .value = 10 });
 
-    var prog_text = [_]u8{ 0x90 };
+    var prog_text = [_]u8{0x90};
     var prog_data = [_]u8{};
     var image = MergedImage{
         .text = &prog_text,
@@ -1253,7 +1225,6 @@ test "writeExecutablePe produces a PE executable whose main calls _main" {
     try std.testing.expectEqual(0xe8, buf[stub_off]); // E8 = call rel32
     // disp = main_rel_addr(10) - stub_rel_addr(1) - 5 = 4 = 0x00000004 (LE: 04 00 00 00).
     // (Both addresses are VA-relative with the 0x1000 .text base, which cancels.)
-    try std.testing.expectEqualSlices(u8, buf[stub_off + 1..stub_off + 5], &[_]u8{ 0x04, 0x00, 0x00, 0x00 });
+    try std.testing.expectEqualSlices(u8, buf[stub_off + 1 .. stub_off + 5], &[_]u8{ 0x04, 0x00, 0x00, 0x00 });
     try std.testing.expectEqual(0xc3, buf[stub_off + 5]); // C3 = ret
 }
-

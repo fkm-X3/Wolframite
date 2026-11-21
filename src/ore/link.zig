@@ -185,7 +185,13 @@ pub fn linkBinary(
 
     var opts = ferro.defaultLinkOptions(target);
     opts.dump = dump_image;
-    if (ferro.linkObject(io, gpa, obj_path, wfr_std_lib, exe_path, opts)) |_| {} else |_| {
+    if (ferro.linkObject(io, gpa, obj_path, wfr_std_lib, exe_path, opts)) |_| {} else |err| {
+        // Name the underlying Ferro error: "link failed" alone gives the
+        // user nothing to act on (undefined symbol vs. bad object vs. I/O).
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.File.Writer = .init(.stderr(), io, &buf);
+        w.interface.print("ferro link error: {s}\n", .{@errorName(err)}) catch {};
+        w.interface.flush() catch {};
         return error.LinkFailed;
     }
 }

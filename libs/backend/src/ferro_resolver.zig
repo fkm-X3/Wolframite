@@ -63,6 +63,7 @@ pub fn resolveSymbols(
     for (result.undefined.items) |name| {
         if (!ferro_types.isOsImport(name, target)) {
             has_unresolved = true;
+            std.debug.print("ferro: undefined symbol '{s}'\n", .{name});
         }
     }
     if (has_unresolved) {

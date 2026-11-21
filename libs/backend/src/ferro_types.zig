@@ -307,16 +307,63 @@ pub const Kernel32Imports = [_][]const u8{
     "HeapAlloc",
 };
 
-/// Target-aware predicate: on Windows, `name` is an OS import (kernel32)
-/// resolved via the PE import directory; on Linux there are no such imports
-/// (the runtime talks to the OS via raw syscalls), so this always returns
-/// false for `.linux_x86_64`.
-pub fn isOsImport(name: []const u8, target: Target) bool {
-    if (target == .linux_x86_64) return false;
-    for (Kernel32Imports) |k| {
-        if (std.mem.eql(u8, name, k)) return true;
+/// The DLL that a Windows OS import resolves against.
+pub const OsImportDll = enum {
+    kernel32,
+    ntdll,
+
+    /// The DLL name as it must appear in the PE import descriptor.
+    pub fn dllName(self: OsImportDll) []const u8 {
+        return switch (self) {
+            .kernel32 => "kernel32.dll",
+            .ntdll => "ntdll.dll",
+        };
     }
-    return false;
+};
+
+/// The fixed emission order of import DLLs in the PE import directory
+/// (deterministic output regardless of undefined-symbol discovery order).
+pub const os_import_dll_order = [_]OsImportDll{ .kernel32, .ntdll };
+
+/// Size of the synthesized Windows entry stub (`call _main; ret`) that
+/// `writeExecutablePe` appends to merged `.text` before `.data` begins.
+/// Ferro's relocation model (the `.data` VA gap and import-table RVAs) must
+/// agree with that layout, so the size lives here for both to use.
+pub const pe_entry_stub_size: u64 = 6;
+
+/// Classify an undefined symbol that must resolve through the platform import
+/// table instead of the runtime archive. Returns null when `name` is not an
+/// OS import; on Linux this is always null (the runtime talks to the kernel
+/// via raw syscalls, so any undefined symbol there is a link error).
+///
+/// Two DLLs are recognized on Windows:
+///   - kernel32: the exact names in `Kernel32Imports` — the classic Win32
+///     console/process entry points the runtime calls directly;
+///   - ntdll: `Nt*`/`Zw*`/`Rtl*` prefixes, which is what the runtime's
+///     Zig-std portions reference (file I/O, heap, activation contexts,
+///     unwinding). ntdll is the system provider of those names — including
+///     the few `Rtl*` exports kernel32 also forwards — so prefix
+///     classification resolves correctly for both.
+pub fn osImportDll(name: []const u8, target: Target) ?OsImportDll {
+    if (target == .linux_x86_64) return null;
+    for (Kernel32Imports) |k| {
+        if (std.mem.eql(u8, name, k)) return .kernel32;
+    }
+    if (std.mem.startsWith(u8, name, "Nt") or
+        std.mem.startsWith(u8, name, "Zw") or
+        std.mem.startsWith(u8, name, "Rtl"))
+    {
+        return .ntdll;
+    }
+    return null;
+}
+
+/// Target-aware predicate: on Windows, `name` is an OS import resolved via
+/// the PE import directory; on Linux there are no such imports (the runtime
+/// talks to the OS via raw syscalls), so this always returns false for
+/// `.linux_x86_64`.
+pub fn isOsImport(name: []const u8, target: Target) bool {
+    return osImportDll(name, target) != null;
 }
 
 /// Backwards-compatible alias for the Windows-only predicate.
@@ -485,3 +532,32 @@ pub const MergedImage = struct {
         self.addr64_sites.deinit(gpa);
     }
 };
+
+const testing = std.testing;
+
+test "osImportDll classifies kernel32 whitelist names exactly" {
+    try testing.expectEqual(OsImportDll.kernel32, osImportDll("GetStdHandle", .windows_x86_64).?);
+    try testing.expectEqual(OsImportDll.kernel32, osImportDll("WriteFile", .windows_x86_64).?);
+    try testing.expectEqual(OsImportDll.kernel32, osImportDll("ExitProcess", .windows_x86_64).?);
+    // Not on the whitelist: even an Nt-like spelling of a kernel32 name is
+    // only an import if it is listed or matches an ntdll prefix.
+    try testing.expect(osImportDll("WriteFileEx", .windows_x86_64) == null);
+}
+
+test "osImportDll classifies ntdll prefixes (Nt*/Zw*/Rtl*)" {
+    try testing.expectEqual(OsImportDll.ntdll, osImportDll("NtWriteFile", .windows_x86_64).?);
+    try testing.expectEqual(OsImportDll.ntdll, osImportDll("ZwClose", .windows_x86_64).?);
+    try testing.expectEqual(OsImportDll.ntdll, osImportDll("RtlFreeHeap", .windows_x86_64).?);
+    try testing.expectEqual(OsImportDll.ntdll, osImportDll("RtlExitUserProcess", .windows_x86_64).?);
+}
+
+test "osImportDll returns null for non-import names and on Linux" {
+    try testing.expect(osImportDll("wfr_std_print", .windows_x86_64) == null);
+    try testing.expect(osImportDll("malloc", .windows_x86_64) == null);
+    try testing.expect(osImportDll("GetStdHandle", .linux_x86_64) == null);
+    try testing.expect(osImportDll("NtWriteFile", .linux_x86_64) == null);
+    try testing.expect(isOsImport("GetStdHandle", .windows_x86_64));
+    try testing.expect(!isOsImport("GetStdHandle", .linux_x86_64));
+    try testing.expectEqualStrings("kernel32.dll", OsImportDll.kernel32.dllName());
+    try testing.expectEqualStrings("ntdll.dll", OsImportDll.ntdll.dllName());
+}

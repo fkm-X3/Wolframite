@@ -174,44 +174,35 @@ pub fn applyRelocations(
         }
     }
 
-    // Split undefined symbols into OS imports (Windows kernel32) vs. unresolved.
-    // On Linux (or for any non-import name) there are no import thunks: an
-    // undefined symbol referenced by the *program* is a hard error rather
-    // than a silent `ret` stub. Symbols that only the runtime archive
+    // Split undefined symbols into OS imports (Windows kernel32/ntdll) vs.
+    // unresolved. On Linux (or for any non-import name) there are no import
+    // thunks: an undefined symbol referenced by the *program* is a hard error
+    // rather than a silent `ret` stub. Symbols that only the runtime archive
     // references internally (e.g. compiler-rt helpers) keep a `ret` stub.
     var import_names = std.ArrayList([]const u8).empty;
     defer import_names.deinit(gpa);
+    var import_dlls = std.ArrayList(ferro_types.OsImportDll).empty;
+    defer import_dlls.deinit(gpa);
     var stub_total_size: u64 = 0;
     for (undef_names.items) |name| {
-        if (ferro_types.isOsImport(name, target)) {
+        if (ferro_types.osImportDll(name, target)) |dll| {
             try import_names.append(gpa, name);
+            try import_dlls.append(gpa, dll);
             stub_total_size += 6;
         } else {
             // Is this name referenced by the program object?
             var from_prog = false;
             for (prog_undef_names.items) |pn| {
-                if (std.mem.eql(u8, pn, name)) { from_prog = true; break; }
+                if (std.mem.eql(u8, pn, name)) {
+                    from_prog = true;
+                    break;
+                }
             }
             if (from_prog) return error.UndefinedSymbol;
             // Runtime-internal: keep a 1-byte `ret` stub.
             stub_total_size += 1;
         }
     }
-
-    // Import data size (IAT + INT + name entries + dll name + descriptor).
-    var import_data_size: u64 = 0;
-    if (import_names.items.len > 0) {
-        import_data_size += @as(u64, import_names.items.len + 1) * 8; // IAT
-        import_data_size += @as(u64, import_names.items.len + 1) * 8; // INT
-        for (import_names.items) |name| {
-            import_data_size += 2 + name.len + 1; // hint + name + null
-            if (import_data_size % 2 != 0) import_data_size += 1;
-        }
-        import_data_size += "kernel32.dll".len + 1; // dll name
-        import_data_size += 40; // descriptor + null terminator
-    }
-
-    const merged_data_size = prog_data_size + rt_data_size + import_data_size;
 
     // ---- Build symbol address map ----
     var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
@@ -253,13 +244,19 @@ pub fn applyRelocations(
         try symbols.put(name, .{ .section = ".text", .value = off });
     }
 
-    // data_base is now after .text including stubs/thunks.
+    // data_base is now after .text including stubs/thunks. On Windows the PE
+    // writer appends the synthesized entry stub (`pe_entry_stub_size` bytes)
+    // to merged .text before .data begins, so .data's VA is the page-aligned
+    // address after `data_base + pe_entry_stub_size`. The gap must be taken
+    // from that layout or every .data reference is off by up to the stub
+    // size whenever `data_base + stub` crosses a page boundary.
     const data_base = merged_text_size + stub_total_size;
     const data_va_gap: u64 = switch (target) {
         .linux_x86_64 => 0,
         .windows_x86_64 => blk: {
             const aln: u64 = 0x1000;
-            break :blk (data_base + aln - 1) / aln * aln - data_base;
+            const data_start = data_base + ferro_types.pe_entry_stub_size;
+            break :blk (data_start + aln - 1) / aln * aln - data_base;
         },
     };
 
@@ -322,7 +319,157 @@ pub fn applyRelocations(
         try symbols.put(name, .{ .section = ".text", .value = off });
     }
 
-    // Build merged .data.
+    // ---- Build the PE import block (per-DLL IAT/INT arrays, hint/name
+    // entries, DLL names, then the descriptor array). The block is laid out
+    // and filled in its own buffer first so `merged_data` can be allocated
+    // with the exact final size; it is appended after the program and
+    // runtime data. There is one descriptor per used DLL, in the fixed
+    // emission order (`os_import_dll_order`), followed by the all-zero
+    // terminator descriptor the loader expects.
+    var import_block = std.ArrayList(u8).empty;
+    defer import_block.deinit(gpa);
+    var import_thunks = std.ArrayList(ImportThunk).empty;
+    var import_desc_addr: u64 = 0;
+    var import_desc_size: u64 = 0;
+    if (import_names.items.len > 0) {
+        const block_data_off = prog_data_size + rt_data_size; // offset within merged .data
+        const block_merged_base = data_base + block_data_off; // merged-image address
+
+        // PE RVA conversion helpers (PE layout constants). These must match
+        // `writeExecutablePe`: .data's VA is the page-aligned address after
+        // merged .text plus the synthesized entry stub.
+        const pe_text_base: u64 = 0x1000;
+        const pe_data_vaddr = (pe_text_base + data_base + ferro_types.pe_entry_stub_size + 0xFFF) & ~@as(u64, 0xFFF);
+        const toDataRva = struct {
+            fn f(merged_addr: u64, text_len: u64, data_vaddr: u64) u64 {
+                return data_vaddr + (merged_addr - text_len);
+            }
+        }.f;
+
+        // Slot index of each DLL in the fixed emission order.
+        const dllSlot = struct {
+            fn f(dll: ferro_types.OsImportDll) usize {
+                for (ferro_types.os_import_dll_order, 0..) |d, i| {
+                    if (d == dll) return i;
+                }
+                unreachable;
+            }
+        }.f;
+
+        const group_count = ferro_types.os_import_dll_order.len;
+        var counts: [group_count]usize = @splat(0);
+        for (import_dlls.items) |d| counts[dllSlot(d)] += 1;
+        var used_dlls: usize = 0;
+        for (counts) |n| {
+            if (n > 0) used_dlls += 1;
+        }
+
+        // ---- Pass 1: layout. ----
+        var iat_off: [group_count]u64 = undefined;
+        var int_off: [group_count]u64 = undefined;
+        var dll_name_off: [group_count]u64 = undefined;
+        const name_entry_off = try gpa.alloc(u64, import_names.items.len);
+        defer gpa.free(name_entry_off);
+
+        var o: u64 = 0;
+        for (ferro_types.os_import_dll_order, 0..) |_, gi| {
+            if (counts[gi] == 0) continue;
+            iat_off[gi] = o;
+            o += @as(u64, counts[gi] + 1) * 8; // IAT + terminator
+            int_off[gi] = o;
+            o += @as(u64, counts[gi] + 1) * 8; // INT + terminator
+        }
+        for (import_names.items, 0..) |name, i| {
+            name_entry_off[i] = o;
+            o += 2 + name.len + 1; // hint + name + NUL
+            if (o % 2 != 0) o += 1; // next entry starts 2-aligned
+        }
+        for (ferro_types.os_import_dll_order, 0..) |dll, gi| {
+            if (counts[gi] == 0) continue;
+            dll_name_off[gi] = o;
+            o += dll.dllName().len + 1;
+        }
+        o = (o + 3) & ~@as(u64, 3); // descriptors hold u32s: 4-align
+        const desc_array_off = o;
+        o += @as(u64, used_dlls + 1) * 20; // descriptors + terminator
+
+        // ---- Pass 2: fill. ----
+        const block = try gpa.alloc(u8, @intCast(o));
+        defer gpa.free(block);
+        for (block) |*b| b.* = 0;
+
+        for (ferro_types.os_import_dll_order, 0..) |dll, gi| {
+            if (counts[gi] == 0) continue;
+            const dll_name = dll.dllName();
+            for (dll_name, 0..) |c, k| {
+                block[@as(usize, dll_name_off[gi]) + k] = c;
+            }
+        }
+        var slot: [group_count]usize = @splat(0);
+        for (import_names.items, 0..) |name, i| {
+            const gi = dllSlot(import_dlls.items[i]);
+            const k = slot[gi];
+            slot[gi] += 1;
+            const name_rva = toDataRva(block_merged_base + name_entry_off[i], data_base, pe_data_vaddr);
+            writeU64At(block, iat_off[gi] + @as(u64, k) * 8, name_rva);
+            writeU64At(block, int_off[gi] + @as(u64, k) * 8, name_rva);
+            // hint (2 bytes, 0) + name + NUL — hint and NUL already zero.
+            for (name, 0..) |c, kk| {
+                block[@as(usize, name_entry_off[i]) + 2 + kk] = c;
+            }
+        }
+        var desc_i: usize = 0;
+        for (ferro_types.os_import_dll_order, 0..) |_, gi| {
+            if (counts[gi] == 0) continue;
+            const d = desc_array_off + @as(u64, desc_i) * 20;
+            desc_i += 1;
+            writeU32At(block, d + 0, @truncate(toDataRva(block_merged_base + int_off[gi], data_base, pe_data_vaddr))); // OriginalFirstThunk
+            writeU32At(block, d + 4, 0); // TimeDateStamp
+            writeU32At(block, d + 8, 0); // ForwarderChain
+            writeU32At(block, d + 12, @truncate(toDataRva(block_merged_base + dll_name_off[gi], data_base, pe_data_vaddr))); // Name
+            writeU32At(block, d + 16, @truncate(toDataRva(block_merged_base + iat_off[gi], data_base, pe_data_vaddr))); // FirstThunk
+        }
+        // The all-zero terminator descriptor is already zero.
+
+        import_desc_addr = block_merged_base + desc_array_off;
+        import_desc_size = @as(u64, used_dlls + 1) * 20;
+
+        // Fill import thunks (jmp [rip+disp32] into the owning DLL's IAT
+        // slot). Each thunk is the 6 bytes `ff 25 disp32`.
+        @memset(&slot, 0);
+        for (import_names.items, 0..) |name, i| {
+            const gi = dllSlot(import_dlls.items[i]);
+            const k = slot[gi];
+            slot[gi] += 1;
+            const thunk_off = stub_offsets.get(name).?;
+            const iat_slot_merged = block_merged_base + iat_off[gi] + @as(u64, k) * 8;
+            const iat_slot_rva = toDataRva(iat_slot_merged, data_base, pe_data_vaddr);
+            const thunk_rva = pe_text_base + thunk_off;
+            // disp for jmp [rip+disp]: target RIP-relative = iat_slot_rva - (thunk_rva + 6)
+            const disp: i64 = @as(i64, @bitCast(iat_slot_rva)) - @as(i64, @bitCast(thunk_rva + 6));
+            merged_text[@as(usize, thunk_off)] = 0xff;
+            merged_text[@as(usize, thunk_off + 1)] = 0x25;
+            const disp32: i32 = @intCast(disp);
+            const bytes = std.mem.asBytes(&disp32);
+            for (0..4) |kk| {
+                merged_text[@as(usize, thunk_off + 2 + kk)] = bytes[kk];
+            }
+
+            try import_thunks.append(gpa, .{
+                .name = try gpa.dupe(u8, name),
+                .rva = thunk_off,
+                .thunk_addr = thunk_off,
+                .iat_slot_addr = iat_slot_merged,
+                .name_entry_addr = block_merged_base + name_entry_off[i],
+            });
+        }
+
+        for (block) |b| try import_block.append(gpa, b);
+    }
+
+    // Build merged .data: program data, then runtime data, then the import
+    // block (whose IAT slots the Windows loader patches at load time).
+    const merged_data_size = prog_data_size + rt_data_size + import_block.items.len;
     var merged_data = try gpa.alloc(u8, merged_data_size);
     for (merged_data) |*b| b.* = 0;
     if (prog_data_size > 0) {
@@ -337,120 +484,9 @@ pub fn applyRelocations(
             merged_data[@as(usize, prog_data_size) + i] = rt_data.content[i];
         }
     }
-
-    // Fill import data structures in merged .data.
-    var import_thunks = std.ArrayList(ImportThunk).empty;
-    var import_desc_addr: u64 = 0;
-    if (import_names.items.len > 0) {
-        const base_imp = prog_data_size + rt_data_size;
-        var o: u64 = base_imp;
-
-        // IAT array.
-        const iat_off = o;
-        o += @as(u64, import_names.items.len + 1) * 8;
-        // INT array.
-        const int_off = o;
-        o += @as(u64, import_names.items.len + 1) * 8;
-
-        // Name entries.
-        var name_entry_offs = try gpa.alloc(u64, import_names.items.len);
-        defer gpa.free(name_entry_offs);
-        for (import_names.items, 0..) |name, i| {
-            name_entry_offs[i] = o;
-            // hint (2 bytes) + name + null
-            merged_data[@as(usize, o)] = 0;
-            merged_data[@as(usize, o + 1)] = 0;
-            o += 2;
-            for (name, 0..) |c, k| {
-                merged_data[@as(usize, o + k)] = c;
-            }
-            o += name.len;
-            merged_data[@as(usize, o)] = 0;
-            o += 1;
-            if (o % 2 != 0) o += 1;
-        }
-
-        // DLL name.
-        const dll_name_off = o;
-        const dll_name = "kernel32.dll";
-        for (dll_name, 0..) |c, k| {
-            merged_data[@as(usize, o + k)] = c;
-        }
-        o += dll_name.len;
-        merged_data[@as(usize, o)] = 0;
-        o += 1;
-
-        // Descriptor (+ null terminator) = 40 bytes.
-        const desc_off = o;
-        o += 40;
-
-        // PE RVA conversion helpers (PE layout constants).
-        const pe_text_base: u64 = 0x1000;
-        const full_text_size = data_base; // merged text len including stubs
-        const pe_data_vaddr = (pe_text_base + full_text_size + 0xFFF) & ~@as(u64, 0xFFF);
-
-        const toDataRva = struct {
-            fn f(merged_addr: u64, text_len: u64, data_vaddr: u64) u64 {
-                return data_vaddr + (merged_addr - text_len);
-            }
-        }.f;
-
-        // Fill IAT and INT arrays with RVAs of name entries.
-        for (import_names.items, 0..) |_, i| {
-            const name_rva = toDataRva(data_base + name_entry_offs[i], data_base, pe_data_vaddr);
-            // IAT slot
-            const iat_slot_merged = data_base + iat_off + @as(u64, i) * 8;
-            _ = iat_slot_merged;
-            writeU64At(merged_data, iat_off + @as(u64, i) * 8, name_rva);
-            writeU64At(merged_data, int_off + @as(u64, i) * 8, name_rva);
-        }
-        // terminators already zero.
-
-        // Fill descriptor.
-        const int_rva = toDataRva(data_base + int_off, data_base, pe_data_vaddr);
-        const iat_rva = toDataRva(data_base + iat_off, data_base, pe_data_vaddr);
-        const dll_name_rva = toDataRva(data_base + dll_name_off, data_base, pe_data_vaddr);
-        // descriptor at desc_off (relative to merged_data start? desc_off is offset within merged_data)
-        const desc_merged_offset = desc_off; // offset within merged_data
-        // write 20-byte descriptor
-        writeU32At(merged_data, desc_merged_offset + 0, @truncate(int_rva)); // OriginalFirstThunk
-        writeU32At(merged_data, desc_merged_offset + 4, 0); // TimeDateStamp
-        writeU32At(merged_data, desc_merged_offset + 8, 0); // ForwarderChain
-        writeU32At(merged_data, desc_merged_offset + 12, @truncate(dll_name_rva)); // Name
-        writeU32At(merged_data, desc_merged_offset + 16, @truncate(iat_rva)); // FirstThunk
-        // null terminator descriptor already zero.
-
-        import_desc_addr = data_base + desc_off;
-
-        // Fill import thunks (jmp [rip+disp] to IAT slot).
-        for (import_names.items, 0..) |name, i| {
-            const thunk_off = stub_offsets.get(name).?;
-            const iat_slot_merged = data_base + iat_off + @as(u64, i) * 8;
-            const iat_slot_rva = toDataRva(iat_slot_merged, data_base, pe_data_vaddr);
-            const thunk_rva = pe_text_base + thunk_off;
-            // disp for jmp [rip+disp]: target RIP-relative = iat_slot_rva - (thunk_rva + 6)
-            const disp: i64 = @as(i64, @bitCast(iat_slot_rva)) - @as(i64, @bitCast(thunk_rva + 6));
-            merged_text[@as(usize, thunk_off)] = 0xff;
-            merged_text[@as(usize, thunk_off + 1)] = 0x25;
-            const disp32: i32 = @intCast(disp);
-            const bytes = std.mem.asBytes(&disp32);
-            for (0..4) |k| {
-                merged_text[@as(usize, thunk_off + 2 + k)] = bytes[k];
-            }
-            // 6th byte already 0? jmp instruction is 6 bytes: ff 25 disp32. That's 6. Good.
-
-            const iat_slot_merged_addr = iat_slot_merged;
-            const name_entry_merged_addr = data_base + name_entry_offs[i];
-            try import_thunks.append(gpa, .{
-                .name = try gpa.dupe(u8, name),
-                .rva = thunk_off,
-                .thunk_addr = thunk_off,
-                .iat_slot_addr = iat_slot_merged_addr,
-                .name_entry_addr = name_entry_merged_addr,
-            });
-        }
+    for (import_block.items, 0..) |b, i| {
+        merged_data[@as(usize, prog_data_size) + @as(usize, rt_data_size) + i] = b;
     }
-
 
     var abs32_sites = std.ArrayList(u64).empty;
     var addr64_sites = std.ArrayList(u64).empty;
@@ -479,10 +515,13 @@ pub fn applyRelocations(
             try abs32_sites.append(gpa, prog_text_size + rel.offset);
         }
         if (rel.kind == .addr64 and rel.section_idx == 2) {
-            try addr64_sites.append(gpa, data_base + prog_data_size + rel.offset);
+            // Merged-.data-relative offset: the executable writers patch at
+            // `data_file_off + site`, so the site must not include the
+            // merged text length. (Including it made the ELF writer patch
+            // past .data — and out of the file buffer entirely.)
+            try addr64_sites.append(gpa, prog_data_size + rel.offset);
         }
     }
-
 
     return MergedImage{
         .text = merged_text,
@@ -491,7 +530,7 @@ pub fn applyRelocations(
         .symbols = symbols,
         .import_thunks = import_thunks,
         .import_desc_addr = import_desc_addr,
-        .import_desc_size = if (import_desc_addr != 0) 40 else 0,
+        .import_desc_size = import_desc_size,
         .abs32_sites = abs32_sites,
         .addr64_sites = addr64_sites,
     };

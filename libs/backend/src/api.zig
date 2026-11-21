@@ -97,6 +97,12 @@ pub const Context = struct {
             .module = .empty,
             .builder = undefined,
         };
+        // Propagate the target into the module: codegen reads
+        // `module.target` to pick the platform calling convention (SysV
+        // register/stack layout vs Win64 shadow space). Leaving it at the
+        // module default (.linux_x86_64) made every Windows object marshal
+        // arguments in SysV registers — extern calls read garbage.
+        ctx.module.target = target;
         ctx.builder = ir.Builder.init(gpa, &ctx.module);
         return ctx;
     }
@@ -176,7 +182,7 @@ pub const Context = struct {
 
     /// Get a reference to a function by index.
     pub fn getFunction(self: *Context, idx: FunctionIdx) *ir.Function {
-        return &self.module.functions.items[@intFromEnum(idx)];
+        return &self.module.functions.items[@backingInt(idx)];
     }
 
     /// Return the number of functions in the module.
@@ -186,18 +192,18 @@ pub const Context = struct {
 
     /// Get the name of a function.
     pub fn getFunctionName(self: *Context, idx: FunctionIdx) []const u8 {
-        const func = self.module.functions.items[@intFromEnum(idx)];
+        const func = self.module.functions.items[@backingInt(idx)];
         return self.module.strings.get(func.name);
     }
 
     /// Return the number of basic blocks in the given function.
     pub fn getBlockCountIn(self: *Context, idx: FunctionIdx) usize {
-        return self.module.functions.items[@intFromEnum(idx)].blocks.items.len;
+        return self.module.functions.items[@backingInt(idx)].blocks.items.len;
     }
 
     /// Return the number of instructions in the given function.
     pub fn getInstructionCountIn(self: *Context, idx: FunctionIdx) usize {
-        return self.module.functions.items[@intFromEnum(idx)].instructions.items.len;
+        return self.module.functions.items[@backingInt(idx)].instructions.items.len;
     }
 
     // ========================================================================
@@ -246,7 +252,7 @@ pub const Context = struct {
     /// Parameters are numbered from 0. The Nth parameter of the current
     /// function is `getParam(N)`.
     pub fn getParam(_: *Context, index: u32) Value {
-        return @enumFromInt(index);
+        return @fromBackingInt(@intCast(index));
     }
 
     // ========================================================================
@@ -537,7 +543,7 @@ pub const Context = struct {
                     .relocs = pe_relocs,
                 };
                 bytes = try w.writeObject(pe_input);
-            }
+            },
         }
         return bytes;
     }
@@ -621,7 +627,7 @@ test "fibonacci with control flow" {
     ctx.setCurrentBlock(entry);
 
     const n = ctx.getParam(0);
-    const zero = @as(Value, @enumFromInt(0));
+    const zero = @as(Value, @fromBackingInt(@intCast(0)));
     const cond = try ctx.buildIcmp(.icmp_sle, i32_ty, n, zero);
 
     const base = try ctx.appendBlock();
@@ -650,7 +656,7 @@ test "print textual IR" {
     const entry = try ctx.appendBlock();
     ctx.setCurrentBlock(entry);
 
-    const zero = @as(Value, @enumFromInt(0));
+    const zero = @as(Value, @fromBackingInt(@intCast(0)));
     _ = try ctx.buildRet(zero);
 
     var buf: [4096]u8 = undefined;
@@ -829,7 +835,7 @@ test "emit object with globals and an indirect call" {
 
     // .data holds the "greeting" string; greeting and _helper appear as symbol
     // names.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{'h', 'i', 0}) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, &[_]u8{ 'h', 'i', 0 }) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "greeting") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "_helper") != null);
 }
