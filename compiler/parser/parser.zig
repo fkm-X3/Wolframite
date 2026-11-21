@@ -137,6 +137,24 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Accept a struct field name: an identifier, or a keyword-spelled name.
+    /// Keyword-spelled fields (`.test = true`, `test: bool`) appear in
+    /// smeltfile tasks; in field position a keyword token
+    /// can only be a name.
+    fn expectFieldName(self: *Parser) ?Token {
+        if (self.check(.identifier)) {
+            return self.advance();
+        }
+        const tok = self.peek();
+        switch (tok.tag) {
+            .fn_kw, .let_kw, .mut_kw, .struct_kw, .enum_kw, .return_kw, .if_kw, .else_kw, .while_kw, .for_kw, .in_kw, .match_kw, .import_kw, .as_kw, .defer_kw, .true_kw, .false_kw, .null_kw, .comptime_kw, .move_kw, .region_kw, .test_kw => {
+                _ = self.advance();
+                return tok;
+            },
+            else => return null,
+        }
+    }
+
     fn skipNewlinesAndSemicolons(self: *Parser) void {
         while (self.pos < self.tokens.len) {
             const tok = self.peek();
@@ -533,7 +551,7 @@ pub const Parser = struct {
     }
 
     fn parseField(self: *Parser) ?NodeIdx {
-        const name_tok = self.expect(.identifier) orelse return null;
+        const name_tok = self.expectFieldName() orelse return null;
         if (self.expect(.colon) == null) return null;
         const ty = self.parseTypeRepr() orelse return null;
         return self.appendNode(.{ .field = .{ .name = self.makeStringRef(name_tok), .ty = ty } });
@@ -1180,7 +1198,7 @@ pub const Parser = struct {
             }
 
             if (self.expect(.dot) == null) break;
-            const name_tok = self.expect(.identifier) orelse break;
+            const name_tok = self.expectFieldName() orelse break;
             if (self.expect(.eq) == null) break;
             const value = self.parseExpr(Precedence.none.toInt()) orelse break;
 
