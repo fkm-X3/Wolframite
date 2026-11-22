@@ -126,5 +126,7 @@ require a new ADR.
 
 ## Related
 
+- `adr_ferro_tls.md` — the additional `.tls$`, `.tdata`/`.tbss`, SECREL, and
+  TPOFF32 contracts used by the Zig runtime.
 - `libs/backend/src/codegen.zig` — existing NASM emission (`section .text`,
   `section .data`, `extern` handling, `__gN` / `_{func}` naming)

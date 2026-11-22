@@ -43,6 +43,9 @@ pub fn resolveSymbols(
         // Skip the ELF STN_UNDEF null symbol (index 0, empty name).
         if (sym.name.len == 0) continue;
         if (sym.section == null) {
+            // PE's TLS index is synthesized by the relocation/layout stage;
+            // the loader initializes it before the process entry point.
+            if (target == .windows_x86_64 and std.mem.eql(u8, sym.name, "_tls_index")) continue;
             if (runtime_defined.get(sym.name)) |addr| {
                 result.resolved.put(sym.name, addr) catch |err| switch (err) {
                     else => return LinkError.WriteFailed,

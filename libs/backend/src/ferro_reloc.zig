@@ -27,6 +27,39 @@ fn sectionSize(obj: *Object, name: []const u8) u64 {
     return sec.size;
 }
 
+fn findTlsDataSection(obj: *Object) ?*Section {
+    // `.tls` is the archive merge's canonical spelling; the other two are
+    // accepted for directly-read COFF and ELF objects.
+    return findSectionByName(obj, ".tls") orelse
+        findSectionByName(obj, ".tls$") orelse
+        findSectionByName(obj, ".tdata");
+}
+
+fn tlsDataSize(obj: *Object) u64 {
+    const sec = findTlsDataSection(obj) orelse return 0;
+    return sec.size;
+}
+
+fn tlsDataAlignment(obj: *Object) u64 {
+    const sec = findTlsDataSection(obj) orelse return 8;
+    return @max(8, sec.alignment);
+}
+
+fn tlsBssSize(obj: *Object) u64 {
+    return sectionSize(obj, ".tbss");
+}
+
+fn tlsBssAlignment(obj: *Object) u64 {
+    const sec = findSectionByName(obj, ".tbss") orelse return 8;
+    return @max(8, sec.alignment);
+}
+
+fn isTlsDataSectionName(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".tls") or
+        std.mem.eql(u8, name, ".tls$") or
+        std.mem.eql(u8, name, ".tdata");
+}
+
 /// Apply a single relocation to `buf` (merged .text or .data).
 ///
 /// `section_base` is the merged-image address where `buf` starts.
@@ -38,9 +71,16 @@ fn applyReloc(
     symbols: *std.StringHashMap(ResolvedSymbol),
     gap: u64,
     target: ferro_types.Target,
+    aligned_tls_size: u64,
 ) !void {
     _ = target;
     const sym_addr = symbols.get(rel.symbol) orelse return error.RelocationFailed;
+    const symbol_is_tls = std.mem.eql(u8, sym_addr.section, ".tls");
+    if (symbol_is_tls != (rel.kind == .secrel32 or rel.kind == .tpoff32)) {
+        // A TLS offset is meaningful only to the platform's TLS relocation;
+        // conversely those relocations cannot target process-global storage.
+        return error.RelocationFailed;
+    }
     // Convert merged addresses to virtual-address offsets (relative to the
     // text section base) so cross-section references account for any alignment
     // gap between .text and .data (e.g. PE section alignment).
@@ -89,6 +129,26 @@ fn applyReloc(
             for (bytes, 0..4) |b, i| {
                 buf[off + i] = b;
             }
+        },
+        .secrel32 => {
+            // The PE loader returns a pointer to this thread's copy of the
+            // template; SECREL is only the symbol's byte offset within it.
+            const value: i64 = @as(i64, @intCast(sym_addr.value)) + rel.addend;
+            if (value < 0 or value > std.math.maxInt(u32)) return error.RelocationFailed;
+            if (off + 4 > buf.len) return error.RelocationFailed;
+            const v: u32 = @intCast(value);
+            const bytes = std.mem.asBytes(&v);
+            for (bytes, 0..4) |b, i| buf[off + i] = b;
+        },
+        .tpoff32 => {
+            // x86_64 static TLS variant II places the thread pointer after
+            // the aligned TLS block, so offsets grow backwards from FS:0.
+            const value: i64 = @as(i64, @intCast(sym_addr.value)) + rel.addend - @as(i64, @intCast(aligned_tls_size));
+            if (value < std.math.minInt(i32) or value > std.math.maxInt(i32)) return error.RelocationFailed;
+            if (off + 4 > buf.len) return error.RelocationFailed;
+            const v: i32 = @intCast(value);
+            const bytes = std.mem.asBytes(&v);
+            for (bytes, 0..4) |b, i| buf[off + i] = b;
         },
     }
 }
@@ -142,6 +202,19 @@ pub fn applyRelocations(
     const rt_data_size = rt_data.size;
     const prog_bss_size = sectionSize(program, ".bss");
     const rt_bss_size = sectionSize(runtime, ".bss");
+    const prog_tls_size = tlsDataSize(program);
+    const rt_tls_size = tlsDataSize(runtime);
+    const prog_tbss_size = tlsBssSize(program);
+    const rt_tbss_size = tlsBssSize(runtime);
+    const rt_tls_base = std.mem.alignForward(u64, prog_tls_size, tlsDataAlignment(runtime));
+    const rt_tbss_base = std.mem.alignForward(u64, prog_tbss_size, tlsBssAlignment(runtime));
+    const merged_tls_size = rt_tls_base + rt_tls_size;
+    const merged_tbss_size = rt_tbss_base + rt_tbss_size;
+    const tls_alignment = @max(
+        @max(tlsDataAlignment(program), tlsDataAlignment(runtime)),
+        @max(tlsBssAlignment(program), tlsBssAlignment(runtime)),
+    );
+    const aligned_tls_size = std.mem.alignForward(u64, merged_tls_size + merged_tbss_size, tls_alignment);
 
     // Merged layout (relative addresses starting at 0).
     const merged_text_size = prog_text_size + rt_text_size;
@@ -163,12 +236,14 @@ pub fn applyRelocations(
     }.f;
 
     for (program.relocations.items) |rel| {
+        if (target == .windows_x86_64 and std.mem.eql(u8, rel.symbol, "_tls_index")) continue;
         if (symbolNeedsStub(program, runtime, resolved, rel.symbol)) {
             try appendUndef(&undef_names, gpa, rel.symbol);
             try appendUndef(&prog_undef_names, gpa, rel.symbol);
         }
     }
     for (runtime.relocations.items) |rel| {
+        if (target == .windows_x86_64 and std.mem.eql(u8, rel.symbol, "_tls_index")) continue;
         if (symbolNeedsStub(program, runtime, resolved, rel.symbol)) {
             try appendUndef(&undef_names, gpa, rel.symbol);
         }
@@ -252,7 +327,16 @@ pub fn applyRelocations(
     // size whenever `data_base + stub` crosses a page boundary.
     const data_base = merged_text_size + stub_total_size;
     const data_va_gap: u64 = switch (target) {
-        .linux_x86_64 => 0,
+        .linux_x86_64 => blk: {
+            // PT_LOAD segments must not share a page with incompatible
+            // permissions, especially the page containing the entry stub.
+            const has_tls = merged_tls_size + merged_tbss_size > 0;
+            const entry_stub_size: u64 = if (has_tls) 34 else 14;
+            const phdr_count: u64 = if (has_tls) 4 else 2;
+            const header_size: u64 = 64 + phdr_count * 56;
+            const data_file_off = std.mem.alignForward(u64, header_size + data_base + entry_stub_size, 0x1000);
+            break :blk data_file_off - header_size - data_base;
+        },
         .windows_x86_64 => blk: {
             const aln: u64 = 0x1000;
             const data_start = data_base + ferro_types.pe_entry_stub_size;
@@ -260,39 +344,61 @@ pub fn applyRelocations(
         },
     };
 
+    // The Windows loader writes this module's TLS slot here before entry.
+    // Keep the cell in writable .data and point every _tls_index REL32 at it.
+    const emit_tls_index = target == .windows_x86_64 and merged_tls_size + merged_tbss_size > 0;
+    const ordinary_data_size = prog_data_size + rt_data_size;
+    const tls_index_offset = if (emit_tls_index) std.mem.alignForward(u64, ordinary_data_size, 4) else ordinary_data_size;
+    const tls_index_size: u64 = if (emit_tls_index) 4 else 0;
+    const import_data_offset = tls_index_offset + tls_index_size;
+
     // Program-defined symbols (.text / .data only).
     for (program.symbols.items) |sym| {
         if (sym.section == null) continue;
         const sec = sym.section.?;
         if (std.mem.startsWith(u8, sym.name, ".")) continue;
         var addr: u64 = 0;
+        var out_sec = sec;
         if (std.mem.eql(u8, sec, ".text")) {
             addr = sym.value;
         } else if (std.mem.eql(u8, sec, ".data")) {
             addr = data_base + sym.value;
+        } else if (isTlsDataSectionName(sec)) {
+            addr = sym.value;
+            out_sec = ".tls";
+        } else if (std.mem.eql(u8, sec, ".tbss")) {
+            addr = merged_tls_size + sym.value;
+            out_sec = ".tls";
         } else {
             continue;
         }
         if (symbols.get(sym.name) == null) {
-            try symbols.put(sym.name, .{ .section = sec, .value = addr });
+            try symbols.put(sym.name, .{ .section = out_sec, .value = addr });
         }
     }
 
-    // Runtime-defined symbols (.text / .data only). First definition wins.
+    // Runtime-defined symbols (.text / .data / TLS only). First definition wins.
     for (runtime.symbols.items) |sym| {
         if (sym.section == null) continue;
         const sec = sym.section.?;
         if (std.mem.startsWith(u8, sym.name, ".")) continue;
         var addr: u64 = 0;
+        var out_sec = sec;
         if (std.mem.eql(u8, sec, ".text")) {
             addr = prog_text_size + sym.value;
         } else if (std.mem.eql(u8, sec, ".data")) {
             addr = data_base + prog_data_size + sym.value;
+        } else if (isTlsDataSectionName(sec)) {
+            addr = rt_tls_base + sym.value;
+            out_sec = ".tls";
+        } else if (std.mem.eql(u8, sec, ".tbss")) {
+            addr = merged_tls_size + rt_tbss_base + sym.value;
+            out_sec = ".tls";
         } else {
             continue;
         }
         if (symbols.get(sym.name) == null) {
-            try symbols.put(sym.name, .{ .section = sec, .value = addr });
+            try symbols.put(sym.name, .{ .section = out_sec, .value = addr });
         }
     }
 
@@ -303,20 +409,30 @@ pub fn applyRelocations(
         const name = node.key_ptr.*;
         const rt_addr = node.value_ptr.*;
         var addr: u64 = 0;
+        var out_sec = rt_addr.section;
         if (std.mem.eql(u8, rt_addr.section, ".text")) {
             addr = prog_text_size + rt_addr.value;
         } else if (std.mem.eql(u8, rt_addr.section, ".data")) {
             addr = data_base + prog_data_size + rt_addr.value;
+        } else if (isTlsDataSectionName(rt_addr.section)) {
+            addr = rt_tls_base + rt_addr.value;
+            out_sec = ".tls";
+        } else if (std.mem.eql(u8, rt_addr.section, ".tbss")) {
+            addr = merged_tls_size + rt_tbss_base + rt_addr.value;
+            out_sec = ".tls";
         } else {
             continue;
         }
-        try symbols.put(name, .{ .section = rt_addr.section, .value = addr });
+        try symbols.put(name, .{ .section = out_sec, .value = addr });
     }
 
     // Add kernel32 import thunks to symbol map (thunk code filled below).
     for (import_names.items) |name| {
         const off = stub_offsets.get(name).?;
         try symbols.put(name, .{ .section = ".text", .value = off });
+    }
+    if (emit_tls_index) {
+        try symbols.put("_tls_index", .{ .section = ".data", .value = data_base + tls_index_offset });
     }
 
     // ---- Build the PE import block (per-DLL IAT/INT arrays, hint/name
@@ -332,7 +448,7 @@ pub fn applyRelocations(
     var import_desc_addr: u64 = 0;
     var import_desc_size: u64 = 0;
     if (import_names.items.len > 0) {
-        const block_data_off = prog_data_size + rt_data_size; // offset within merged .data
+        const block_data_off = import_data_offset; // offset within merged .data
         const block_merged_base = data_base + block_data_off; // merged-image address
 
         // PE RVA conversion helpers (PE layout constants). These must match
@@ -467,9 +583,9 @@ pub fn applyRelocations(
         for (block) |b| try import_block.append(gpa, b);
     }
 
-    // Build merged .data: program data, then runtime data, then the import
-    // block (whose IAT slots the Windows loader patches at load time).
-    const merged_data_size = prog_data_size + rt_data_size + import_block.items.len;
+    // Build merged .data: program data, runtime data, the optional TLS index
+    // cell, then the import block (whose IAT slots the loader patches).
+    const merged_data_size = import_data_offset + import_block.items.len;
     var merged_data = try gpa.alloc(u8, merged_data_size);
     for (merged_data) |*b| b.* = 0;
     if (prog_data_size > 0) {
@@ -485,7 +601,21 @@ pub fn applyRelocations(
         }
     }
     for (import_block.items, 0..) |b, i| {
-        merged_data[@as(usize, prog_data_size) + @as(usize, rt_data_size) + i] = b;
+        merged_data[@as(usize, import_data_offset) + i] = b;
+    }
+
+    // The TLS template has its own lifetime: loaders copy these bytes for
+    // each thread instead of mapping them as the thread's writable storage.
+    var merged_tls = try gpa.alloc(u8, merged_tls_size);
+    errdefer gpa.free(merged_tls);
+    @memset(merged_tls, 0);
+    if (prog_tls_size > 0) {
+        const sec = findTlsDataSection(program).?;
+        @memcpy(merged_tls[0..@intCast(prog_tls_size)], sec.content);
+    }
+    if (rt_tls_size > 0) {
+        const sec = findTlsDataSection(runtime).?;
+        @memcpy(merged_tls[@intCast(rt_tls_base)..@intCast(merged_tls_size)], sec.content);
     }
 
     var abs32_sites = std.ArrayList(u64).empty;
@@ -495,9 +625,19 @@ pub fn applyRelocations(
 
     // ---- Apply relocations: program object ----
     for (program.relocations.items) |rel| {
-        const buf = if (rel.section_idx == 1) merged_text else merged_data;
-        const base = if (rel.section_idx == 1) @as(u64, 0) else data_base;
-        applyReloc(&rel, base, buf, &symbols, data_va_gap, target) catch {};
+        if (rel.section_idx == 3 and rel.kind != .secrel32 and rel.kind != .tpoff32) return error.RelocationFailed;
+        const buf = switch (rel.section_idx) {
+            1 => merged_text,
+            2 => merged_data,
+            3 => merged_tls,
+            else => return error.RelocationFailed,
+        };
+        const base = switch (rel.section_idx) {
+            1, 3 => @as(u64, 0),
+            2 => data_base,
+            else => unreachable,
+        };
+        try applyReloc(&rel, base, buf, &symbols, data_va_gap, target, aligned_tls_size);
         if (rel.kind == .abs32 and rel.section_idx == 1) {
             try abs32_sites.append(gpa, rel.offset);
         }
@@ -508,9 +648,20 @@ pub fn applyRelocations(
 
     // ---- Apply relocations: runtime object ----
     for (runtime.relocations.items) |rel| {
-        const buf = if (rel.section_idx == 1) merged_text[prog_text_size..] else merged_data[prog_data_size..];
-        const base = if (rel.section_idx == 1) prog_text_size else data_base + prog_data_size;
-        applyReloc(&rel, base, buf, &symbols, data_va_gap, target) catch {};
+        if (rel.section_idx == 3 and rel.kind != .secrel32 and rel.kind != .tpoff32) return error.RelocationFailed;
+        const buf = switch (rel.section_idx) {
+            1 => merged_text[prog_text_size..],
+            2 => merged_data[prog_data_size..],
+            3 => merged_tls[@intCast(rt_tls_base)..],
+            else => return error.RelocationFailed,
+        };
+        const base = switch (rel.section_idx) {
+            1 => prog_text_size,
+            2 => data_base + prog_data_size,
+            3 => rt_tls_base,
+            else => unreachable,
+        };
+        try applyReloc(&rel, base, buf, &symbols, data_va_gap, target, aligned_tls_size);
         if (rel.kind == .abs32 and rel.section_idx == 1) {
             try abs32_sites.append(gpa, prog_text_size + rel.offset);
         }
@@ -527,6 +678,10 @@ pub fn applyRelocations(
         .text = merged_text,
         .data = merged_data,
         .bss_size = merged_bss_size,
+        .tls = merged_tls,
+        .tls_zero_fill_size = merged_tbss_size,
+        .tls_alignment = tls_alignment,
+        .tls_index_offset = tls_index_offset,
         .symbols = symbols,
         .import_thunks = import_thunks,
         .import_desc_addr = import_desc_addr,
@@ -567,3 +722,105 @@ pub const writeExecutableElfToFile = ferro_elf.writeExecutableElfToFile;
 const ferro_pe = @import("ferro_pe.zig");
 
 pub const writeExecutablePe = ferro_pe.writeExecutablePe;
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+fn testObjectDeinit(obj: *Object, gpa: Allocator) void {
+    obj.sections.deinit(gpa);
+    obj.symbols.deinit(gpa);
+    obj.relocations.deinit(gpa);
+}
+
+test "TLS merge preserves template data, zero fill, and TPOFF32 offsets" {
+    const gpa = testing.allocator;
+    var empty_file: [0]u8 = .{};
+    var empty: [0]u8 = .{};
+    var program = Object{
+        .path = "program",
+        .format = .elf64,
+        .file_bytes = &empty_file,
+        .sections = .empty,
+        .symbols = .empty,
+        .relocations = .empty,
+    };
+    defer testObjectDeinit(&program, gpa);
+    var runtime = Object{
+        .path = "runtime",
+        .format = .elf64,
+        .file_bytes = &empty_file,
+        .sections = .empty,
+        .symbols = .empty,
+        .relocations = .empty,
+    };
+    defer testObjectDeinit(&runtime, gpa);
+
+    var text: [8]u8 = @splat(0);
+    const program_tls: [8]u8 = @splat(0x11);
+    const runtime_tls: [8]u8 = @splat(0x22);
+    try program.sections.appendSlice(gpa, &.{
+        .{ .name = ".text", .offset = 0, .size = text.len, .flags = 0, .type_ = 0, .content = &text },
+        .{ .name = ".data", .offset = 0, .size = 0, .flags = 0, .type_ = 0, .content = empty[0..] },
+        .{ .name = ".tdata", .offset = 0, .size = program_tls.len, .flags = 0, .type_ = 0, .alignment = 8, .content = &program_tls },
+        .{ .name = ".tbss", .offset = 0, .size = 8, .flags = 0, .type_ = 0, .alignment = 8, .content = empty[0..] },
+    });
+    try runtime.sections.appendSlice(gpa, &.{
+        .{ .name = ".text", .offset = 0, .size = 0, .flags = 0, .type_ = 0, .content = empty[0..] },
+        .{ .name = ".data", .offset = 0, .size = 0, .flags = 0, .type_ = 0, .content = empty[0..] },
+        .{ .name = ".tdata", .offset = 0, .size = runtime_tls.len, .flags = 0, .type_ = 0, .alignment = 8, .content = &runtime_tls },
+        .{ .name = ".tbss", .offset = 0, .size = 16, .flags = 0, .type_ = 0, .alignment = 8, .content = empty[0..] },
+    });
+    try program.symbols.appendSlice(gpa, &.{
+        .{ .name = "init", .section = ".tdata", .value = 0, .size = 8, .binding = .local },
+        .{ .name = "zero", .section = ".tbss", .value = 0, .size = 8, .binding = .local },
+    });
+    try runtime.symbols.appendSlice(gpa, &.{
+        .{ .name = "rt_init", .section = ".tdata", .value = 0, .size = 8, .binding = .local },
+        .{ .name = "rt_zero", .section = ".tbss", .value = 0, .size = 8, .binding = .local },
+    });
+    try program.relocations.appendSlice(gpa, &.{
+        .{ .section_idx = 1, .offset = 0, .symbol = "zero", .kind = .tpoff32, .addend = 0 },
+        .{ .section_idx = 1, .offset = 4, .symbol = "rt_zero", .kind = .tpoff32, .addend = 0 },
+    });
+
+    var resolved = ResolvedSymbols{
+        .undefined = .empty,
+        .resolved = std.StringHashMap(ResolvedSymbol).init(gpa),
+    };
+    defer resolved.deinit(gpa);
+    var image = try applyRelocations(&program, &runtime, &resolved, gpa, .linux_x86_64);
+    defer image.deinit(gpa);
+
+    // Total TLS = 16 initialized + 24 zero-filled = 40 bytes. Both zero
+    // symbols point into the zero-fill tail, not into process-global .bss.
+    try testing.expectEqual(@as(usize, 16), image.tls.len);
+    try testing.expectEqual(@as(u64, 24), image.tls_zero_fill_size);
+    try testing.expectEqualSlices(u8, &program_tls, image.tls[0..8]);
+    try testing.expectEqualSlices(u8, &runtime_tls, image.tls[8..16]);
+    try testing.expectEqual(@as(i32, -24), std.mem.readInt(i32, image.text[0..4], .little));
+    try testing.expectEqual(@as(i32, -16), std.mem.readInt(i32, image.text[4..8], .little));
+    try testing.expectEqual(@as(u64, 16), image.symbols.get("zero").?.value);
+    try testing.expectEqual(@as(u64, 24), image.symbols.get("rt_zero").?.value);
+    try testing.expectEqualStrings(".tls", image.symbols.get("zero").?.section);
+}
+
+test "SECREL32 accepts only TLS symbols and writes template offsets" {
+    const gpa = testing.allocator;
+    var symbols = std.StringHashMap(ResolvedSymbol).init(gpa);
+    defer symbols.deinit();
+    try symbols.put("panic_stage", .{ .section = ".tls", .value = 16 });
+    try symbols.put("ordinary", .{ .section = ".data", .value = 32 });
+
+    var buf: [4]u8 = @splat(0);
+    const rel = Relocation{ .section_idx = 1, .offset = 0, .symbol = "panic_stage", .kind = .secrel32, .addend = 0 };
+    try applyReloc(&rel, 0, &buf, &symbols, 0, .windows_x86_64, 40);
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, &buf, .little));
+
+    const bad_kind = Relocation{ .section_idx = 1, .offset = 0, .symbol = "panic_stage", .kind = .pc32, .addend = 0 };
+    try testing.expectError(error.RelocationFailed, applyReloc(&bad_kind, 0, &buf, &symbols, 0, .windows_x86_64, 40));
+    const bad_target = Relocation{ .section_idx = 1, .offset = 0, .symbol = "ordinary", .kind = .secrel32, .addend = 0 };
+    try testing.expectError(error.RelocationFailed, applyReloc(&bad_target, 0, &buf, &symbols, 0, .windows_x86_64, 40));
+}

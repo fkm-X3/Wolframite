@@ -151,6 +151,65 @@ pub fn readSome(handle: Handle, buf: []u8) usize {
     return done;
 }
 
+/// Initialize thread-local storage from the executable's program headers.
+///
+/// Zig's Linux TLS support owns the ABI-specific layout: PT_TLS describes the
+/// initialization template, `prepareArea` builds the DTV/TCB/TLS block, and
+/// `setThreadPointer` installs the resulting thread pointer. Runtime-created
+/// threads also use the resulting `area_desc`, so this must run before `_main`.
+pub fn initThreadLocalStorage(phdrs: []std.elf.ElfN.Phdr) void {
+    if (builtin.os.tag != .linux) return;
+
+    const tls = std.os.linux.tls;
+
+    var load_bias: usize = 0;
+    var tls_header: ?*const std.elf.ElfN.Phdr = null;
+    for (phdrs) |*phdr| {
+        switch (@backingInt(phdr.type)) {
+            6 => load_bias = @intFromPtr(phdrs.ptr) -% phdr.vaddr, // PT_PHDR
+            7 => tls_header = phdr, // PT_TLS
+            else => {},
+        }
+    }
+    const phdr = tls_header orelse return;
+    const alignment = @max(1, phdr.@"align");
+    const abi_tcb_offset = std.mem.alignForward(usize, phdr.memsz, alignment);
+    // x86_64 variant II: one-pointer ABI TCB, one-pointer Zig TCB, then
+    // a DTV whose two fields are `len` and `tls_block`.
+    const dtv_offset = std.mem.alignForward(
+        usize,
+        abi_tcb_offset + 2 * @sizeOf(usize),
+        @alignOf(usize),
+    );
+    const init_ptr: [*]const u8 = @ptrFromInt(load_bias +% phdr.vaddr);
+    tls.area_desc = .{
+        .size = dtv_offset + 2 * @sizeOf(usize),
+        .alignment = alignment,
+        .dtv = .{ .offset = dtv_offset },
+        .abi_tcb = .{ .offset = abi_tcb_offset },
+        .block = .{
+            .init = init_ptr[0..phdr.filesz],
+            .offset = 0,
+            .size = phdr.memsz,
+        },
+        .gdt_entry_number = std.math.maxInt(usize),
+    };
+
+    // The main thread's area lives until process exit. Use a raw mapping:
+    // allocator/error-return machinery may itself require an initialized TP.
+    const base = std.os.linux.mmap(
+        null,
+        tls.area_desc.size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    if (std.os.linux.errno(base) != .SUCCESS) exit(1);
+    const area = @as([*]u8, @ptrFromInt(base))[0..tls.area_desc.size];
+    tls.setThreadPointer(tls.prepareArea(area));
+}
+
 /// Terminate the process immediately with `code`.
 ///
 /// This bypasses every buffered write on purpose: a runtime that is exiting

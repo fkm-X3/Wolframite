@@ -66,9 +66,10 @@ comptime {
 
 const EtExec: u16 = 2;
 const PtLoad: u32 = 1;
-const PfR: u32 = 0x1;
+const PtTls: u32 = 7;
+const PfR: u32 = 0x4;
 const PfW: u32 = 0x2;
-const PfX: u32 = 0x4;
+const PfX: u32 = 0x1;
 
 /// The Linux user-space entry point is `_start`, which Ferro synthesizes to
 /// call `_main` (the symbol Tungsten names as program entry). `_start` runs:
@@ -99,6 +100,53 @@ pub fn buildLinuxStartStub(gpa: Allocator, main_addr: u64, stub_addr: u64) ![]u8
     return stub;
 }
 
+/// TLS-aware `_start`: initialize the thread pointer from this executable's
+/// program headers before any runtime or program code can access TLS.
+fn buildLinuxTlsStartStub(
+    gpa: Allocator,
+    main_addr: u64,
+    init_tls_addr: u64,
+    stub_addr: u64,
+    phdr_vaddr: u64,
+    phdr_count: u16,
+) ![]u8 {
+    // movabs rdi, phdr_vaddr; mov esi, phdr_count; call init; call main; exit.
+    var stub = try gpa.alloc(u8, 34);
+    stub[0] = 0x48;
+    stub[1] = 0xbf;
+    const phdr_bytes = std.mem.asBytes(&phdr_vaddr);
+    for (0..8) |i| stub[2 + i] = phdr_bytes[i];
+    stub[10] = 0xbe;
+    const count_bytes = std.mem.asBytes(&phdr_count);
+    stub[11] = count_bytes[0];
+    stub[12] = count_bytes[1];
+    stub[13] = 0;
+    stub[14] = 0;
+
+    stub[15] = 0xe8;
+    const init_disp: i64 = @as(i64, @bitCast(init_tls_addr)) - @as(i64, @bitCast(stub_addr + 15)) - 5;
+    const init_disp_i32: i32 = @intCast(init_disp);
+    const init_disp_bytes = std.mem.asBytes(&init_disp_i32);
+    for (0..4) |i| stub[16 + i] = init_disp_bytes[i];
+
+    stub[20] = 0xe8;
+    const main_disp: i64 = @as(i64, @bitCast(main_addr)) - @as(i64, @bitCast(stub_addr + 20)) - 5;
+    const main_disp_i32: i32 = @intCast(main_disp);
+    const main_disp_bytes = std.mem.asBytes(&main_disp_i32);
+    for (0..4) |i| stub[21 + i] = main_disp_bytes[i];
+
+    stub[25] = 0x89;
+    stub[26] = 0xc7;
+    stub[27] = 0xb8;
+    stub[28] = 0x3c;
+    stub[29] = 0;
+    stub[30] = 0;
+    stub[31] = 0;
+    stub[32] = 0x0f;
+    stub[33] = 0x05;
+    return stub;
+}
+
 /// Write an ELF executable (ET_EXEC) whose entry `_start` calls `_main`.
 ///
 /// Layout: ELF header (64) + 2x PT_LOAD program headers (.text R/X, .data R/W)
@@ -116,17 +164,28 @@ pub fn writeExecutableElf(
     const text_size = @as(u64, @intCast(text.len));
     const data_size = @as(u64, @intCast(data.len));
 
-    // `_start` lives at the end of merged `.text` (relative offset `start_offset`);
-    // `_main` address comes from symbol resolution. Both are relative to image base
-    // 0, so the `call _main` displacement is `main_addr - start_offset - 5`; the
-    // vaddr base (0x400000) cancels at runtime.
+    // `_start` lives at the end of merged `.text`. TLS-aware images get two
+    // extra headers (a PT_LOAD for the template and PT_TLS itself) and call
+    // the runtime initializer before `_main`.
+    const emit_tls = image.tls.len > 0 or image.tls_zero_fill_size > 0;
     const ehdr_size: u64 = 64;
-    const phdr_count: u64 = 2;
+    const phdr_count: u64 = if (emit_tls) 4 else 2;
     const phdr_size: u64 = 56 * phdr_count;
     const header_size: u64 = ehdr_size + phdr_size;
-    const text_vaddr: u64 = 0x400000 + header_size;
+    const image_base: u64 = 0x400000;
+    const text_vaddr: u64 = image_base + header_size;
     const start_offset = text_size;
-    const stub = try buildLinuxStartStub(gpa, entry_symbol_addr, start_offset);
+    const stub = if (emit_tls) blk: {
+        const init_tls = image.symbols.get("wfr_std_init_tls") orelse return error.UndefinedSymbol;
+        break :blk try buildLinuxTlsStartStub(
+            gpa,
+            entry_symbol_addr,
+            init_tls.value,
+            start_offset,
+            image_base + ehdr_size,
+            @intCast(phdr_count),
+        );
+    } else try buildLinuxStartStub(gpa, entry_symbol_addr, start_offset);
     defer gpa.free(stub);
 
     const full_text_size = text_size + stub.len;
@@ -135,13 +194,16 @@ pub fn writeExecutableElf(
     for (text, 0..text.len) |b, i| full_text[i] = b;
     for (stub, 0..stub.len) |b, i| full_text[text_size + i] = b;
 
-    const data_vaddr = text_vaddr + full_text_size;
-
     const text_file_off = header_size;
-    const data_file_off = text_file_off + full_text_size;
-    const total_size = data_file_off + data_size;
+    const unaligned_data_file_off = text_file_off + full_text_size;
+    const data_file_off = (unaligned_data_file_off + 0xFFF) & ~@as(u64, 0xFFF);
+    const data_vaddr = image_base + data_file_off;
+    const tls_file_off = if (emit_tls) (data_file_off + data_size + 0xFFF) & ~@as(u64, 0xFFF) else data_file_off + data_size;
+    const tls_vaddr = image_base + tls_file_off;
+    const total_size = tls_file_off + image.tls.len;
 
     var buf = try gpa.alloc(u8, total_size);
+    @memset(buf, 0);
     var pos: u64 = 0;
 
     // ---- ELF header ----
@@ -173,11 +235,13 @@ pub fn writeExecutableElf(
         const ph = Elf64Phdr{
             .p_type = PtLoad,
             .p_flags = PfR | PfX,
-            .p_offset = text_file_off,
-            .p_vaddr = text_vaddr,
-            .p_paddr = text_vaddr,
-            .p_filesz = full_text_size,
-            .p_memsz = full_text_size,
+            // TLS startup reads the program headers at image_base + 64, so
+            // this segment must include them rather than starting at .text.
+            .p_offset = if (emit_tls) 0 else text_file_off,
+            .p_vaddr = if (emit_tls) image_base else text_vaddr,
+            .p_paddr = if (emit_tls) image_base else text_vaddr,
+            .p_filesz = if (emit_tls) text_file_off + full_text_size else full_text_size,
+            .p_memsz = if (emit_tls) text_file_off + full_text_size else full_text_size,
             .p_align = 0x1000,
         };
         const ph_bytes = std.mem.asBytes(&ph);
@@ -204,6 +268,40 @@ pub fn writeExecutableElf(
         }
         pos += 56;
     }
+    if (emit_tls) {
+        // The initialization template is mapped read-only; prepareArea copies
+        // it into each thread's writable TLS block.
+        const tls_load = Elf64Phdr{
+            .p_type = PtLoad,
+            .p_flags = PfR,
+            .p_offset = tls_file_off,
+            .p_vaddr = tls_vaddr,
+            .p_paddr = tls_vaddr,
+            .p_filesz = image.tls.len,
+            // Only the initialized template is mapped. The zero-fill tail is
+            // per-thread state described by PT_TLS below, not read-only file
+            // storage that the kernel must clear during exec.
+            .p_memsz = image.tls.len,
+            .p_align = 0x1000,
+        };
+        const tls_load_bytes = std.mem.asBytes(&tls_load);
+        for (0..tls_load_bytes.len) |i| buf[pos + @as(u64, i)] = tls_load_bytes[i];
+        pos += 56;
+
+        const tls_ph = Elf64Phdr{
+            .p_type = PtTls,
+            .p_flags = PfR,
+            .p_offset = tls_file_off,
+            .p_vaddr = tls_vaddr,
+            .p_paddr = tls_vaddr,
+            .p_filesz = image.tls.len,
+            .p_memsz = image.tls.len + image.tls_zero_fill_size,
+            .p_align = image.tls_alignment,
+        };
+        const tls_ph_bytes = std.mem.asBytes(&tls_ph);
+        for (0..tls_ph_bytes.len) |i| buf[pos + @as(u64, i)] = tls_ph_bytes[i];
+        pos += 56;
+    }
 
     // ---- .text content ----
     for (full_text, 0..full_text.len) |b, i| {
@@ -225,18 +323,20 @@ pub fn writeExecutableElf(
     for (data, 0..data.len) |b, i| {
         buf[data_file_off + @as(u64, i)] = b;
     }
-    // Patch absolute 64-bit reloc sites in .data: the sites hold
-    // merged-.data-relative values, whose real VA base is
-    // `data_vaddr = text_vaddr + full_text_size`; the merged base they were
-    // written against is `text.len`, so the delta is `text_vaddr + stub`.
+    // Patch absolute 64-bit reloc sites in .data. The relocation applier has
+    // already included the complete text-to-data gap (entry stub plus any
+    // page padding), so only the text segment's VA base remains to be added.
     for (image.addr64_sites.items) |site| {
         const off = data_file_off + site;
         const cur = readU64(buf, @intCast(off));
-        const patched = cur + text_vaddr + stub.len;
+        const patched = cur + text_vaddr;
         var i: u6 = 0;
         while (i < 8) : (i += 1) {
             buf[off + i] = @truncate(patched >> (i * 8));
         }
+    }
+    if (emit_tls) {
+        for (image.tls, 0..image.tls.len) |b, i| buf[tls_file_off + @as(u64, i)] = b;
     }
 
     return buf;
@@ -249,4 +349,57 @@ pub fn writeExecutableElfToFile(
     buf: []u8,
 ) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = exe_path, .data = buf });
+}
+
+test "ELF writer emits PT_TLS and initializes TLS before main" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var symbols = std.StringHashMap(ferro_types.ResolvedSymbol).init(gpa);
+    defer symbols.deinit();
+    try symbols.put("_main", .{ .section = ".text", .value = 0 });
+    try symbols.put("wfr_std_init_tls", .{ .section = ".text", .value = 0 });
+
+    var text: [1]u8 = .{0xc3};
+    var data: [4]u8 = @splat(0);
+    var tls: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var image = MergedImage{
+        .text = &text,
+        .data = &data,
+        .bss_size = 0,
+        .tls = &tls,
+        .tls_zero_fill_size = 8,
+        .tls_alignment = 8,
+        .symbols = symbols,
+        .import_thunks = .empty,
+        .import_desc_addr = 0,
+        .import_desc_size = 0,
+        .abs32_sites = .empty,
+        .addr64_sites = .empty,
+    };
+    const buf = try writeExecutableElf(&image, 0, gpa);
+    defer gpa.free(buf);
+
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, buf[56..58], .little));
+    const phdrs = buf[64 .. 64 + 4 * 56];
+    try testing.expectEqual(@as(u64, 0), readU64(phdrs, 8)); // headers are mapped
+    try testing.expectEqual(PfR | PfX, readU32(phdrs, 4));
+    try testing.expectEqual(@as(u64, 0x1000), readU64(phdrs, 56 + 8)); // page-separated data
+    try testing.expectEqual(PfR | PfW, readU32(phdrs, 56 + 4));
+
+    const tls_load = phdrs[112..168];
+    try testing.expectEqual(PtLoad, readU32(tls_load, 0));
+    try testing.expectEqual(PfR, readU32(tls_load, 4));
+    try testing.expectEqual(@as(u64, 8), readU64(tls_load, 32));
+    try testing.expectEqual(@as(u64, 8), readU64(tls_load, 40));
+    const tls_ph = phdrs[168..224];
+    try testing.expectEqual(PtTls, readU32(tls_ph, 0));
+    try testing.expectEqual(@as(u64, 8), readU64(tls_ph, 32));
+    try testing.expectEqual(@as(u64, 16), readU64(tls_ph, 40));
+    try testing.expectEqual(@as(u64, 8), readU64(tls_ph, 48));
+
+    const stub = buf[64 + 4 * 56 + text.len ..][0..34];
+    try testing.expectEqualSlices(u8, &.{ 0x48, 0xbf, 0x40, 0x00, 0x40, 0x00, 0, 0, 0, 0 }, stub[0..10]);
+    try testing.expectEqualSlices(u8, &.{ 0xbe, 4, 0, 0, 0 }, stub[10..15]);
+    try testing.expectEqual(@as(u8, 0xe8), stub[15]); // init TLS
+    try testing.expectEqual(@as(u8, 0xe8), stub[20]); // _main
 }

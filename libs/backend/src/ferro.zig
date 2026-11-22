@@ -115,6 +115,14 @@ pub const writeExecutablePe = ferro_pe.writeExecutablePe;
 /// Return the raw section content (`.text` / `.data`) for a relocation's
 /// section index, or null when the section is absent.
 fn sectionContent(obj: *const Object, section_idx: u16) ?[]const u8 {
+    if (section_idx == 3) {
+        for (obj.sections.items) |sec| {
+            if (std.mem.eql(u8, sec.name, ".tls") or
+                std.mem.eql(u8, sec.name, ".tls$") or
+                std.mem.eql(u8, sec.name, ".tdata")) return sec.content;
+        }
+        return null;
+    }
     const name = switch (section_idx) {
         1 => ".text",
         2 => ".data",
@@ -144,6 +152,7 @@ fn dumpObjectRelocs(
     text_base: u64,
     data_base: u64,
     gap: u64,
+    aligned_tls_size: u64,
     symbols: *const std.StringHashMap(ferro_types.ResolvedSymbol),
 ) void {
     const i32_min = @as(i64, std.math.minInt(i32));
@@ -155,6 +164,7 @@ fn dumpObjectRelocs(
         const section_name = switch (rel.section_idx) {
             1 => ".text",
             2 => ".data",
+            3 => ".tls",
             else => ".?",
         };
         const is_data = rel.section_idx == 2;
@@ -175,13 +185,16 @@ fn dumpObjectRelocs(
 
         const sym_addr = symbols.get(rel.symbol);
         const s_merged = if (sym_addr) |a| a.value else 0;
-        const s_va = s_merged + (if (is_data and sym_addr != null) gap else 0);
+        const target_is_data = sym_addr != null and std.mem.eql(u8, sym_addr.?.section, ".data");
+        const s_va = s_merged + (if (target_is_data) gap else 0);
 
         var disp_after: i64 = 0;
         const kind_name = switch (rel.kind) {
             .pc32 => "PC32",
             .addr64 => "ADDR64",
             .abs32 => "ABS32",
+            .secrel32 => "SECREL32",
+            .tpoff32 => "TPOFF32",
         };
         switch (rel.kind) {
             .pc32 => {
@@ -196,6 +209,14 @@ fn dumpObjectRelocs(
             .abs32 => {
                 const s_merged_i64: i64 = @intCast(s_merged);
                 disp_after = s_merged_i64 + rel.addend;
+            },
+            .secrel32 => {
+                const s_merged_i64: i64 = @intCast(s_merged);
+                disp_after = s_merged_i64 + rel.addend;
+            },
+            .tpoff32 => {
+                const s_merged_i64: i64 = @intCast(s_merged);
+                disp_after = s_merged_i64 + rel.addend - @as(i64, @intCast(aligned_tls_size));
             },
         }
 
@@ -241,9 +262,16 @@ fn dumpMergedImage(
     var w = Io.File.Writer.init(.stderr(), io, &buf);
 
     const data_base = image.text.len;
+    const has_tls = image.tls.len > 0 or image.tls_zero_fill_size > 0;
     const gap = switch (options.target) {
-        .linux_x86_64 => 0,
-        .windows_x86_64 => (data_base + 0x1000 - 1) / 0x1000 * 0x1000 - data_base,
+        .linux_x86_64 => blk: {
+            const entry_stub_size: u64 = if (has_tls) 34 else 14;
+            const phdr_count: u64 = if (has_tls) 4 else 2;
+            const header_size: u64 = 64 + phdr_count * 56;
+            const data_file_off = std.mem.alignForward(u64, header_size + data_base + entry_stub_size, 0x1000);
+            break :blk data_file_off - header_size - data_base;
+        },
+        .windows_x86_64 => std.mem.alignForward(u64, data_base + ferro_types.pe_entry_stub_size, 0x1000) - data_base,
     };
 
     _ = w.interface.print("== Ferro merged image dump (target: {s}) ==\n", .{@tagName(options.target)}) catch {};
@@ -258,8 +286,8 @@ fn dumpMergedImage(
     }
 
     _ = w.interface.print(
-        "merged .text: {d} bytes\nmerged .data: {d} bytes\nmerged .bss: {d} bytes\n",
-        .{ image.text.len, image.data.len, image.bss_size },
+        "merged .text: {d} bytes\nmerged .data: {d} bytes\nmerged .bss: {d} bytes\nmerged TLS: {d} initialized + {d} zero-fill bytes (align {d})\nabsolute fixups: {d} ABS32 text sites, {d} ADDR64 data sites\n",
+        .{ image.text.len, image.data.len, image.bss_size, image.tls.len, image.tls_zero_fill_size, image.tls_alignment, image.abs32_sites.items.len, image.addr64_sites.items.len },
     ) catch {};
 
     _ = w.interface.print("\n-- Symbols (merged address) --\n", .{}) catch {};
@@ -272,9 +300,10 @@ fn dumpMergedImage(
 
     const prog_text_size = sectionSize(program, ".text");
     const prog_data_size = sectionSize(program, ".data");
+    const aligned_tls_size = std.mem.alignForward(u64, image.tls.len + image.tls_zero_fill_size, image.tls_alignment);
 
-    dumpObjectRelocs(&w, "program", program, 0, data_base, gap, &image.symbols);
-    dumpObjectRelocs(&w, "runtime", runtime, prog_text_size, data_base + prog_data_size, gap, &image.symbols);
+    dumpObjectRelocs(&w, "program", program, 0, data_base, gap, aligned_tls_size, &image.symbols);
+    dumpObjectRelocs(&w, "runtime", runtime, prog_text_size, data_base + prog_data_size, gap, aligned_tls_size, &image.symbols);
 
     _ = w.interface.flush() catch {};
 }
@@ -881,8 +910,9 @@ test "applyRelocations merges sections and applies PC32 + ADDR64 relocations" {
     // PC32: S(4) + A(-4) - P(0) = 0 => disp32 = 0.
     try std.testing.expectEqualSlices(u8, image.text[0..4], &[_]u8{ 0x00, 0x00, 0x00, 0x00 });
 
-    // __g0 ADDR64: S(data_base(6) + 0) + A(0) = 6 at .data offset 0 (little-endian u64).
-    try std.testing.expectEqualSlices(u8, image.data[0..8], &[_]u8{ 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    // __g0 ADDR64: the gap is 4096 - 176 - 6 = 3914. Adding __g0's merged
+    // offset 6 stores 3920 (0x0f50). The ELF writer adds text_vaddr next.
+    try std.testing.expectEqualSlices(u8, image.data[0..8], &[_]u8{ 0x50, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
 
     // __g0 symbol resolves to merged address 6 in .data.
     if (image.symbols.get("__g0")) |addr| {

@@ -393,8 +393,9 @@ pub const Binding = enum(u8) {
 
 /// A relocation record parsed from an object file.
 pub const Relocation = struct {
-    /// Section index the relocation applies to (1 = .text, 2 = .data, matching
-    /// the codegen/`ObjectInput` convention; section 0 is undefined/null).
+    /// Section index the relocation applies to (1 = .text, 2 = .data,
+    /// 3 = TLS initialization data, matching the codegen/`ObjectInput`
+    /// convention for the first two; section 0 is undefined/null).
     section_idx: u16,
     /// Offset within the section where the relocated bytes live.
     offset: u64,
@@ -414,6 +415,10 @@ pub const RelocKind = enum(u8) {
     addr64,
     /// Absolute 32-bit (signed): `S + A` (R_X86_64_32 / R_X86_64_32S).
     abs32,
+    /// Byte offset within the final TLS template (IMAGE_REL_AMD64_SECREL).
+    secrel32,
+    /// Signed offset from the x86_64 thread pointer (R_X86_64_TPOFF32).
+    tpoff32,
 };
 
 /// A section recorded in an object file. `content` borrows from `Object.file_bytes`
@@ -428,6 +433,9 @@ pub const Section = struct {
     flags: u64,
     /// ELF `sh_type` or COFF section characteristics.
     type_: u32,
+    /// Required byte alignment. COFF leaves this unspecified for ordinary
+    /// Zig sections, so the reader uses 1 there; ELF preserves sh_addralign.
+    alignment: u64 = 1,
     content: []const u8,
 };
 
@@ -443,11 +451,12 @@ pub const Object = struct {
     sections: std.ArrayList(Section),
     symbols: std.ArrayList(Symbol),
     relocations: std.ArrayList(Relocation),
-    /// Buffers owned by archive-merged objects (merged `.text`/`.data`).
+    /// Buffers owned by archive-merged objects (merged `.text`/`.data`/TLS).
     /// `null` for directly-read objects, whose section contents borrow from
     /// `file_bytes`.
     owned_text: ?[]u8 = null,
     owned_data: ?[]u8 = null,
+    owned_tls: ?[]u8 = null,
     /// When true, symbol and relocation names were duplicated and must be freed
     /// by `deinit` (archive-merged objects). Directly-read objects borrow them
     /// from `file_bytes`.
@@ -460,6 +469,7 @@ pub const Object = struct {
         }
         if (self.owned_text) |buf| gpa.free(buf);
         if (self.owned_data) |buf| gpa.free(buf);
+        if (self.owned_tls) |buf| gpa.free(buf);
         gpa.free(self.file_bytes);
         self.sections.deinit(gpa);
         self.symbols.deinit(gpa);
@@ -511,6 +521,15 @@ pub const MergedImage = struct {
     text: []u8,
     data: []u8,
     bss_size: u64,
+    /// Initialized per-thread template. TLS symbols retain offsets into this
+    /// block rather than process-global virtual addresses.
+    tls: []u8 = &[_]u8{},
+    /// Zero-initialized bytes following `tls` in every thread's TLS block.
+    tls_zero_fill_size: u64 = 0,
+    /// Alignment of the complete TLS block (PT_TLS p_align on ELF).
+    tls_alignment: u64 = 8,
+    /// Offset of the synthesized PE `_tls_index` cell within `data`.
+    tls_index_offset: u64 = 0,
     symbols: std.StringHashMap(ResolvedSymbol),
     import_thunks: std.ArrayList(ImportThunk),
     /// Merged-data address of the import directory descriptor (0 if none).
@@ -526,6 +545,7 @@ pub const MergedImage = struct {
         for (self.import_thunks.items) |thunk| gpa.free(thunk.name);
         gpa.free(self.text);
         gpa.free(self.data);
+        if (self.tls.len > 0) gpa.free(self.tls);
         self.symbols.deinit();
         self.import_thunks.deinit(gpa);
         self.abs32_sites.deinit(gpa);

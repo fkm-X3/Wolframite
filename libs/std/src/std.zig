@@ -110,6 +110,12 @@ export fn wfr_std_exit(code: i32) noreturn {
     os.exit(code);
 }
 
+/// Initialize Linux TLS from Ferro's ELF program-header table. Other targets
+/// have loader-managed TLS and never call this entry point.
+export fn wfr_std_init_tls(phdrs: [*]std.elf.ElfN.Phdr, phnum: usize) void {
+    if (builtin.os.tag == .linux) os.initThreadLocalStorage(phdrs[0..phnum]);
+}
+
 /// The length of a `String` header, as seen from inside a program.
 export fn wfr_std_string_len(s: *const String) i64 {
     return s.len;

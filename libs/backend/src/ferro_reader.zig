@@ -114,6 +114,7 @@ const RelX86_64_PC32: u32 = 2;
 const RelX86_64_PLT32: u32 = 4;
 const RelX86_64_32: u32 = 10;
 const RelX86_64_32S: u32 = 11;
+const RelX86_64_Tpoff32: u32 = 23;
 
 /// Read a NUL-terminated string from `strtab` at `off`.
 fn cstr(strtab: []const u8, off: usize) []const u8 {
@@ -193,6 +194,7 @@ fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
             .size = hdr.size,
             .flags = hdr.flags,
             .type_ = hdr.type_,
+            .alignment = @max(1, hdr.addralign),
             .content = content,
         });
     }
@@ -266,6 +268,7 @@ fn readElfObject(gpa: Allocator, path: []const u8, file_bytes: []u8) !Object {
                 RelX86_64_PC32, RelX86_64_PLT32 => .pc32,
                 RelX86_64_64 => .addr64,
                 RelX86_64_32, RelX86_64_32S => .abs32,
+                RelX86_64_Tpoff32 => .tpoff32,
                 else => .addr64,
             };
             try obj.relocations.append(gpa, .{
@@ -407,13 +410,13 @@ fn readCoffObjectFromBytes(gpa: Allocator, path: []const u8, bytes: []const u8) 
                     .kind = .pc32,
                     .addend = -4,
                 }),
-                CoffRelocSecrel => {
-                    // SECREL carries the target's offset within its own
-                    // section. Ferro's two-section model cannot express it
-                    // for symbols outside `.text`/`.data` (the runtime uses
-                    // SECREL for `.tls$` TLS variables), and misapplying it
-                    // would corrupt the site. Leave the site as emitted.
-                },
+                CoffRelocSecrel => try obj.relocations.append(gpa, .{
+                    .section_idx = @truncate(si + 1),
+                    .offset = r_offset,
+                    .symbol = sym_name,
+                    .kind = .secrel32,
+                    .addend = 0,
+                }),
                 // Anything else cannot be represented in Ferro's model;
                 // failing loudly beats silently writing garbage.
                 else => return error.ObjectReadFailed,
@@ -494,12 +497,32 @@ fn isDataLikeSection(name: []const u8) bool {
     return std.mem.eql(u8, name, ".data") or
         std.mem.eql(u8, name, ".rdata") or
         std.mem.eql(u8, name, ".rodata") or
-        std.mem.eql(u8, name, ".data.rel.ro") or
-        std.mem.eql(u8, name, ".tdata");
+        std.mem.eql(u8, name, ".data.rel.ro");
 }
 
 fn isBssLikeSection(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".bss") or std.mem.eql(u8, name, ".tbss");
+    return std.mem.eql(u8, name, ".bss");
+}
+
+/// TLS is never folded into process-global data. COFF spells the initialized
+/// template `.tls$`; ELF splits it into `.tdata` and zero-filled `.tbss`.
+fn isTlsDataSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".tls$") or std.mem.eql(u8, name, ".tdata");
+}
+
+fn isTlsBssSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".tbss");
+}
+
+fn tlsSectionAlignment(sec: Section) u64 {
+    // Zig's COFF writer does not set IMAGE_SCN_ALIGN_* on .tls$, although its
+    // variables use their natural x86_64 alignment. Eight is a conservative
+    // floor and over-alignment does not change SECREL semantics.
+    return @max(8, sec.alignment);
+}
+
+fn alignTlsOffset(offset: u64, alignment: u64) u64 {
+    return std.mem.alignForward(u64, offset, alignment);
 }
 
 /// Read a relocatable object file, transparently unwrapping platform archive
@@ -575,16 +598,17 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
 
     if (members.items.len == 0) return error.ObjectReadFailed;
 
-    // ---- Pass 2: merge into one Object with .text (offset 0) then .data. ----
+    // ---- Pass 2: merge into one Object with canonical text/data/TLS. ----
     var obj = Object{
         .path = path,
-        .format = .pe_coff,
+        .format = members.items[0].format,
         .file_bytes = file_bytes,
         .sections = .empty,
         .symbols = .empty,
         .relocations = .empty,
         .owned_text = null,
         .owned_data = null,
+        .owned_tls = null,
         .owns_symbol_names = true,
     };
     errdefer obj.deinit(gpa);
@@ -592,15 +616,22 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
     // Concatenate section contents.
     var merged_text: []u8 = undefined;
     var merged_data: []u8 = undefined;
+    var merged_tls: []u8 = undefined;
+    var merged_tls_alignment: u64 = 8;
     {
         var text_len: u64 = 0;
         var data_len: u64 = 0;
+        var tls_len: u64 = 0;
         for (members.items) |m| {
             for (m.sections.items) |sec| {
                 if (std.mem.eql(u8, sec.name, ".text")) {
                     text_len += sec.size;
                 } else if (isDataLikeSection(sec.name)) {
                     data_len += sec.size;
+                } else if (isTlsDataSection(sec.name)) {
+                    merged_tls_alignment = @max(merged_tls_alignment, tlsSectionAlignment(sec));
+                    tls_len = alignTlsOffset(tls_len, tlsSectionAlignment(sec));
+                    tls_len += sec.size;
                 }
             }
         }
@@ -628,14 +659,31 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 }
             }
         }
+        merged_tls = try gpa.alloc(u8, tls_len);
+        @memset(merged_tls, 0);
+        if (tls_len > 0) {
+            var pos: u64 = 0;
+            for (members.items) |m| {
+                for (m.sections.items) |sec| {
+                    if (isTlsDataSection(sec.name)) {
+                        pos = alignTlsOffset(pos, tlsSectionAlignment(sec));
+                        for (sec.content, 0..) |b, i| merged_tls[pos + @as(usize, i)] = b;
+                        pos += sec.size;
+                    }
+                }
+            }
+        }
     }
 
-    // Record cumulative text/data offset before each member.
+    // Record cumulative text/data/TLS offsets before each member.
     var cum_text: u64 = 0;
     var cum_data: u64 = 0;
+    var cum_tls: u64 = 0;
+    var cum_tbss: u64 = 0;
 
     obj.owned_text = merged_text;
     obj.owned_data = merged_data;
+    obj.owned_tls = merged_tls;
 
     // Sections.
     try obj.sections.append(gpa, .{
@@ -656,15 +704,34 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             .content = merged_data,
         });
     }
-    // .bss section (merged, no file bytes).
+    if (merged_tls.len > 0) {
+        try obj.sections.append(gpa, .{
+            .name = ".tls",
+            .offset = 0,
+            .size = @as(u64, merged_tls.len),
+            .flags = 0,
+            .type_ = 0,
+            .alignment = merged_tls_alignment,
+            .content = merged_tls,
+        });
+    }
+    // Process-global and thread-local zero-filled sections stay distinct.
     var total_bss: u64 = 0;
+    var total_tbss: u64 = 0;
+    var merged_tbss_alignment: u64 = 8;
     for (members.items) |m| {
         for (m.sections.items) |sec| {
-            if (isBssLikeSection(sec.name)) total_bss += sec.size;
+            if (isBssLikeSection(sec.name)) {
+                total_bss += sec.size;
+            } else if (isTlsBssSection(sec.name)) {
+                total_tbss = alignTlsOffset(total_tbss, tlsSectionAlignment(sec));
+                total_tbss += sec.size;
+                merged_tbss_alignment = @max(merged_tbss_alignment, tlsSectionAlignment(sec));
+            }
         }
     }
+    var empty: [0]u8 = undefined;
     if (total_bss > 0) {
-        var empty: [0]u8 = undefined;
         try obj.sections.append(gpa, .{
             .name = ".bss",
             .offset = 0,
@@ -674,17 +741,42 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
             .content = empty[0..],
         });
     }
+    if (total_tbss > 0) {
+        try obj.sections.append(gpa, .{
+            .name = ".tbss",
+            .offset = 0,
+            .size = total_tbss,
+            .flags = 0,
+            .type_ = 0,
+            .alignment = merged_tbss_alignment,
+            .content = empty[0..],
+        });
+    }
 
-    // Symbols.
+    // Symbols. Section-relative TLS offsets are preserved through the merge;
+    // they must never become process-global .data addresses.
     for (members.items) |m| {
-        // Compute per-section byte offset within this member's data region.
         var section_data_off = std.StringHashMap(u64).init(gpa);
         defer section_data_off.deinit();
+        var section_tls_off = std.StringHashMap(u64).init(gpa);
+        defer section_tls_off.deinit();
+        var section_tbss_off = std.StringHashMap(u64).init(gpa);
+        defer section_tbss_off.deinit();
         var running: u64 = 0;
+        var running_tls: u64 = 0;
+        var running_tbss: u64 = 0;
         for (m.sections.items) |sec| {
             if (isDataLikeSection(sec.name)) {
                 section_data_off.put(sec.name, running) catch {};
                 running += sec.size;
+            } else if (isTlsDataSection(sec.name)) {
+                running_tls = alignTlsOffset(running_tls, tlsSectionAlignment(sec));
+                section_tls_off.put(sec.name, running_tls) catch {};
+                running_tls += sec.size;
+            } else if (isTlsBssSection(sec.name)) {
+                running_tbss = alignTlsOffset(running_tbss, tlsSectionAlignment(sec));
+                section_tbss_off.put(sec.name, running_tbss) catch {};
+                running_tbss += sec.size;
             }
         }
         for (m.symbols.items) |sym| {
@@ -701,6 +793,14 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 sec = ".data";
                 const base = section_data_off.get(sym.section.?) orelse 0;
                 value = cum_data + base + sym.value;
+            } else if (isTlsDataSection(sym.section.?)) {
+                sec = ".tls";
+                const base = section_tls_off.get(sym.section.?) orelse 0;
+                value = cum_tls + base + sym.value;
+            } else if (isTlsBssSection(sym.section.?)) {
+                sec = ".tbss";
+                const base = section_tbss_off.get(sym.section.?) orelse 0;
+                value = cum_tbss + base + sym.value;
             } else {
                 continue;
             }
@@ -720,36 +820,36 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 cum_data += sec.size;
             }
         }
+        cum_tls += running_tls;
+        cum_tbss += running_tbss;
     }
 
-    // Relocations. Only carry over relocations that target a section we
-    // actually merged (.text or .data). Relocations against .rdata, .xdata,
-    // .pdata, etc. are dropped: Ferro's object model has no representation
-    // for those sections, and applying them to .data corrupts appended data
-    // such as the PE import table.
+    // Carry over relocations whose storage survived the merge. Relocations
+    // against discarded metadata (.xdata, .pdata, debug sections, etc.) are
+    // not retargeted to unrelated output bytes.
     cum_text = 0;
     cum_data = 0;
+    cum_tls = 0;
     for (members.items) |m| {
-        // Per-section data offset within this member.
         var section_data_off = std.StringHashMap(u64).init(gpa);
         defer section_data_off.deinit();
+        var section_tls_off = std.StringHashMap(u64).init(gpa);
+        defer section_tls_off.deinit();
         var running: u64 = 0;
+        var running_tls: u64 = 0;
         for (m.sections.items) |sec| {
             if (isDataLikeSection(sec.name)) {
                 section_data_off.put(sec.name, running) catch {};
                 running += sec.size;
+            } else if (isTlsDataSection(sec.name)) {
+                running_tls = alignTlsOffset(running_tls, tlsSectionAlignment(sec));
+                section_tls_off.put(sec.name, running_tls) catch {};
+                running_tls += sec.size;
             }
         }
         for (m.relocations.items) |rel| {
-            // Section indexes are format-specific: COFF relocation entries
-            // reference sections by 1-based section number, ELF relocations
-            // by 0-based index into the section list. Translate both to an
-            // index into this member's section list before looking the
-            // section up. (Getting this wrong silently drops every `.text`
-            // relocation of a Zig-built archive member — its sections are
-            // ordered .bss/.data/.rdata/.text/.tls$, so a 1-based `.text`
-            // index lands on `.tls$` — and misapplies `.rdata` relocations
-            // as `.text` ones.)
+            // COFF relocation entries use 1-based section numbers; ELF uses
+            // 0-based indexes into the section list.
             const member_sec_idx: usize = switch (m.format) {
                 .pe_coff => @as(usize, rel.section_idx) - 1,
                 .elf64 => @as(usize, rel.section_idx),
@@ -758,10 +858,20 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 m.sections.items[member_sec_idx].name
             else
                 "";
-            if (!std.mem.eql(u8, sec_name, ".text") and !isDataLikeSection(sec_name)) continue;
-            // Remap to Ferro's two-section model: .text -> 1, .data -> 2.
-            const new_section_idx: u16 = if (std.mem.eql(u8, sec_name, ".text")) 1 else 2;
-            const off_base = if (new_section_idx == 1) cum_text else (cum_data + (section_data_off.get(sec_name) orelse 0));
+            var new_section_idx: u16 = 0;
+            var off_base: u64 = 0;
+            if (std.mem.eql(u8, sec_name, ".text")) {
+                new_section_idx = 1;
+                off_base = cum_text;
+            } else if (isDataLikeSection(sec_name)) {
+                new_section_idx = 2;
+                off_base = cum_data + (section_data_off.get(sec_name) orelse 0);
+            } else if (isTlsDataSection(sec_name)) {
+                new_section_idx = 3;
+                off_base = cum_tls + (section_tls_off.get(sec_name) orelse 0);
+            } else {
+                continue;
+            }
             try obj.relocations.append(gpa, .{
                 .section_idx = new_section_idx,
                 .offset = rel.offset + off_base,
@@ -777,6 +887,7 @@ pub fn readArchiveObject(io: std.Io, gpa: Allocator, path: []const u8) !Object {
                 cum_data += sec.size;
             }
         }
+        cum_tls += running_tls;
     }
 
     // Release per-member containers now that their data has been merged.
@@ -851,7 +962,7 @@ fn testBuildCoffMember(gpa: Allocator) ![]u8 {
     try testPutU16(&b, gpa, 0); // characteristics
 
     // Section headers. Relocations reference symbols by index:
-    // 0 = SomeData (.data), 1 = SomeString (.rdata), 2 = SomeFunc (.text),
+    // 0 = SomeData (.data), 1 = SomeString (.tls$), 2 = SomeFunc (.text),
     // 3 = GetStdHandle (undefined).
     const sections = [_]struct {
         name: []const u8,
@@ -888,7 +999,7 @@ fn testBuildCoffMember(gpa: Allocator) ![]u8 {
     try b.appendSlice(gpa, &text_raw);
 
     // Relocations: .rdata (1): pointer to SomeData; .text (2): call to
-    // SomeFunc (REL32) and pointer to SomeData (ADDR64).
+    // SomeFunc (REL32) and a TLS-template offset for SomeStr (SECREL).
     try testPutU32(&b, gpa, 0); // .rdata+0
     try testPutU32(&b, gpa, 0); // SomeData
     try testPutU16(&b, gpa, 1); // ADDR64
@@ -896,8 +1007,8 @@ fn testBuildCoffMember(gpa: Allocator) ![]u8 {
     try testPutU32(&b, gpa, 2); // SomeFunc
     try testPutU16(&b, gpa, 4); // REL32
     try testPutU32(&b, gpa, 8); // .text+8
-    try testPutU32(&b, gpa, 0); // SomeData
-    try testPutU16(&b, gpa, 1); // ADDR64
+    try testPutU32(&b, gpa, 1); // SomeStr
+    try testPutU16(&b, gpa, 11); // SECREL
 
     // Symbol table (18 bytes each, no aux records). "GetStdHandle" uses the
     // long-name form: a dword offset into the string table with the high
@@ -910,7 +1021,7 @@ fn testBuildCoffMember(gpa: Allocator) ![]u8 {
         storage: u8,
     }{
         .{ .name = "SomeData", .value = 0, .section = 2, .storage = 2 },
-        .{ .name = "SomeStr", .value = 0, .section = 3, .storage = 2 },
+        .{ .name = "SomeStr", .value = 0, .section = 5, .storage = 2 },
         .{ .name = "SomeFunc", .value = 0, .section = 4, .storage = 2 },
         .{ .name = long_name, .long = true, .value = 0, .section = 0, .storage = 2 },
     };
@@ -970,14 +1081,14 @@ test "archive merge keeps COFF member relocations (1-based section numbers)" {
     try testing.expectEqualStrings(".data", obj.sections.items[1].name);
     try testing.expectEqual(@as(u64, 16), obj.sections.items[1].size);
 
-    // Symbols keep their sections; .rdata symbols land in .data behind the
-    // member's .data bytes.
+    // Ordinary data symbols keep their rebasing, while TLS symbols retain a
+    // canonical TLS-template offset instead of joining .data.
     var found_string = false;
     for (obj.symbols.items) |sym| {
         if (std.mem.eql(u8, sym.name, "SomeStr")) {
             found_string = true;
-            try testing.expectEqualStrings(".data", sym.section.?);
-            try testing.expectEqual(@as(u64, 8), sym.value);
+            try testing.expectEqualStrings(".tls", sym.section.?);
+            try testing.expectEqual(@as(u64, 0), sym.value);
         }
         if (std.mem.eql(u8, sym.name, "GetStdHandle")) {
             try testing.expect(sym.section == null);
@@ -985,11 +1096,10 @@ test "archive merge keeps COFF member relocations (1-based section numbers)" {
     }
     try testing.expect(found_string);
 
-    // All three relocations survive, retargeted to Ferro's two-section
-    // model with correct merged offsets:
-    //   .rdata+0 (pointer to SomeData)  -> .data+8
+    // All three relocations survive with correct merged offsets:
+    //   .rdata+0 (pointer to SomeData)  -> .data+8, addr64
     //   .text+0 (call SomeFunc, REL32)  -> .text+0, pc32, addend -4
-    //   .text+8 (pointer to SomeData)   -> .text+8, addr64
+    //   .text+8 (SomeStr TLS offset)    -> .text+8, secrel32
     try testing.expectEqual(@as(usize, 3), obj.relocations.items.len);
     const rel0 = obj.relocations.items[0];
     try testing.expectEqual(@as(u16, 2), rel0.section_idx);
@@ -1005,8 +1115,8 @@ test "archive merge keeps COFF member relocations (1-based section numbers)" {
     const rel2 = obj.relocations.items[2];
     try testing.expectEqual(@as(u16, 1), rel2.section_idx);
     try testing.expectEqual(@as(u64, 8), rel2.offset);
-    try testing.expectEqualStrings("SomeData", rel2.symbol);
-    try testing.expectEqual(RelocKind.addr64, rel2.kind);
+    try testing.expectEqualStrings("SomeStr", rel2.symbol);
+    try testing.expectEqual(RelocKind.secrel32, rel2.kind);
 }
 
 test "COFF reader rejects unsupported relocation types instead of misapplying them" {

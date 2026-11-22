@@ -170,6 +170,8 @@ fn relocKindName(kind: RelocKind) []const u8 {
         .pc32 => "PC32",
         .addr64 => "ADDR64",
         .abs32 => "ABS32",
+        .secrel32 => "SECREL32",
+        .tpoff32 => "TPOFF32",
     };
 }
 

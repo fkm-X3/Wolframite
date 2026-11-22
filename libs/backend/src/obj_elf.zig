@@ -337,6 +337,8 @@ pub const Writer = struct {
                 .pc32 => RelocX86_64_PC32,
                 .addr64 => RelocX86_64_64,
                 .abs32 => RelX86_64_32,
+                .secrel32 => return error.UnsupportedRelocation,
+                .tpoff32 => 23, // R_X86_64_TPOFF32
             };
             // r_offset(u64) r_info(u64) r_addend(i64) = 24 bytes.
             try self.putU64(r.offset);

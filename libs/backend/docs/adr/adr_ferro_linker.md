@@ -75,10 +75,13 @@ the Wolframite compiler as ordinary errors — no `ld` script parsing.
    object reader: sections, symbol table, relocation table, string table.
 2. `resolveSymbols(...)` — collect defined/undefined symbols, resolve
    undefined references against the runtime, report `UndefinedSymbol` by name.
-3. `applyRelocations(...)` — apply PC32/REL32 and ADDR64 relocations, merge
-   `.text`/`.data`/`.bss` from program object + runtime.
+3. `applyRelocations(...)` — apply ordinary and TLS relocations, merge
+   `.text`/`.data`/`.bss`, and preserve a separate initialized/zero-filled TLS
+   template from program object + runtime.
 4. Entry-point wiring — synthesize the platform entry (`_start` → `_main` on
-   Linux; CRT entry → `_main` on Windows) internally.
+   Linux; CRT entry → `_main` on Windows) internally. Linux initializes the
+   thread pointer from PT_TLS before `_main`; Windows uses its TLS directory
+   and loader-managed `_tls_index`.
 5. `writeExecutable(...)` — write ELF executable (Linux) or PE executable
    (Windows).
 
@@ -134,3 +137,5 @@ underscoring conventions.
   relocation types, section layout, symbol naming.
 - `libs/backend/src/ferro.zig` — `linkObject`, `LinkOptions`, `Target`,
   `LinkError`, and stubs.
+- `adr_ferro_tls.md` — static TLS sections, relocations, loader metadata, and
+  startup initialization.
