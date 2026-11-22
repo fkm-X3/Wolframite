@@ -15,9 +15,8 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.17.1
+      - name: Installs zig through zvm
+        run: zvm i 0.17.1
 
       - name: Run all tests
         run: zig build test
