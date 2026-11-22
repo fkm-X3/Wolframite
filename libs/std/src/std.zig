@@ -27,6 +27,10 @@ const abi = @import("abi.zig");
 const fmt = @import("fmt.zig");
 const os = @import("os.zig");
 
+// Keep Zig's safety checks without pulling the default stack-trace reporter and
+// its threaded I/O implementation into this libc-free runtime.
+pub const panic = std.debug.FullPanic(runtimePanic);
+
 pub const String = abi.String;
 
 /// `print(value: String)` — the one function the prelude injects into every
@@ -145,9 +149,16 @@ export fn wfr_std_assert(cond: i64) void {
 /// never allocates, so it stays usable from anywhere — including a panic
 /// raised while the program is already unwinding nothing.
 export fn wfr_std_panic(s: *const String) noreturn {
-    const bytes = bytesOf(s);
+    terminateWithPanic(bytesOf(s));
+}
+
+fn runtimePanic(message: []const u8, _: ?usize) noreturn {
+    terminateWithPanic(message);
+}
+
+fn terminateWithPanic(message: []const u8) noreturn {
     _ = os.writeAll(os.stderrHandle(), "panic: ");
-    _ = os.writeAll(os.stderrHandle(), bytes);
+    _ = os.writeAll(os.stderrHandle(), message);
     _ = os.writeAll(os.stderrHandle(), "\n");
     os.exit(1);
 }
