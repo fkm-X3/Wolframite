@@ -25,7 +25,7 @@ longer keywords and re-lex as ordinary identifiers. No token grammar depends on 
 ### 2.1 Keywords
 
 ```
-fn  let  mut  struct  enum  return  if  else  while  for  in
+fn  let  mut  struct  enum  return  break  continue  if  else  while  for  in
 match  import  as  defer  true  false  null  comptime  move  region
 ```
 
@@ -152,13 +152,15 @@ From `examples/imports.wfr`.
 ### 4.6 Statements & bindings
 
 ```
-<stmt>        ::= <let_stmt> | <return_stmt> | <expr_stmt>
+<stmt>        ::= <let_stmt> | <return_stmt> | <break_stmt> | <continue_stmt> | <expr_stmt>
                 | <if_expr> | <while_expr> | <for_stmt> | <match_expr>
                 | <block> | <defer_stmt>
 
 <let_stmt>    ::= ('let' | 'mut') <name> (':' <type_repr>)? ('=' <expr>)? <terminator>
 <name>        ::= identifier | '_'                       -- `_` discards
 <return_stmt> ::= 'return' <expr>?                       -- no value => unit
+<break_stmt>  ::= 'break' <terminator>
+<continue_stmt> ::= 'continue' <terminator>
 <expr_stmt>  ::= <expr> <terminator>
 <defer_stmt>  ::= 'defer' <expr> <terminator>            -- RAII hook, runs at scope exit
 <block>       ::= '{' <stmt>* '}'
@@ -189,6 +191,11 @@ let z = x + 10         // type inferred: z: i32
 ```
 
 `if`/`while`/`for` bodies are blocks; braces are required.
+`break` exits the innermost enclosing loop. `continue` starts its next iteration: a
+`while` loop rechecks its condition, and a `for` loop runs its increment before the next
+condition check. Both are statements and are illegal outside a loop in the same function
+or closure. Deferred expressions in scopes exited by either statement run before control
+transfers.
 `if` and `match` are **expressions** (each arm/body yields a value when used as an expression).
 `match` arms are delimited by newlines/commas; arms may share commas.
 From `examples/control_flow.wfr`:
@@ -542,7 +549,7 @@ The grammar above is the target for every rewritten example:
 | `hello.wfr` | module, `fn`, call, string literal |
 | `functions.wfr` | fn decl, block + `=` shorthand, no-return fn, call nesting |
 | `variables.wfr` | `let`/`mut`, annotations, assignment, inference |
-| `control_flow.wfr` | `if` expr, `while`, `for in a..b`, `defer`, block |
+| `control_flow.wfr` | `if` expr, `while`, `for in a..b`, `break`, `continue`, `defer`, block |
 | `enums.wfr` | generic enum, variant payload `Some(T)`, `Ok(T)`/`Err(E)` |
 | `match.wfr` | `match` expr, literal patterns, variant patterns, `_` wildcard, guard |
 | `structs.wfr` | pure-data struct, struct init, field access, free fns |

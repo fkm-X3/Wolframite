@@ -18,11 +18,37 @@ fn sum_up_to(n: i32) -> i32 {
     return total
 }
 
+fn match_control() -> i32 {
+    mut i: i32 = 0
+    mut total: i32 = 0
+    while i < 10 {
+        i = i + 1
+        match i {
+            3 => { continue },
+            8 => { break },
+            _ => { total = total + i },
+        }
+    }
+    return total
+}
+
+fn sum_even_range() -> i32 {
+    mut total: i32 = 0
+    for i in 0..10 {
+        if i == 8 { break }
+        if i % 2 == 1 { continue }
+        total = total + i
+    }
+    return total
+}
+
 fn main() -> i32 {
     mut result: i32 = 0
     result = result + classify(-1)
     result = result + classify(0)
     result = result + classify(5)
     result = result + sum_up_to(3)
+    result = result + match_control()
+    result = result + sum_even_range()
     return result
 }

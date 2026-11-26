@@ -620,7 +620,7 @@ pub const Resolver = struct {
             },
             .param, .field, .enum_variant, .match_arm, .struct_init_field => {},
             .module, .fn_decl, .struct_decl, .enum_decl, .import_decl, .test_decl => {},
-            .let_stmt, .return_stmt, .expr_stmt, .defer_stmt, .while_expr, .for_range, .for_each => {},
+            .let_stmt, .return_stmt, .break_stmt, .continue_stmt, .expr_stmt, .defer_stmt, .while_expr, .for_range, .for_each => {},
         }
     }
 };

@@ -15,6 +15,8 @@ pub const TokenTag = enum(u8) {
     struct_kw,
     enum_kw,
     return_kw,
+    break_kw,
+    continue_kw,
     if_kw,
     else_kw,
     while_kw,
@@ -96,6 +98,8 @@ pub const TokenTag = enum(u8) {
             .struct_kw => "struct",
             .enum_kw => "enum",
             .return_kw => "return",
+            .break_kw => "break",
+            .continue_kw => "continue",
             .if_kw => "if",
             .else_kw => "else",
             .while_kw => "while",
@@ -184,6 +188,8 @@ pub const KEYWORDS = init: {
         .{ "struct", .struct_kw },
         .{ "enum", .enum_kw },
         .{ "return", .return_kw },
+        .{ "break", .break_kw },
+        .{ "continue", .continue_kw },
         .{ "if", .if_kw },
         .{ "else", .else_kw },
         .{ "while", .while_kw },
@@ -227,6 +233,8 @@ test "Token lexeme from source" {
 test "lookupKeyword finds keywords" {
     try std.testing.expectEqual(@as(?TokenTag, .fn_kw), lookupKeyword("fn"));
     try std.testing.expectEqual(@as(?TokenTag, .return_kw), lookupKeyword("return"));
+    try std.testing.expectEqual(@as(?TokenTag, .break_kw), lookupKeyword("break"));
+    try std.testing.expectEqual(@as(?TokenTag, .continue_kw), lookupKeyword("continue"));
     try std.testing.expectEqual(@as(?TokenTag, .comptime_kw), lookupKeyword("comptime"));
     try std.testing.expectEqual(@as(?TokenTag, .move_kw), lookupKeyword("move"));
     try std.testing.expectEqual(@as(?TokenTag, .region_kw), lookupKeyword("region"));

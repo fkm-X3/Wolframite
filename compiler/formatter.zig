@@ -336,6 +336,8 @@ const Fmt = struct {
                     try self.fmtExpr(v);
                 }
             },
+            .break_stmt => try self.write("break"),
+            .continue_stmt => try self.write("continue"),
             .expr_stmt => |e| try self.fmtExpr(e.expr),
             .defer_stmt => |d| {
                 try self.write("defer ");

@@ -147,7 +147,7 @@ pub const Parser = struct {
         }
         const tok = self.peek();
         switch (tok.tag) {
-            .fn_kw, .let_kw, .mut_kw, .struct_kw, .enum_kw, .return_kw, .if_kw, .else_kw, .while_kw, .for_kw, .in_kw, .match_kw, .import_kw, .as_kw, .defer_kw, .true_kw, .false_kw, .null_kw, .comptime_kw, .move_kw, .region_kw, .test_kw => {
+            .fn_kw, .let_kw, .mut_kw, .struct_kw, .enum_kw, .return_kw, .break_kw, .continue_kw, .if_kw, .else_kw, .while_kw, .for_kw, .in_kw, .match_kw, .import_kw, .as_kw, .defer_kw, .true_kw, .false_kw, .null_kw, .comptime_kw, .move_kw, .region_kw, .test_kw => {
                 _ = self.advance();
                 return tok;
             },
@@ -568,6 +568,14 @@ pub const Parser = struct {
                 }
                 const value = self.parseExpr(Precedence.none.toInt()) orelse return null;
                 return self.appendNode(.{ .return_stmt = .{ .value = value } });
+            },
+            .break_kw => {
+                _ = self.advance();
+                return self.appendNode(.{ .break_stmt = self.makeStringRef(tok) });
+            },
+            .continue_kw => {
+                _ = self.advance();
+                return self.appendNode(.{ .continue_stmt = self.makeStringRef(tok) });
             },
             .if_kw => {
                 _ = self.advance();
@@ -1629,6 +1637,25 @@ test "parser: while loop" {
     const body = res.arena.get(decl.fn_decl.body);
     const stmt = res.arena.get(body.block.stmts.indices[0]);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .while_expr), tagOf(stmt));
+}
+
+test "parser: break and continue statements" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    while true {
+        \\        break
+        \\        continue
+        \\    }
+        \\}
+    );
+    defer res.arena.deinit();
+    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
+    const body = res.arena.get(decl.fn_decl.body);
+    const loop = res.arena.get(body.block.stmts.indices[0]);
+    const loop_body = res.arena.get(loop.while_expr.body);
+    try std.testing.expectEqual(@as(usize, 2), loop_body.block.stmts.indices.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .break_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[0])));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .continue_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[1])));
 }
 
 test "parser: defer statement" {

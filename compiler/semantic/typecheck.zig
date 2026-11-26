@@ -104,6 +104,8 @@ pub const TypeChecker = struct {
 
     fn_ret_type: TypeIdx,
     in_function: bool,
+    /// Number of loops enclosing the statement being checked in this function.
+    loop_depth: u32 = 0,
     /// Whether the expression being typed sits inside a `comptime` context,
     /// where `?` has no success/error split to branch on (R29c).
     in_comptime: bool,
@@ -395,8 +397,10 @@ pub const TypeChecker = struct {
 
         const prev_ret = self.fn_ret_type;
         const prev_in_fn = self.in_function;
+        const prev_loop_depth = self.loop_depth;
 
         self.in_function = true;
+        self.loop_depth = 0;
         if (f.return_type) |ret_ty| {
             self.fn_ret_type = self.inferTypeRef(ret_ty);
         } else {
@@ -440,6 +444,7 @@ pub const TypeChecker = struct {
 
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
+        self.loop_depth = prev_loop_depth;
     }
 
     // ========================================================================
@@ -1547,6 +1552,12 @@ pub const TypeChecker = struct {
         len.* += n;
     }
 
+    fn checkLoopBody(self: *TypeChecker, body: NodeIdx) anyerror!void {
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
+        try self.checkStmt(body);
+    }
+
     fn checkStmt(self: *TypeChecker, stmt_idx: NodeIdx) anyerror!void {
         // A failed comptime constraint stops the check of the instance it was
         // found in (R23b).
@@ -1619,6 +1630,13 @@ pub const TypeChecker = struct {
                 }
                 self.setNodeType(stmt_idx, self.void_ty);
             },
+            .break_stmt, .continue_stmt => {
+                if (self.loop_depth == 0) {
+                    const keyword = if (stmt.* == .break_stmt) "break" else "continue";
+                    self.errorAt(stmt_idx, "'{s}' used outside a loop", .{keyword});
+                }
+                self.setNodeType(stmt_idx, self.void_ty);
+            },
             .expr_stmt => |e| {
                 _ = self.inferExprType(e.expr);
                 self.setNodeType(stmt_idx, self.void_ty);
@@ -1643,7 +1661,7 @@ pub const TypeChecker = struct {
                 if (!self.typesEqual(cond_ty, self.bool_ty)) {
                     self.errorAt(stmt_idx, "while condition must be bool, got '{s}'", .{self.typeName(cond_ty)});
                 }
-                try self.checkStmt(w.body);
+                try self.checkLoopBody(w.body);
                 self.setNodeType(stmt_idx, self.void_ty);
             },
             .for_range => |fr| {
@@ -1656,7 +1674,7 @@ pub const TypeChecker = struct {
                     .decl_node = stmt_idx,
                     .type_idx = self.i32_ty,
                 }) catch @panic("OOM");
-                try self.checkStmt(fr.body);
+                try self.checkLoopBody(fr.body);
                 self.scopes.popScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
@@ -1670,7 +1688,7 @@ pub const TypeChecker = struct {
                     .decl_node = stmt_idx,
                     .type_idx = var_ty,
                 }) catch @panic("OOM");
-                try self.checkStmt(fe.body);
+                try self.checkLoopBody(fe.body);
                 self.scopes.popScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
@@ -2360,8 +2378,10 @@ pub const TypeChecker = struct {
 
         const prev_ret = self.fn_ret_type;
         const prev_in_fn = self.in_function;
+        const prev_loop_depth = self.loop_depth;
         self.fn_ret_type = ret_ty;
         self.in_function = true;
+        self.loop_depth = 0;
 
         _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
         for (cl.params.indices, 0..) |param_idx, i| {
@@ -2380,6 +2400,7 @@ pub const TypeChecker = struct {
         self.scopes.popScope();
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
+        self.loop_depth = prev_loop_depth;
 
         if (ret_placeholder) |ph| {
             // An expression body's type is the closure's return type; a block
@@ -4056,6 +4077,50 @@ test "typecheck: while loop" {
         res.type_pool.deinit();
         res.diagnostics.deinit();
     }
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: break and continue require an enclosing loop" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    break
+        \\    continue
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'break' used outside a loop"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "'continue' used outside a loop"));
+}
+
+test "typecheck: loop control does not cross a closure boundary" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    while true {
+        \\        let f = || { break }
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'break' used outside a loop"));
+}
+
+test "typecheck: break and continue accept nested loops" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    mut i: i32 = 0
+        \\    while i < 3 {
+        \\        for j in 0..3 {
+        \\            if j == 1 { continue }
+        \\            if i == 2 { break }
+        \\        }
+        \\        i = i + 1
+        \\    }
+        \\    return i
+        \\}
+    );
+    defer deinitCheck(&res);
     try std.testing.expect(!res.diagnostics.hasErrors());
 }
 

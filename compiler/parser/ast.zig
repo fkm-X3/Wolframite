@@ -114,6 +114,8 @@ pub const Node = union(enum) {
     // Statements
     let_stmt: struct { mutable: bool, name: StringRef, ty: ?NodeIdx, init_expr: ?NodeIdx },
     return_stmt: struct { value: ?NodeIdx },
+    break_stmt: StringRef,
+    continue_stmt: StringRef,
     expr_stmt: struct { expr: NodeIdx },
     defer_stmt: struct { expr: NodeIdx },
 
@@ -252,6 +254,8 @@ fn cloneNode(
         .null_literal,
         .identifier,
         .fn_ref,
+        .break_stmt,
+        .continue_stmt,
         => {
             return appendClone(arena, idx, map, node.*);
         },

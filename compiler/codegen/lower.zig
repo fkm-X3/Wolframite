@@ -50,6 +50,15 @@ const Binding = struct {
     materialized: ?Materialized = null,
 };
 
+const LoopControl = enum { break_loop, continue_loop };
+
+/// Branch targets and the defer depth for the innermost active loop.
+const LoopTarget = struct {
+    break_block: api.BasicBlockIdx,
+    continue_block: api.BasicBlockIdx,
+    defer_marker: usize,
+};
+
 /// A statically known module-level `fn` a composition calls directly.
 const DirectFn = struct {
     /// The callee's IR function index.
@@ -241,6 +250,8 @@ pub const Lowerer = struct {
     shadows: std.ArrayListUnmanaged(struct { name: []const u8, prev: ?Binding }),
     /// Deferred expressions, innermost scope last.
     pending_defers: std.ArrayListUnmanaged(NodeIdx),
+    /// Active loops, innermost last.
+    loop_targets: std.ArrayListUnmanaged(LoopTarget),
     /// The composition the expression being lowered materialized, if any
     /// (R31b). The binding that holds it picks it up.
     pending_materialized: ?Materialized = null,
@@ -297,6 +308,7 @@ pub const Lowerer = struct {
             .locals = .empty,
             .shadows = .empty,
             .pending_defers = .empty,
+            .loop_targets = .empty,
             .test_mode = test_mode,
         };
         self.ptr_ty = try ctx.ptrType(self.i64_ty);
@@ -313,6 +325,7 @@ pub const Lowerer = struct {
         self.locals.deinit(self.gpa);
         self.shadows.deinit(self.gpa);
         self.pending_defers.deinit(self.gpa);
+        self.loop_targets.deinit(self.gpa);
         self.strings.deinit();
     }
 
@@ -436,6 +449,7 @@ pub const Lowerer = struct {
         self.locals.clearRetainingCapacity();
         self.shadows.clearRetainingCapacity();
         self.pending_defers.clearRetainingCapacity();
+        self.loop_targets.clearRetainingCapacity();
         self.pending_materialized = null;
         self.block_terminated = false;
         self.sret_slot = null;
@@ -744,6 +758,8 @@ pub const Lowerer = struct {
             .block => |b| try self.lowerBlock(b.stmts),
             .let_stmt => try self.lowerLet(node_idx),
             .return_stmt => |r| try self.lowerReturn(r),
+            .break_stmt => try self.lowerLoopControl(node_idx, .break_loop),
+            .continue_stmt => try self.lowerLoopControl(node_idx, .continue_loop),
             .expr_stmt => |e| _ = try self.lowerExpr(e.expr),
             .defer_stmt => |d| try self.pending_defers.append(self.gpa, d.expr),
             .if_expr => try self.lowerIf(node_idx),
@@ -784,6 +800,22 @@ pub const Lowerer = struct {
             },
             else => _ = try self.lowerExpr(node_idx),
         }
+    }
+
+    fn lowerLoopControl(self: *Lowerer, node_idx: NodeIdx, control: LoopControl) !void {
+        if (self.loop_targets.items.len == 0) {
+            const keyword = if (control == .break_loop) "break" else "continue";
+            self.codegenError(node_idx, "'{s}' used outside a loop", .{keyword});
+            return;
+        }
+        const target = self.loop_targets.items[self.loop_targets.items.len - 1];
+        try self.emitDefersFrom(target.defer_marker);
+        const destination = switch (control) {
+            .break_loop => target.break_block,
+            .continue_loop => target.continue_block,
+        };
+        _ = try self.ctx.buildBr(destination);
+        self.terminated();
     }
 
     fn lowerBlock(self: *Lowerer, stmts: NodeList) anyerror!void {
@@ -1054,7 +1086,15 @@ pub const Lowerer = struct {
         _ = try self.ctx.buildCondBr(cond, body, end);
 
         self.setBlock(body);
+        const defer_marker = self.pending_defers.items.len;
+        try self.loop_targets.append(self.gpa, .{
+            .break_block = end,
+            .continue_block = header,
+            .defer_marker = defer_marker,
+        });
         try self.lowerStmt(w.body);
+        self.loop_targets.items.len -= 1;
+        if (self.pending_defers.items.len > defer_marker) self.pending_defers.items.len = defer_marker;
         if (!self.block_terminated) _ = try self.ctx.buildBr(header);
 
         self.setBlock(end);
@@ -1081,15 +1121,22 @@ pub const Lowerer = struct {
 
         self.setBlock(body);
         try self.bindLocal(self.nameSlice(fr.var_name), slot, self.checker.nodeType(fr.start));
+        const defer_marker = self.pending_defers.items.len;
+        try self.loop_targets.append(self.gpa, .{
+            .break_block = exit,
+            .continue_block = incr,
+            .defer_marker = defer_marker,
+        });
         try self.lowerStmt(fr.body);
-        if (!self.block_terminated) {
-            _ = try self.ctx.buildBr(incr);
+        self.loop_targets.items.len -= 1;
+        if (self.pending_defers.items.len > defer_marker) self.pending_defers.items.len = defer_marker;
+        if (!self.block_terminated) _ = try self.ctx.buildBr(incr);
 
-            self.setBlock(incr);
-            const next = try self.ctx.buildAdd(self.i64_ty, try self.ctx.buildLoad(self.i64_ty, slot), try self.ctx.buildIntConst(self.i64_ty, 1));
-            _ = try self.ctx.buildStore(self.i64_ty, slot, next);
-            _ = try self.ctx.buildBr(header);
-        }
+        self.setBlock(incr);
+        const next = try self.ctx.buildAdd(self.i64_ty, try self.ctx.buildLoad(self.i64_ty, slot), try self.ctx.buildIntConst(self.i64_ty, 1));
+        _ = try self.ctx.buildStore(self.i64_ty, slot, next);
+        _ = try self.ctx.buildBr(header);
+
         self.setBlock(exit);
         try self.popLocalScope(self.shadows.items.len - if (self.locals.get(self.nameSlice(fr.var_name)) != null) @as(usize, 1) else 0);
     }
@@ -1132,15 +1179,22 @@ pub const Lowerer = struct {
         const ch = try self.ctx.buildLoad(self.i32_ty, elem_ptr);
         _ = try self.ctx.buildStore(self.i64_ty, var_slot, ch);
         try self.bindLocal(self.nameSlice(fe.var_name), var_slot, self.checker.i32_ty);
+        const defer_marker = self.pending_defers.items.len;
+        try self.loop_targets.append(self.gpa, .{
+            .break_block = exit,
+            .continue_block = incr,
+            .defer_marker = defer_marker,
+        });
         try self.lowerStmt(fe.body);
-        if (!self.block_terminated) {
-            _ = try self.ctx.buildBr(incr);
+        self.loop_targets.items.len -= 1;
+        if (self.pending_defers.items.len > defer_marker) self.pending_defers.items.len = defer_marker;
+        if (!self.block_terminated) _ = try self.ctx.buildBr(incr);
 
-            self.setBlock(incr);
-            const next = try self.ctx.buildAdd(self.i64_ty, try self.ctx.buildLoad(self.i64_ty, i_slot), try self.ctx.buildIntConst(self.i64_ty, 1));
-            _ = try self.ctx.buildStore(self.i64_ty, i_slot, next);
-            _ = try self.ctx.buildBr(header);
-        }
+        self.setBlock(incr);
+        const next = try self.ctx.buildAdd(self.i64_ty, try self.ctx.buildLoad(self.i64_ty, i_slot), try self.ctx.buildIntConst(self.i64_ty, 1));
+        _ = try self.ctx.buildStore(self.i64_ty, i_slot, next);
+        _ = try self.ctx.buildBr(header);
+
         self.setBlock(exit);
         try self.popLocalScope(self.shadows.items.len - if (self.locals.get(self.nameSlice(fe.var_name)) != null) @as(usize, 1) else 0);
     }
@@ -3472,6 +3526,16 @@ fn runLower(allocator: Allocator, source: []const u8) !TestResult {
     return .{ .arena = arena, .type_pool = type_pool, .diagnostics = diags, .ctx = ctx };
 }
 
+fn expectBranchCount(text: []const u8, target: []const u8, expected: usize) !void {
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, text, offset, target)) |pos| {
+        count += 1;
+        offset = pos + target.len;
+    }
+    try std.testing.expectEqual(expected, count);
+}
+
 fn checkLower(allocator: Allocator, source: []const u8) !TestResult {
     var res = try runLower(allocator, source);
     errdefer {
@@ -3611,6 +3675,53 @@ test "lower: while loop" {
     const text = res.text(&buf);
     try std.testing.expect(std.mem.indexOf(u8, text, "icmp slt") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bb1:") != null);
+}
+
+test "lower: break and continue target while exit and header through if and match" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    mut i: i32 = 0
+        \\    while i < 10 {
+        \\        i = i + 1
+        \\        if i == 3 { continue }
+        \\        match i {
+        \\            8 => { break },
+        \\            _ => { i = i + 0 },
+        \\        }
+        \\    }
+        \\    return i
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [16384]u8 = undefined;
+    const text = res.text(&buf);
+    // bb1 is the header: entry, continue, and the ordinary back edge.
+    try expectBranchCount(text, "br bb1\n", 3);
+    // bb3 is the loop exit, reached by the break inside the match arm.
+    try expectBranchCount(text, "br bb3\n", 1);
+}
+
+test "lower: break and continue target for-range exit and latch" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    mut total: i32 = 0
+        \\    for i in 0..10 {
+        \\        if i == 3 { continue }
+        \\        if i == 8 { break }
+        \\        total = total + i
+        \\    }
+        \\    return total
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [16384]u8 = undefined;
+    const text = res.text(&buf);
+    // bb3 is the increment latch: continue and ordinary body fallthrough.
+    try expectBranchCount(text, "br bb3\n", 2);
+    // bb4 is the loop exit, reached by the break in the nested if.
+    try expectBranchCount(text, "br bb4\n", 1);
 }
 
 test "lower: for range loop" {

@@ -29,7 +29,7 @@ Implementation targets, per layer:
 | `compiler/semantic/types.zig` | `SemType` union incl. the `function` member and generic `app` representation, `TypePool` |
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
-| `compiler/semantic/typecheck.zig` | typing rules R4–R39, `?` rules R26–R29, constraint eval ordering |
+| `compiler/semantic/typecheck.zig` | typing rules R4–R40, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
 
@@ -664,6 +664,12 @@ runtime-only fn writing `x` + newline to stdout:
   same decl node, so the cache is naturally shared).
 - **R38 (diagnostics).** All error messages use the free-fn model: no "method",
   "interface", "class", "Self", "vtable" wording anywhere (§5.2 of `docs/syntax.md`).
+- **R40 (loop control).** `break` and `continue` are legal only lexically inside a
+  `while`/`for` body belonging to the same function or closure; any other use is a
+  semantic error. They target the innermost enclosing loop. `break` branches to that
+  loop's exit. `continue` branches to its condition for `while`, or to its latch for
+  `for` so the increment runs before the next condition check. Deferred expressions in
+  every scope exited by the transfer run last-in-first-out before the branch.
 
 ## 11. Conformance checklist
 
@@ -681,6 +687,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `compose`/`curry`/`id`/`pipe` zero-cost | R31 |
 | `\|>` pipe + hole | R30 |
 | `print` IO prelude | R39 |
+| `break` / `continue` | R40 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -692,8 +699,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29; backend tests for R3/R16; lowerer tests for R13–R18,
-   R28, R31); and
+   (compiler tests for R4–R29 and R40; backend tests for R3/R16; lowerer tests for R13–R18,
+   R28, R31, R40); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.
