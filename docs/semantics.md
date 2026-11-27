@@ -670,6 +670,13 @@ runtime-only fn writing `x` + newline to stdout:
   loop's exit. `continue` branches to its condition for `while`, or to its latch for
   `for` so the increment runs before the next condition check. Deferred expressions in
   every scope exited by the transfer run last-in-first-out before the branch.
+- **R41 (labeled loops).** `name: while` and `name: for` declare a loop label visible
+  only in that loop's body. Labels must be unique among enclosing loops in the same
+  function or closure; sibling loops may reuse a name. `break name` and `continue name`
+  target the nearest enclosing loop with that label instead of the innermost loop, and
+  an unknown label is a semantic error. Label lookup never crosses a function or closure
+  boundary. Targeted transfers use the selected loop's R40 destination and run deferred
+  expressions from every scope they exit, last-in-first-out.
 
 ## 11. Conformance checklist
 
@@ -687,7 +694,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `compose`/`curry`/`id`/`pipe` zero-cost | R31 |
 | `\|>` pipe + hole | R30 |
 | `print` IO prelude | R39 |
-| `break` / `continue` | R40 |
+| `break` / `continue`, including targeted labels | R40–R41 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -699,8 +706,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40; backend tests for R3/R16; lowerer tests for R13–R18,
-   R28, R31, R40); and
+   (compiler tests for R4–R29 and R40–R41; backend tests for R3/R16; lowerer tests for R13–R18,
+   R28, R31, R40–R41); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

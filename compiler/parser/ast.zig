@@ -61,6 +61,11 @@ pub const NodeList = struct {
     indices: []const NodeIdx,
 };
 
+pub const LoopControlStmt = struct {
+    keyword: StringRef,
+    label: ?StringRef,
+};
+
 pub const Node = union(enum) {
     // Literals / primaries
     int_literal: i64,
@@ -114,8 +119,8 @@ pub const Node = union(enum) {
     // Statements
     let_stmt: struct { mutable: bool, name: StringRef, ty: ?NodeIdx, init_expr: ?NodeIdx },
     return_stmt: struct { value: ?NodeIdx },
-    break_stmt: StringRef,
-    continue_stmt: StringRef,
+    break_stmt: LoopControlStmt,
+    continue_stmt: LoopControlStmt,
     expr_stmt: struct { expr: NodeIdx },
     defer_stmt: struct { expr: NodeIdx },
 
@@ -145,9 +150,9 @@ pub const Node = union(enum) {
 
     // Control flow
     if_expr: struct { cond: NodeIdx, then_body: NodeIdx, else_body: ?NodeIdx },
-    while_expr: struct { cond: NodeIdx, body: NodeIdx },
-    for_range: struct { var_name: StringRef, start: NodeIdx, end: NodeIdx, body: NodeIdx },
-    for_each: struct { var_name: StringRef, iterable: NodeIdx, body: NodeIdx },
+    while_expr: struct { label: ?StringRef, cond: NodeIdx, body: NodeIdx },
+    for_range: struct { label: ?StringRef, var_name: StringRef, start: NodeIdx, end: NodeIdx, body: NodeIdx },
+    for_each: struct { label: ?StringRef, var_name: StringRef, iterable: NodeIdx, body: NodeIdx },
     match_expr: struct { scrutinee: NodeIdx, arms: NodeList },
     block: struct { stmts: NodeList },
 
@@ -422,13 +427,14 @@ fn cloneNode(
         .while_expr => |w| {
             const cond = try cloneNode(arena, w.cond, map);
             const body = try cloneNode(arena, w.body, map);
-            return appendClone(arena, idx, map, .{ .while_expr = .{ .cond = cond, .body = body } });
+            return appendClone(arena, idx, map, .{ .while_expr = .{ .label = w.label, .cond = cond, .body = body } });
         },
         .for_range => |fr| {
             const start = try cloneNode(arena, fr.start, map);
             const end = try cloneNode(arena, fr.end, map);
             const body = try cloneNode(arena, fr.body, map);
             return appendClone(arena, idx, map, .{ .for_range = .{
+                .label = fr.label,
                 .var_name = fr.var_name,
                 .start = start,
                 .end = end,
@@ -439,6 +445,7 @@ fn cloneNode(
             const iterable = try cloneNode(arena, fe.iterable, map);
             const body = try cloneNode(arena, fe.body, map);
             return appendClone(arena, idx, map, .{ .for_each = .{
+                .label = fe.label,
                 .var_name = fe.var_name,
                 .iterable = iterable,
                 .body = body,

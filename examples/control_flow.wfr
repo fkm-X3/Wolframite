@@ -42,6 +42,21 @@ fn sum_even_range() -> i32 {
     return total
 }
 
+fn labeled_nested() -> i32 {
+    mut total: i32 = 0
+    mut i: i32 = 0
+    outer: while i < 4 {
+        i = i + 1
+        inner: for j in 0..5 {
+            if i == 4 { break outer }
+            if j == 2 { continue inner }
+            if j == 3 { continue outer }
+            total = total + 1
+        }
+    }
+    return total
+}
+
 fn main() -> i32 {
     mut result: i32 = 0
     result = result + classify(-1)
@@ -50,5 +65,6 @@ fn main() -> i32 {
     result = result + sum_up_to(3)
     result = result + match_control()
     result = result + sum_even_range()
+    result = result + labeled_nested()
     return result
 }

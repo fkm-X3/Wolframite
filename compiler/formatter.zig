@@ -336,8 +336,20 @@ const Fmt = struct {
                     try self.fmtExpr(v);
                 }
             },
-            .break_stmt => try self.write("break"),
-            .continue_stmt => try self.write("continue"),
+            .break_stmt => |control| {
+                try self.write("break");
+                if (control.label) |label| {
+                    try self.write(" ");
+                    try self.write(label.slice(self.source));
+                }
+            },
+            .continue_stmt => |control| {
+                try self.write("continue");
+                if (control.label) |label| {
+                    try self.write(" ");
+                    try self.write(label.slice(self.source));
+                }
+            },
             .expr_stmt => |e| try self.fmtExpr(e.expr),
             .defer_stmt => |d| {
                 try self.write("defer ");
@@ -349,12 +361,20 @@ const Fmt = struct {
             },
             .if_expr => |i| try self.fmtIfExpr(i),
             .while_expr => |w| {
+                if (w.label) |label| {
+                    try self.write(label.slice(self.source));
+                    try self.write(": ");
+                }
                 try self.write("while ");
                 try self.fmtExpr(w.cond);
                 try self.write(" ");
                 try self.fmtBlock(w.body);
             },
             .for_range => |fr| {
+                if (fr.label) |label| {
+                    try self.write(label.slice(self.source));
+                    try self.write(": ");
+                }
                 try self.write("for ");
                 try self.write(fr.var_name.slice(self.source));
                 try self.write(" in ");
@@ -365,6 +385,10 @@ const Fmt = struct {
                 try self.fmtBlock(fr.body);
             },
             .for_each => |fe| {
+                if (fe.label) |label| {
+                    try self.write(label.slice(self.source));
+                    try self.write(": ");
+                }
                 try self.write("for ");
                 try self.write(fe.var_name.slice(self.source));
                 try self.write(" in ");

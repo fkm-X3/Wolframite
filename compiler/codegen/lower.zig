@@ -52,8 +52,9 @@ const Binding = struct {
 
 const LoopControl = enum { break_loop, continue_loop };
 
-/// Branch targets and the defer depth for the innermost active loop.
+/// Branch targets, optional source label, and defer depth for an active loop.
 const LoopTarget = struct {
+    label: ?StringRef,
     break_block: api.BasicBlockIdx,
     continue_block: api.BasicBlockIdx,
     defer_marker: usize,
@@ -758,8 +759,8 @@ pub const Lowerer = struct {
             .block => |b| try self.lowerBlock(b.stmts),
             .let_stmt => try self.lowerLet(node_idx),
             .return_stmt => |r| try self.lowerReturn(r),
-            .break_stmt => try self.lowerLoopControl(node_idx, .break_loop),
-            .continue_stmt => try self.lowerLoopControl(node_idx, .continue_loop),
+            .break_stmt => |control| try self.lowerLoopControl(node_idx, .break_loop, control.label),
+            .continue_stmt => |control| try self.lowerLoopControl(node_idx, .continue_loop, control.label),
             .expr_stmt => |e| _ = try self.lowerExpr(e.expr),
             .defer_stmt => |d| try self.pending_defers.append(self.gpa, d.expr),
             .if_expr => try self.lowerIf(node_idx),
@@ -802,17 +803,38 @@ pub const Lowerer = struct {
         }
     }
 
-    fn lowerLoopControl(self: *Lowerer, node_idx: NodeIdx, control: LoopControl) !void {
-        if (self.loop_targets.items.len == 0) {
-            const keyword = if (control == .break_loop) "break" else "continue";
-            self.codegenError(node_idx, "'{s}' used outside a loop", .{keyword});
-            return;
+    fn lowerLoopControl(self: *Lowerer, node_idx: NodeIdx, control: LoopControl, label: ?StringRef) !void {
+        const keyword = if (control == .break_loop) "break" else "continue";
+        var target: ?LoopTarget = null;
+        if (label) |label_ref| {
+            const name = self.nameSlice(label_ref);
+            var i = self.loop_targets.items.len;
+            while (i > 0) {
+                i -= 1;
+                const candidate = self.loop_targets.items[i];
+                const candidate_label = candidate.label orelse continue;
+                if (std.mem.eql(u8, name, self.nameSlice(candidate_label))) {
+                    target = candidate;
+                    break;
+                }
+            }
+            if (target == null) {
+                self.codegenError(node_idx, "'{s}' label '{s}' does not refer to an enclosing loop", .{ keyword, name });
+                return;
+            }
+        } else {
+            if (self.loop_targets.items.len == 0) {
+                self.codegenError(node_idx, "'{s}' used outside a loop", .{keyword});
+                return;
+            }
+            target = self.loop_targets.items[self.loop_targets.items.len - 1];
         }
-        const target = self.loop_targets.items[self.loop_targets.items.len - 1];
-        try self.emitDefersFrom(target.defer_marker);
+
+        const resolved = target.?;
+        try self.emitDefersFrom(resolved.defer_marker);
         const destination = switch (control) {
-            .break_loop => target.break_block,
-            .continue_loop => target.continue_block,
+            .break_loop => resolved.break_block,
+            .continue_loop => resolved.continue_block,
         };
         _ = try self.ctx.buildBr(destination);
         self.terminated();
@@ -1088,6 +1110,7 @@ pub const Lowerer = struct {
         self.setBlock(body);
         const defer_marker = self.pending_defers.items.len;
         try self.loop_targets.append(self.gpa, .{
+            .label = w.label,
             .break_block = end,
             .continue_block = header,
             .defer_marker = defer_marker,
@@ -1123,6 +1146,7 @@ pub const Lowerer = struct {
         try self.bindLocal(self.nameSlice(fr.var_name), slot, self.checker.nodeType(fr.start));
         const defer_marker = self.pending_defers.items.len;
         try self.loop_targets.append(self.gpa, .{
+            .label = fr.label,
             .break_block = exit,
             .continue_block = incr,
             .defer_marker = defer_marker,
@@ -1181,6 +1205,7 @@ pub const Lowerer = struct {
         try self.bindLocal(self.nameSlice(fe.var_name), var_slot, self.checker.i32_ty);
         const defer_marker = self.pending_defers.items.len;
         try self.loop_targets.append(self.gpa, .{
+            .label = fe.label,
             .break_block = exit,
             .continue_block = incr,
             .defer_marker = defer_marker,
@@ -3722,6 +3747,35 @@ test "lower: break and continue target for-range exit and latch" {
     try expectBranchCount(text, "br bb3\n", 2);
     // bb4 is the loop exit, reached by the break in the nested if.
     try expectBranchCount(text, "br bb4\n", 1);
+}
+
+test "lower: labels target outer while and inner for loop blocks" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    mut total: i32 = 0
+        \\    mut i: i32 = 0
+        \\    outer: while i < 4 {
+        \\        i = i + 1
+        \\        inner: for j in 0..5 {
+        \\            if i == 4 { break outer }
+        \\            if j == 2 { continue inner }
+        \\            if j == 3 { continue outer }
+        \\            total = total + 1
+        \\        }
+        \\    }
+        \\    return total
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [16384]u8 = undefined;
+    const text = res.text(&buf);
+    // bb3 is the outer while exit, targeted from inside the inner for.
+    try expectBranchCount(text, "br bb3\n", 1);
+    // bb6 is the inner for latch: targeted continue plus ordinary fallthrough.
+    try expectBranchCount(text, "br bb6\n", 2);
+    // bb1 is the outer while header: entry, targeted continue, and back edge.
+    try expectBranchCount(text, "br bb1\n", 3);
 }
 
 test "lower: for range loop" {

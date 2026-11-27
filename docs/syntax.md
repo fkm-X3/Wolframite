@@ -159,8 +159,8 @@ From `examples/imports.wfr`.
 <let_stmt>    ::= ('let' | 'mut') <name> (':' <type_repr>)? ('=' <expr>)? <terminator>
 <name>        ::= identifier | '_'                       -- `_` discards
 <return_stmt> ::= 'return' <expr>?                       -- no value => unit
-<break_stmt>  ::= 'break' <terminator>
-<continue_stmt> ::= 'continue' <terminator>
+<break_stmt>  ::= 'break' <identifier>? <terminator>
+<continue_stmt> ::= 'continue' <identifier>? <terminator>
 <expr_stmt>  ::= <expr> <terminator>
 <defer_stmt>  ::= 'defer' <expr> <terminator>            -- RAII hook, runs at scope exit
 <block>       ::= '{' <stmt>* '}'
@@ -181,9 +181,10 @@ let z = x + 10         // type inferred: z: i32
 
 ```
 <if_expr>     ::= 'if' <expr> <block_or_if> ( 'else' ( 'if' <expr> <block_or_if> | <block> ) )?
-<while_expr>  ::= 'while' <expr> <block>
-<for_stmt>    ::= 'for' <identifier> 'in' <expr> '..' <expr> <block>     -- numeric range
-                | 'for' <identifier> 'in' <expr> <block>                 -- iterate over value
+<loop_label>  ::= <identifier> ':'
+<while_expr>  ::= <loop_label>? 'while' <expr> <block>
+<for_stmt>    ::= <loop_label>? 'for' <identifier> 'in' <expr> '..' <expr> <block>  -- numeric range
+                | <loop_label>? 'for' <identifier> 'in' <expr> <block>              -- iterate over value
 <match_expr>  ::= 'match' <expr> '{' <match_arm> (','? <match_arm>)* ','? '}'
 <match_arm>   ::= <pattern> ( 'if' <expr> )? '=>' <expr>
 <pattern>     ::= literal | '_' | <identifier>           -- enum variant / binding
@@ -191,11 +192,16 @@ let z = x + 10         // type inferred: z: i32
 ```
 
 `if`/`while`/`for` bodies are blocks; braces are required.
-`break` exits the innermost enclosing loop. `continue` starts its next iteration: a
-`while` loop rechecks its condition, and a `for` loop runs its increment before the next
-condition check. Both are statements and are illegal outside a loop in the same function
-or closure. Deferred expressions in scopes exited by either statement run before control
-transfers.
+Without a label, `break` exits the innermost enclosing loop and `continue` starts its next
+iteration: a `while` loop rechecks its condition, and a `for` loop runs its increment before
+the next condition check. Both are statements and are illegal outside a loop in the same
+function or closure.
+
+A prefix label (`outer: while ...` or `outer: for ...`) names that loop for `break outer`
+and `continue outer`. A targeted statement names an enclosing loop; labels must be unique
+among the enclosing loops in the same function or closure, and may be reused by sibling
+loops. Label lookup does not cross a function or closure boundary. Deferred expressions in
+every scope exited by labeled or unlabeled loop control run before control transfers.
 `if` and `match` are **expressions** (each arm/body yields a value when used as an expression).
 `match` arms are delimited by newlines/commas; arms may share commas.
 From `examples/control_flow.wfr`:
@@ -549,7 +555,7 @@ The grammar above is the target for every rewritten example:
 | `hello.wfr` | module, `fn`, call, string literal |
 | `functions.wfr` | fn decl, block + `=` shorthand, no-return fn, call nesting |
 | `variables.wfr` | `let`/`mut`, annotations, assignment, inference |
-| `control_flow.wfr` | `if` expr, `while`, `for in a..b`, `break`, `continue`, `defer`, block |
+| `control_flow.wfr` | `if` expr, labeled `while`/`for in a..b`, targeted `break`/`continue`, `defer`, block |
 | `enums.wfr` | generic enum, variant payload `Some(T)`, `Ok(T)`/`Err(E)` |
 | `match.wfr` | `match` expr, literal patterns, variant patterns, `_` wildcard, guard |
 | `structs.wfr` | pure-data struct, struct init, field access, free fns |

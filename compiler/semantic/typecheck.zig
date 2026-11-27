@@ -104,8 +104,10 @@ pub const TypeChecker = struct {
 
     fn_ret_type: TypeIdx,
     in_function: bool,
-    /// Number of loops enclosing the statement being checked in this function.
-    loop_depth: u32 = 0,
+    /// Labels of loops enclosing the statement being checked, innermost last.
+    loop_labels: std.ArrayListUnmanaged(?StringRef) = .empty,
+    /// First active loop-label entry for the current function or closure.
+    loop_label_base: usize = 0,
     /// Whether the expression being typed sits inside a `comptime` context,
     /// where `?` has no success/error split to branch on (R29c).
     in_comptime: bool,
@@ -275,6 +277,7 @@ pub const TypeChecker = struct {
         self.instance_by_callee.deinit(self.allocator);
         self.comptime_values.deinit(self.allocator);
         self.comptime_branches.deinit(self.allocator);
+        self.loop_labels.deinit(self.allocator);
         var info_it = self.generic_info.iterator();
         while (info_it.next()) |entry| {
             const info = entry.value_ptr.*;
@@ -397,10 +400,10 @@ pub const TypeChecker = struct {
 
         const prev_ret = self.fn_ret_type;
         const prev_in_fn = self.in_function;
-        const prev_loop_depth = self.loop_depth;
+        const prev_loop_label_base = self.loop_label_base;
 
         self.in_function = true;
-        self.loop_depth = 0;
+        self.loop_label_base = self.loop_labels.items.len;
         if (f.return_type) |ret_ty| {
             self.fn_ret_type = self.inferTypeRef(ret_ty);
         } else {
@@ -444,7 +447,8 @@ pub const TypeChecker = struct {
 
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
-        self.loop_depth = prev_loop_depth;
+        self.loop_labels.items.len = self.loop_label_base;
+        self.loop_label_base = prev_loop_label_base;
     }
 
     // ========================================================================
@@ -1552,9 +1556,25 @@ pub const TypeChecker = struct {
         len.* += n;
     }
 
-    fn checkLoopBody(self: *TypeChecker, body: NodeIdx) anyerror!void {
-        self.loop_depth += 1;
-        defer self.loop_depth -= 1;
+    fn hasEnclosingLoopLabel(self: *const TypeChecker, name: []const u8) bool {
+        var i = self.loop_labels.items.len;
+        while (i > self.loop_label_base) {
+            i -= 1;
+            const label = self.loop_labels.items[i] orelse continue;
+            if (std.mem.eql(u8, name, self.nameSlice(label))) return true;
+        }
+        return false;
+    }
+
+    fn checkLoopBody(self: *TypeChecker, loop_idx: NodeIdx, body: NodeIdx, label: ?StringRef) anyerror!void {
+        if (label) |new_label| {
+            const name = self.nameSlice(new_label);
+            if (self.hasEnclosingLoopLabel(name)) {
+                self.errorAt(loop_idx, "duplicate loop label '{s}' in enclosing loop scope", .{name});
+            }
+        }
+        self.loop_labels.append(self.allocator, label) catch @panic("OOM");
+        defer self.loop_labels.items.len -= 1;
         try self.checkStmt(body);
     }
 
@@ -1630,9 +1650,14 @@ pub const TypeChecker = struct {
                 }
                 self.setNodeType(stmt_idx, self.void_ty);
             },
-            .break_stmt, .continue_stmt => {
-                if (self.loop_depth == 0) {
-                    const keyword = if (stmt.* == .break_stmt) "break" else "continue";
+            .break_stmt, .continue_stmt => |control| {
+                const keyword = if (stmt.* == .break_stmt) "break" else "continue";
+                if (control.label) |label| {
+                    const name = self.nameSlice(label);
+                    if (!self.hasEnclosingLoopLabel(name)) {
+                        self.errorAt(stmt_idx, "'{s}' label '{s}' does not refer to an enclosing loop", .{ keyword, name });
+                    }
+                } else if (self.loop_labels.items.len == self.loop_label_base) {
                     self.errorAt(stmt_idx, "'{s}' used outside a loop", .{keyword});
                 }
                 self.setNodeType(stmt_idx, self.void_ty);
@@ -1661,7 +1686,7 @@ pub const TypeChecker = struct {
                 if (!self.typesEqual(cond_ty, self.bool_ty)) {
                     self.errorAt(stmt_idx, "while condition must be bool, got '{s}'", .{self.typeName(cond_ty)});
                 }
-                try self.checkLoopBody(w.body);
+                try self.checkLoopBody(stmt_idx, w.body, w.label);
                 self.setNodeType(stmt_idx, self.void_ty);
             },
             .for_range => |fr| {
@@ -1674,7 +1699,7 @@ pub const TypeChecker = struct {
                     .decl_node = stmt_idx,
                     .type_idx = self.i32_ty,
                 }) catch @panic("OOM");
-                try self.checkLoopBody(fr.body);
+                try self.checkLoopBody(stmt_idx, fr.body, fr.label);
                 self.scopes.popScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
@@ -1688,7 +1713,7 @@ pub const TypeChecker = struct {
                     .decl_node = stmt_idx,
                     .type_idx = var_ty,
                 }) catch @panic("OOM");
-                try self.checkLoopBody(fe.body);
+                try self.checkLoopBody(stmt_idx, fe.body, fe.label);
                 self.scopes.popScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
@@ -2378,10 +2403,10 @@ pub const TypeChecker = struct {
 
         const prev_ret = self.fn_ret_type;
         const prev_in_fn = self.in_function;
-        const prev_loop_depth = self.loop_depth;
+        const prev_loop_label_base = self.loop_label_base;
         self.fn_ret_type = ret_ty;
         self.in_function = true;
-        self.loop_depth = 0;
+        self.loop_label_base = self.loop_labels.items.len;
 
         _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
         for (cl.params.indices, 0..) |param_idx, i| {
@@ -2400,7 +2425,8 @@ pub const TypeChecker = struct {
         self.scopes.popScope();
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
-        self.loop_depth = prev_loop_depth;
+        self.loop_labels.items.len = self.loop_label_base;
+        self.loop_label_base = prev_loop_label_base;
 
         if (ret_placeholder) |ph| {
             // An expression body's type is the closure's return type; a block
@@ -4122,6 +4148,65 @@ test "typecheck: break and continue accept nested loops" {
     );
     defer deinitCheck(&res);
     try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: labeled loop control accepts enclosing labels and sibling reuse" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    outer: while true {
+        \\        inner: for i in 0..3 {
+        \\            if i == 1 { continue inner }
+        \\            break outer
+        \\        }
+        \\    }
+        \\    outer: for i in 0..3 {
+        \\        break outer
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: targeted loop control rejects unknown labels" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    break missing
+        \\    continue missing
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'break' label 'missing' does not refer to an enclosing loop"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "'continue' label 'missing' does not refer to an enclosing loop"));
+}
+
+test "typecheck: nested loops reject duplicate labels" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    outer: while true {
+        \\        outer: for i in 0..3 {
+        \\            break outer
+        \\        }
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "duplicate loop label 'outer' in enclosing loop scope"));
+}
+
+test "typecheck: labeled loop control does not cross a closure boundary" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    outer: while true {
+        \\        let f = || { break outer }
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'break' label 'outer' does not refer to an enclosing loop"));
 }
 
 test "typecheck: for range loop" {

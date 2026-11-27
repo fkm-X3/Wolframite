@@ -571,11 +571,19 @@ pub const Parser = struct {
             },
             .break_kw => {
                 _ = self.advance();
-                return self.appendNode(.{ .break_stmt = self.makeStringRef(tok) });
+                const label = if (self.check(.identifier)) self.makeStringRef(self.advance()) else null;
+                return self.appendNode(.{ .break_stmt = .{
+                    .keyword = self.makeStringRef(tok),
+                    .label = label,
+                } });
             },
             .continue_kw => {
                 _ = self.advance();
-                return self.appendNode(.{ .continue_stmt = self.makeStringRef(tok) });
+                const label = if (self.check(.identifier)) self.makeStringRef(self.advance()) else null;
+                return self.appendNode(.{ .continue_stmt = .{
+                    .keyword = self.makeStringRef(tok),
+                    .label = label,
+                } });
             },
             .if_kw => {
                 _ = self.advance();
@@ -583,11 +591,11 @@ pub const Parser = struct {
             },
             .while_kw => {
                 _ = self.advance();
-                return self.parseWhileExpr();
+                return self.parseWhileExpr(null);
             },
             .for_kw => {
                 _ = self.advance();
-                return self.parseForStmt();
+                return self.parseForStmt(null);
             },
             .defer_kw => {
                 _ = self.advance();
@@ -600,6 +608,15 @@ pub const Parser = struct {
                 return self.parseMatchExpr();
             },
             .identifier => {
+                if (self.peekNext().tag == .colon) {
+                    const label_tok = self.advance();
+                    _ = self.advance();
+                    const label = self.makeStringRef(label_tok);
+                    if (self.expectPeek(.while_kw)) |_| return self.parseWhileExpr(label);
+                    if (self.expectPeek(.for_kw)) |_| return self.parseForStmt(label);
+                    self.errorHere("expected 'while' or 'for' after loop label", .{});
+                    return null;
+                }
                 const expr = self.parseExpr(Precedence.none.toInt()) orelse return null;
                 return self.appendNode(.{ .expr_stmt = .{ .expr = expr } });
             },
@@ -678,14 +695,14 @@ pub const Parser = struct {
         return self.appendNode(.{ .if_expr = .{ .cond = cond, .then_body = then_body, .else_body = else_body } });
     }
 
-    fn parseWhileExpr(self: *Parser) ?NodeIdx {
+    fn parseWhileExpr(self: *Parser, label: ?StringRef) ?NodeIdx {
         const cond = self.parseExpr(Precedence.none.toInt()) orelse return null;
         self.skipNewlinesAndSemicolons();
         const body = self.parseBlock() orelse return null;
-        return self.appendNode(.{ .while_expr = .{ .cond = cond, .body = body } });
+        return self.appendNode(.{ .while_expr = .{ .label = label, .cond = cond, .body = body } });
     }
 
-    fn parseForStmt(self: *Parser) ?NodeIdx {
+    fn parseForStmt(self: *Parser, label: ?StringRef) ?NodeIdx {
         const name_tok = self.expect(.identifier) orelse return null;
         if (self.expect(.in_kw) == null) return null;
 
@@ -704,6 +721,7 @@ pub const Parser = struct {
             self.skipNewlinesAndSemicolons();
             const body = self.parseBlock() orelse return null;
             return self.appendNode(.{ .for_range = .{
+                .label = label,
                 .var_name = self.makeStringRef(name_tok),
                 .start = range_start,
                 .end = end,
@@ -718,6 +736,7 @@ pub const Parser = struct {
             self.skipNewlinesAndSemicolons();
             const body = self.parseBlock() orelse return null;
             return self.appendNode(.{ .for_range = .{
+                .label = label,
                 .var_name = self.makeStringRef(name_tok),
                 .start = start,
                 .end = end,
@@ -728,6 +747,7 @@ pub const Parser = struct {
         self.skipNewlinesAndSemicolons();
         const body = self.parseBlock() orelse return null;
         return self.appendNode(.{ .for_each = .{
+            .label = label,
             .var_name = self.makeStringRef(name_tok),
             .iterable = start,
             .body = body,
@@ -1656,6 +1676,35 @@ test "parser: break and continue statements" {
     try std.testing.expectEqual(@as(usize, 2), loop_body.block.stmts.indices.len);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .break_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[0])));
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .continue_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[1])));
+}
+
+test "parser: labeled loops and targeted loop control" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    outer: while true {
+        \\        inner: for i in 0..3 {
+        \\            break outer
+        \\            continue inner
+        \\        }
+        \\    }
+        \\}
+    );
+    defer res.arena.deinit();
+
+    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
+    const body = res.arena.get(decl.fn_decl.body);
+    const outer = res.arena.get(body.block.stmts.indices[0]);
+    try std.testing.expectEqualStrings("outer", nameOf(&res, outer.while_expr.label orelse return error.TestUnexpectedNull));
+
+    const outer_body = res.arena.get(outer.while_expr.body);
+    const inner = res.arena.get(outer_body.block.stmts.indices[0]);
+    try std.testing.expectEqualStrings("inner", nameOf(&res, inner.for_range.label orelse return error.TestUnexpectedNull));
+
+    const inner_body = res.arena.get(inner.for_range.body);
+    const break_stmt = res.arena.get(inner_body.block.stmts.indices[0]).break_stmt;
+    const continue_stmt = res.arena.get(inner_body.block.stmts.indices[1]).continue_stmt;
+    try std.testing.expectEqualStrings("outer", nameOf(&res, break_stmt.label orelse return error.TestUnexpectedNull));
+    try std.testing.expectEqualStrings("inner", nameOf(&res, continue_stmt.label orelse return error.TestUnexpectedNull));
 }
 
 test "parser: defer statement" {
