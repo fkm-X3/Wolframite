@@ -652,8 +652,10 @@ pub const Parser = struct {
             const type_repr = self.parseTypeRepr() orelse return null;
             ty = switch (type_repr) {
                 .plain => |n| n,
-                .reference => |n| n,
-                .mut_reference => |n| n,
+                .reference, .mut_reference => |n| self.appendNode(.{ .unary_op = .{
+                    .op = if (type_repr == .reference) .ref else .mut_ref,
+                    .operand = n,
+                } }),
             };
             self.skipNewlinesAndSemicolons();
         }
@@ -2213,6 +2215,37 @@ test "parser: reference type representations" {
     try std.testing.expectEqual(@as(std.meta.Tag(TypeRepr), .reference), @as(std.meta.Tag(TypeRepr), field0.field.ty));
     const field1 = res.arena.get(decl.struct_decl.fields.indices[1]);
     try std.testing.expectEqual(@as(std.meta.Tag(TypeRepr), .mut_reference), @as(std.meta.Tag(TypeRepr), field1.field.ty));
+}
+
+test "parser: address-of lvalues and annotated reference locals" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(s: S, p: &mut i32) {
+        \\    let q: &mut &i32 = &p
+        \\    let a = &s.value
+        \\    let b = &p.*
+        \\    let c = &s.values[0]
+        \\}
+    );
+    defer res.arena.deinit();
+
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const q = res.arena.get(body.block.stmts.indices[0]).let_stmt;
+    const q_ty = res.arena.get(q.ty orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .unary_op), tagOf(q_ty));
+    try std.testing.expectEqual(ast.UnaryOp.mut_ref, q_ty.unary_op.op);
+    const q_pointee = res.arena.get(q_ty.unary_op.operand);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .unary_op), tagOf(q_pointee));
+    try std.testing.expectEqual(ast.UnaryOp.ref, q_pointee.unary_op.op);
+
+    const a = res.arena.get(body.block.stmts.indices[1]).let_stmt;
+    const a_init = res.arena.get(a.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .field_access), tagOf(res.arena.get(a_init.unary_op.operand)));
+    const b = res.arena.get(body.block.stmts.indices[2]).let_stmt;
+    const b_init = res.arena.get(b.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .deref), tagOf(res.arena.get(b_init.unary_op.operand)));
+    const c = res.arena.get(body.block.stmts.indices[3]).let_stmt;
+    const c_init = res.arena.get(c.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(res.arena.get(c_init.unary_op.operand)));
 }
 
 test "parser: wildcard binding" {

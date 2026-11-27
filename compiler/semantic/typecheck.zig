@@ -51,6 +51,13 @@ const ComptimeBinding = struct {
     ty: TypeIdx,
 };
 
+/// Local storage whose address is carried by a reference or an aggregate.
+/// `depth` is the lexical block depth of that storage, not of the use site.
+const BorrowOrigin = struct {
+    storage: NodeIdx,
+    depth: u32,
+};
+
 /// Walking state for closure capture-set inference (R7): the captures found so
 /// far (in source order of first appearance), the set of binders already
 /// captured (dedup), and the names bound inside the closure, one set per lexical
@@ -111,6 +118,16 @@ pub const TypeChecker = struct {
     /// Whether the expression being typed sits inside a `comptime` context,
     /// where `?` has no success/error split to branch on (R29c).
     in_comptime: bool,
+    /// Distinguishes `&T` in type position from address-of in value position.
+    in_type_ref: bool = false,
+
+    /// Lexical depth of every local or parameter's own storage.
+    storage_depths: std.AutoHashMapUnmanaged(NodeIdx, u32) = .empty,
+    /// Local-storage addresses carried by each binding's current value.
+    /// Entries are deliberately flow-insensitive and retain the deepest origin.
+    binding_origins: std.AutoHashMapUnmanaged(NodeIdx, BorrowOrigin) = .empty,
+    /// Origins computed while an expression's lexical scope was still active.
+    expression_origins: std.AutoHashMapUnmanaged(NodeIdx, BorrowOrigin) = .empty,
 
     type_name_buf: [2][16]u8,
     type_name_toggle: u1 = 0,
@@ -278,6 +295,9 @@ pub const TypeChecker = struct {
         self.comptime_values.deinit(self.allocator);
         self.comptime_branches.deinit(self.allocator);
         self.loop_labels.deinit(self.allocator);
+        self.storage_depths.deinit(self.allocator);
+        self.binding_origins.deinit(self.allocator);
+        self.expression_origins.deinit(self.allocator);
         var info_it = self.generic_info.iterator();
         while (info_it.next()) |entry| {
             const info = entry.value_ptr.*;
@@ -430,6 +450,7 @@ pub const TypeChecker = struct {
             // Record the type on the binder so a closure that captures this
             // parameter can read it off the env entry (R7/R8).
             self.setNodeType(param_idx, param_ty);
+            self.recordStorage(param_idx);
             self.scopes.insert(self.nameSlice(param.param.name), .{
                 .name = param.param.name,
                 .kind = .param,
@@ -710,6 +731,7 @@ pub const TypeChecker = struct {
             const param = self.arena.get(param_idx);
             const param_ty = self.inferTypeRef(param.param.ty);
             self.setNodeType(param_idx, param_ty);
+            self.recordStorage(param_idx);
             self.scopes.insert(self.nameSlice(param.param.name), .{
                 .name = param.param.name,
                 .kind = .param,
@@ -1628,6 +1650,12 @@ pub const TypeChecker = struct {
                     self.setNodeType(stmt_idx, init_ty);
                 }
 
+                self.recordStorage(stmt_idx);
+                if (l.init_expr) |init_val| {
+                    if (self.localOrigin(init_val)) |origin| {
+                        self.rememberBindingOrigin(stmt_idx, origin);
+                    }
+                }
                 self.scopes.insert(self.nameSlice(l.name), .{
                     .name = l.name,
                     .kind = .local,
@@ -1656,6 +1684,7 @@ pub const TypeChecker = struct {
                             self.typeName(fixed), self.typeName(val_ty),
                         });
                     }
+                    self.checkEscapeReturn(val);
                 }
                 self.setNodeType(stmt_idx, self.void_ty);
             },
@@ -1705,6 +1734,7 @@ pub const TypeChecker = struct {
                 _ = self.inferExprType(fr.start);
                 _ = self.inferExprType(fr.end);
                 _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+                self.recordStorage(stmt_idx);
                 self.scopes.insert(self.nameSlice(fr.var_name), .{
                     .name = fr.var_name,
                     .kind = .local,
@@ -1719,6 +1749,7 @@ pub const TypeChecker = struct {
                 const iter_ty = self.inferExprType(fe.iterable);
                 const var_ty = self.forEachElemType(stmt_idx, iter_ty);
                 _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+                self.recordStorage(stmt_idx);
                 self.scopes.insert(self.nameSlice(fe.var_name), .{
                     .name = fe.var_name,
                     .kind = .local,
@@ -1751,6 +1782,7 @@ pub const TypeChecker = struct {
         const expr = self.arena.get(expr_idx);
         const ty = self.inferExprTypeInner(expr_idx, expr);
         self.setNodeType(expr_idx, ty);
+        _ = self.localOrigin(expr_idx);
         return ty;
     }
 
@@ -1901,6 +1933,7 @@ pub const TypeChecker = struct {
                     b.op == .mul_assign or b.op == .div_assign)
                 {
                     self.checkAssignmentTarget(b.left);
+                    self.checkEscapeAssignment(b.left, b.right);
                     const null_rejected = self.rejectNullForReference(b.right, left_ty);
                     if (!null_rejected and !self.typesEqual(left_ty, right_ty)) {
                         self.errorAt(expr_idx, "assignment type mismatch: '{s}' and '{s}'", .{
@@ -1940,10 +1973,13 @@ pub const TypeChecker = struct {
             .unary_op => |u| {
                 const operand_ty = self.inferExprType(u.operand);
                 return switch (u.op) {
-                    .ref, .mut_ref => self.type_pool.add(.{ .pointer = .{
-                        .elem = operand_ty,
-                        .mutable = u.op == .mut_ref,
-                    } }) catch @panic("OOM"),
+                    .ref, .mut_ref => blk: {
+                        if (!self.in_type_ref) self.checkAddressOf(expr_idx, u.op, u.operand);
+                        break :blk self.type_pool.add(.{ .pointer = .{
+                            .elem = operand_ty,
+                            .mutable = u.op == .mut_ref,
+                        } }) catch @panic("OOM");
+                    },
                     else => operand_ty,
                 };
             },
@@ -2156,6 +2192,9 @@ pub const TypeChecker = struct {
     }
 
     fn inferTypeRef(self: *TypeChecker, expr_idx: NodeIdx) TypeIdx {
+        const prev = self.in_type_ref;
+        self.in_type_ref = true;
+        defer self.in_type_ref = prev;
         return self.inferExprType(expr_idx);
     }
 
@@ -2270,6 +2309,236 @@ pub const TypeChecker = struct {
         if (sem == .pointer and !sem.pointer.mutable) {
             self.errorAt(target, "cannot write through a shared reference; use '&mut' to mutate the pointee", .{});
         }
+    }
+
+    fn recordStorage(self: *TypeChecker, decl_idx: NodeIdx) void {
+        const depth = self.scopes.depth(self.scopes.currentScope());
+        self.storage_depths.put(self.allocator, decl_idx, depth) catch @panic("OOM");
+    }
+
+    fn storageName(self: *const TypeChecker, storage: NodeIdx) []const u8 {
+        const node = self.arena.get(storage);
+        return switch (node.*) {
+            .let_stmt => |l| self.nameSlice(l.name),
+            .param => |p| self.nameSlice(p.name),
+            .for_range => |f| self.nameSlice(f.var_name),
+            .for_each => |f| self.nameSlice(f.var_name),
+            .identifier => |id| self.nameSlice(id),
+            else => "<local>",
+        };
+    }
+
+    fn originForStorage(self: *TypeChecker, storage: NodeIdx) BorrowOrigin {
+        const depth = self.storage_depths.get(storage) orelse
+            self.scopes.depth(self.scopes.currentScope());
+        return .{ .storage = storage, .depth = depth };
+    }
+
+    fn rememberBindingOrigin(self: *TypeChecker, binding: NodeIdx, origin: BorrowOrigin) void {
+        if (self.binding_origins.getPtr(binding)) |current| {
+            if (origin.depth > current.depth) current.* = origin;
+            return;
+        }
+        self.binding_origins.put(self.allocator, binding, origin) catch @panic("OOM");
+    }
+
+    /// Whether an expression denotes storage whose address can be taken.
+    /// A reference operand need not itself be an lvalue: `&factory().*` and
+    /// `&ptr.field` name the pointee's storage, not the reference temporary.
+    fn isLvalue(self: *TypeChecker, expr_idx: NodeIdx) bool {
+        const node = self.arena.get(expr_idx);
+        return switch (node.*) {
+            .identifier => |id| blk: {
+                const sym = self.scopes.lookup(self.nameSlice(id), self.scopes.currentScope()) orelse
+                    break :blk false;
+                break :blk sym.kind == .local or sym.kind == .param;
+            },
+            .field_access => |fa| self.type_pool.get(self.getNodeType(fa.object)) == .pointer or
+                self.isLvalue(fa.object),
+            .index_access => |ia| self.type_pool.get(self.getNodeType(ia.object)) == .pointer or
+                self.isLvalue(ia.object),
+            .deref => |operand| self.type_pool.get(self.getNodeType(operand)) == .pointer,
+            .paren_expr => |inner| self.isLvalue(inner),
+            else => false,
+        };
+    }
+
+    fn throughSharedReference(self: *TypeChecker, expr_idx: NodeIdx) bool {
+        const node = self.arena.get(expr_idx);
+        return switch (node.*) {
+            .deref => |operand| blk: {
+                const sem = self.type_pool.get(self.getNodeType(operand));
+                break :blk sem == .pointer and !sem.pointer.mutable;
+            },
+            .field_access => |fa| blk: {
+                const sem = self.type_pool.get(self.getNodeType(fa.object));
+                if (sem == .pointer and !sem.pointer.mutable) break :blk true;
+                break :blk self.throughSharedReference(fa.object);
+            },
+            .index_access => |ia| blk: {
+                const sem = self.type_pool.get(self.getNodeType(ia.object));
+                if (sem == .pointer and !sem.pointer.mutable) break :blk true;
+                break :blk self.throughSharedReference(ia.object);
+            },
+            .paren_expr => |inner| self.throughSharedReference(inner),
+            else => false,
+        };
+    }
+
+    fn checkAddressOf(self: *TypeChecker, expr_idx: NodeIdx, op: ast.UnaryOp, operand: NodeIdx) void {
+        if (!self.isLvalue(operand)) {
+            self.errorAt(expr_idx, "cannot take the address of an rvalue; address-of requires an lvalue", .{});
+        }
+        if (op == .mut_ref and self.throughSharedReference(operand)) {
+            self.errorAt(expr_idx, "cannot take an exclusive reference through a shared reference", .{});
+        }
+    }
+
+    fn checkEscapeReturn(self: *TypeChecker, value: NodeIdx) void {
+        const origin = self.localOrigin(value) orelse return;
+        self.errorAt(value, "reference to local '{s}' escapes its block through return", .{
+            self.storageName(origin.storage),
+        });
+    }
+
+    fn checkEscapeAssignment(self: *TypeChecker, target: NodeIdx, value: NodeIdx) void {
+        const origin = self.localOrigin(value) orelse return;
+        const destination = self.addressOrigin(target) orelse {
+            self.errorAt(value, "reference to local '{s}' escapes its block through assignment to longer-lived storage", .{
+                self.storageName(origin.storage),
+            });
+            return;
+        };
+        if (origin.depth > destination.depth) {
+            self.errorAt(value, "reference to local '{s}' escapes its block through assignment to longer-lived storage", .{
+                self.storageName(origin.storage),
+            });
+            return;
+        }
+        self.rememberBindingOrigin(destination.storage, origin);
+    }
+
+    /// The local storage an lvalue addresses. For a dereference or a field/index
+    /// through a reference, this is the pointee's origin rather than the storage
+    /// of the reference value itself.
+    fn addressOrigin(self: *TypeChecker, expr_idx: NodeIdx) ?BorrowOrigin {
+        const node = self.arena.get(expr_idx);
+        return switch (node.*) {
+            .identifier => |id| blk: {
+                const sym = self.scopes.lookup(self.nameSlice(id), self.scopes.currentScope()) orelse
+                    break :blk null;
+                if (sym.kind != .local and sym.kind != .param) break :blk null;
+                break :blk self.originForStorage(sym.decl_node);
+            },
+            .field_access => |fa| if (self.type_pool.get(self.getNodeType(fa.object)) == .pointer)
+                self.localOrigin(fa.object)
+            else
+                self.addressOrigin(fa.object),
+            .index_access => |ia| if (self.type_pool.get(self.getNodeType(ia.object)) == .pointer)
+                self.localOrigin(ia.object)
+            else
+                self.addressOrigin(ia.object),
+            .deref => |operand| self.localOrigin(operand),
+            .paren_expr => |inner| self.addressOrigin(inner),
+            else => null,
+        };
+    }
+
+    /// Find one local-storage address carried by a value. Keeping the deepest
+    /// origin per binding makes the analysis conservative without a lifetime
+    /// annotation or a flow-sensitive borrow checker.
+    fn localOrigin(self: *TypeChecker, expr_idx: NodeIdx) ?BorrowOrigin {
+        if (self.expression_origins.get(expr_idx)) |origin| return origin;
+        if (!self.typeCanCarryReference(self.getNodeType(expr_idx))) return null;
+        const node = self.arena.get(expr_idx);
+        const result = switch (node.*) {
+            .identifier => |id| blk: {
+                const sym = self.scopes.lookup(self.nameSlice(id), self.scopes.currentScope()) orelse
+                    break :blk null;
+                break :blk self.binding_origins.get(sym.decl_node);
+            },
+            .unary_op => |u| switch (u.op) {
+                .ref, .mut_ref => self.addressOrigin(u.operand),
+                else => null,
+            },
+            .deref => |operand| blk: {
+                const address = self.localOrigin(operand) orelse break :blk null;
+                break :blk self.binding_origins.get(address.storage);
+            },
+            .field_access => |fa| blk: {
+                if (self.type_pool.get(self.getNodeType(fa.object)) != .pointer) {
+                    break :blk self.localOrigin(fa.object);
+                }
+                const base = self.localOrigin(fa.object) orelse break :blk null;
+                break :blk self.binding_origins.get(base.storage);
+            },
+            .index_access => |ia| blk: {
+                if (self.type_pool.get(self.getNodeType(ia.object)) != .pointer) {
+                    break :blk self.localOrigin(ia.object);
+                }
+                const base = self.localOrigin(ia.object) orelse break :blk null;
+                break :blk self.binding_origins.get(base.storage);
+            },
+            .paren_expr, .move_expr, .comptime_expr, .try_propagate => |inner| self.localOrigin(inner),
+            .binary_op => |b| self.localOrigin(b.right) orelse self.localOrigin(b.left),
+            .call => |c| blk: {
+                for (c.args.indices) |arg| {
+                    if (self.localOrigin(arg)) |origin| break :blk origin;
+                }
+                break :blk null;
+            },
+            .struct_init => |si| blk: {
+                for (si.fields.indices) |field_idx| {
+                    const value = self.arena.get(field_idx).struct_init_field.value;
+                    if (self.localOrigin(value)) |origin| break :blk origin;
+                }
+                break :blk null;
+            },
+            .if_expr => |i| self.localOrigin(i.then_body) orelse
+                (if (i.else_body) |else_body| self.localOrigin(else_body) else null),
+            .match_expr => |m| blk: {
+                for (m.arms.indices) |arm_idx| {
+                    const body = self.arena.get(arm_idx).match_arm.body;
+                    if (self.localOrigin(body)) |origin| break :blk origin;
+                }
+                break :blk null;
+            },
+            .pipeline => |p| self.localOrigin(p.rhs) orelse self.localOrigin(p.lhs),
+            .closure => |cl| blk: {
+                for (cl.env.indices) |capture| {
+                    if (self.binding_origins.get(capture)) |origin| break :blk origin;
+                }
+                break :blk null;
+            },
+            .block => |b| blk: {
+                if (b.stmts.indices.len == 0) break :blk null;
+                const last = self.arena.get(b.stmts.indices[b.stmts.indices.len - 1]);
+                if (last.* != .expr_stmt) break :blk null;
+                break :blk self.localOrigin(last.expr_stmt.expr);
+            },
+            else => null,
+        };
+        if (result) |origin| {
+            self.expression_origins.put(self.allocator, expr_idx, origin) catch @panic("OOM");
+        }
+        return result;
+    }
+
+    fn typeCanCarryReference(self: *const TypeChecker, ty: TypeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .pointer,
+            .string_type,
+            .struct_type,
+            .applied_struct,
+            .enum_type,
+            .applied_enum,
+            .array,
+            .slice,
+            .function,
+            .applied_fn,
+            => true,
+            else => false,
+        };
     }
 
     /// Plain references are non-null. The `null` literal keeps its existing
@@ -2465,6 +2734,7 @@ pub const TypeChecker = struct {
         _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
         for (cl.params.indices, 0..) |param_idx, i| {
             const pname = self.arena.get(param_idx).param.name;
+            self.recordStorage(param_idx);
             self.scopes.insert(self.nameSlice(pname), .{
                 .name = pname,
                 .kind = .param,
@@ -2475,6 +2745,7 @@ pub const TypeChecker = struct {
 
         const body_is_block = self.arena.get(cl.body).* == .block;
         const body_ty = self.inferExprType(cl.body);
+        if (!body_is_block) self.checkEscapeReturn(cl.body);
 
         self.scopes.popScope();
         self.fn_ret_type = prev_ret;
@@ -3613,6 +3884,7 @@ pub const TypeChecker = struct {
                 const arg = self.arena.get(arg_idx);
                 if (arg.* != .identifier) continue;
                 const field_ty = self.enumPayloadType(gparams, args, variant_node.enum_variant.fields.indices[i]);
+                self.recordStorage(arg_idx);
                 self.scopes.insert(self.nameSlice(arg.identifier), .{
                     .name = arg.identifier,
                     .kind = .local,
@@ -3743,9 +4015,9 @@ pub const TypeChecker = struct {
 
     fn inferTypeRefNode(self: *TypeChecker, ty: ast.TypeRepr) TypeIdx {
         return switch (ty) {
-            .plain => |n| self.inferExprType(n),
+            .plain => |n| self.inferTypeRef(n),
             .reference, .mut_reference => |n| blk: {
-                const pointee = self.inferExprType(n);
+                const pointee = self.inferTypeRef(n);
                 break :blk self.type_pool.add(.{ .pointer = .{
                     .elem = pointee,
                     .mutable = ty == .mut_reference,
@@ -3759,7 +4031,7 @@ pub const TypeChecker = struct {
         switch (decl.*) {
             .fn_decl => {
                 if (decl.fn_decl.return_type) |ret| {
-                    return self.inferExprType(ret);
+                    return self.inferTypeRef(ret);
                 }
                 return self.void_ty;
             },
@@ -4561,6 +4833,193 @@ test "typecheck: null is rejected for plain references" {
     defer deinitCheck(&res);
     try std.testing.expect(res.diagnostics.hasErrors());
     try std.testing.expect(hasMessage(&res.diagnostics, "'null' cannot be used as a non-null reference"));
+}
+
+test "typecheck: address-of accepts fields indices and dereferences" {
+    var res = try runCheck(std.testing.allocator,
+        \\struct Box { value: i32 }
+        \\fn write(p: &mut i32) { p.* = 2 }
+        \\fn f(p: &mut i32, text: String) -> i32 {
+        \\    mut b = Box{ .value = 1 }
+        \\    let field = &b.value
+        \\    let same = &p.*
+        \\    let ch = &text[0]
+        \\    write(&mut b.value)
+        \\    write(&mut p.*)
+        \\    return field.* + same.* + ch.*
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: pointer-to-pointer chains and annotated reference locals" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn set(pp: &mut &mut i32, value: i32) { pp.*.* = value }
+        \\fn main() -> i32 {
+        \\    mut x = 1
+        \\    mut p: &mut i32 = &mut x
+        \\    set(&mut p, 9)
+        \\    return p.*
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: address-of rejects rvalues" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn make() -> i32 { return 1 }
+        \\fn main() {
+        \\    let a = &1
+        \\    let b = &make()
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot take the address of an rvalue"));
+}
+
+test "typecheck: local and parameter addresses cannot be returned" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn direct() -> &i32 {
+        \\    let x = 1
+        \\    return &x
+        \\}
+        \\fn indirect() -> &i32 {
+        \\    let x = 1
+        \\    let p = &x
+        \\    return p
+        \\}
+        \\fn parameter(x: i32) -> &i32 {
+        \\    return &x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "reference to local 'x' escapes its block through return"));
+}
+
+test "typecheck: caller-owned references may be returned but local call results may not" {
+    var valid = try runCheck(std.testing.allocator,
+        \\fn identity(p: &i32) -> &i32 { return p }
+        \\fn readdress(p: &i32) -> &i32 { return &p.* }
+        \\fn main() -> i32 {
+        \\    let x = 4
+        \\    let p = identity(&x)
+        \\    let q = readdress(p)
+        \\    return q.*
+        \\}
+    );
+    defer deinitCheck(&valid);
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+
+    var invalid = try runCheck(std.testing.allocator,
+        \\fn identity(p: &i32) -> &i32 { return p }
+        \\fn bad() -> &i32 {
+        \\    let x = 4
+        \\    return identity(&x)
+        \\}
+    );
+    defer deinitCheck(&invalid);
+    try std.testing.expect(invalid.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "reference to local 'x' escapes its block through return"));
+}
+
+test "typecheck: closure environments do not extend local address lifetimes" {
+    var valid = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x = 4
+        \\    let p = &x
+        \\    let f = || p.*
+        \\    return f()
+        \\}
+    );
+    defer deinitCheck(&valid);
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+
+    var invalid = try runCheck(std.testing.allocator,
+        \\fn bad() -> fn() -> i32 {
+        \\    let x = 4
+        \\    let p = &x
+        \\    return || p.*
+        \\}
+    );
+    defer deinitCheck(&invalid);
+    try std.testing.expect(invalid.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "reference to local 'x' escapes its block through return"));
+}
+
+test "typecheck: branch-local address origins survive scope pop" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn bad(cond: bool, p: &i32) -> &i32 {
+        \\    let x = 4
+        \\    return if cond {
+        \\        let q = &x
+        \\        q
+        \\    } else {
+        \\        p
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "reference to local 'x' escapes its block through return"));
+}
+
+test "typecheck: local addresses cannot escape into longer-lived storage" {
+    var res = try runCheck(std.testing.allocator,
+        \\struct Holder { p: &i32 }
+        \\fn aggregate() -> Holder {
+        \\    let x = 1
+        \\    return Holder{ .p = &x }
+        \\}
+        \\fn assignment() -> i32 {
+        \\    mut x = 1
+        \\    mut h = Holder{ .p = &x }
+        \\    {
+        \\        let y = 2
+        \\        h.p = &y
+        \\    }
+        \\    return 0
+        \\}
+        \\fn output(out: &mut &i32) {
+        \\    let x = 1
+        \\    out.* = &x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "escapes its block through return"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "reference to local 'y' escapes its block through assignment to longer-lived storage"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "reference to local 'x' escapes its block through assignment to longer-lived storage"));
+}
+
+test "typecheck: a reference to outer storage is valid in a shorter nested block" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn read(p: &i32) -> i32 { return p.* }
+        \\fn main() -> i32 {
+        \\    let x = 4
+        \\    {
+        \\        let p = &x
+        \\        let value = read(p)
+        \\    }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: exclusive address-of cannot pass through a shared reference" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn f(p: &i32) {
+        \\    let q = &mut p.*
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot take an exclusive reference through a shared reference"));
 }
 
 // ---------------------------------------------------------------------------

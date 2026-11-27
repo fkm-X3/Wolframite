@@ -46,6 +46,8 @@ const GenericInstance = generics_mod.GenericInstance;
 const Binding = struct {
     value: api.Value,
     ty: TypeIdx,
+    /// Addressable storage for a scalar parameter, spilled on first address-of.
+    address: ?api.Value = null,
     /// The materialized composition this binding holds, if any (R31b).
     materialized: ?Materialized = null,
 };
@@ -1230,6 +1232,13 @@ pub const Lowerer = struct {
 
     /// `obj[index]` — Strings index by byte (char), arrays by element slot.
     fn lowerIndexAccess(self: *Lowerer, node_idx: NodeIdx, ia: anytype) !api.Value {
+        const elem_ptr = try self.lowerIndexAddr(node_idx, ia) orelse
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        if (self.aggregateByteSize(self.exprType(node_idx)) > 8) return elem_ptr;
+        return self.ctx.buildLoad(self.irTypeFor(self.exprType(node_idx)), elem_ptr);
+    }
+
+    fn lowerIndexAddr(self: *Lowerer, node_idx: NodeIdx, ia: anytype) !?api.Value {
         const obj = try self.lowerExpr(ia.object);
         const index = try self.lowerExpr(ia.index);
         var sem = self.type_pool.get(self.exprType(ia.object));
@@ -1238,16 +1247,14 @@ pub const Lowerer = struct {
             .string_type => {
                 const data_addr = try self.ctx.buildPtrAdd(self.ptr_ty, obj, try self.ctx.buildIntConst(self.i64_ty, @intCast(string_mod.data_offset)));
                 const data = try self.ctx.buildLoad(self.ptr_ty, data_addr);
-                const elem_ptr = try self.ctx.buildPtrAdd(self.ptr_ty, data, index);
-                return self.ctx.buildLoad(self.i32_ty, elem_ptr);
+                return try self.ctx.buildPtrAdd(self.ptr_ty, data, index);
             },
             .array => {
-                const elem_ptr = try self.ctx.buildPtrAdd(self.ptr_ty, obj, try self.ctx.buildMul(self.i64_ty, index, try self.ctx.buildIntConst(self.i64_ty, 8)));
-                return self.ctx.buildLoad(self.i64_ty, elem_ptr);
+                return try self.ctx.buildPtrAdd(self.ptr_ty, obj, try self.ctx.buildMul(self.i64_ty, index, try self.ctx.buildIntConst(self.i64_ty, 8)));
             },
             else => {
                 self.codegenError(node_idx, "index access is only lowered for String and array values", .{});
-                return self.ctx.buildIntConst(self.i64_ty, 0);
+                return null;
             },
         }
     }
@@ -1545,7 +1552,8 @@ pub const Lowerer = struct {
             .call => |c| return self.lowerCall(node_idx, c),
             .field_access => |fa| {
                 if (try self.lowerFieldAddr(node_idx, fa)) |addr| {
-                    return self.ctx.buildLoad(self.i64_ty, addr);
+                    if (self.aggregateByteSize(self.exprType(node_idx)) > 8) return addr;
+                    return self.ctx.buildLoad(self.irTypeFor(self.exprType(node_idx)), addr);
                 }
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
@@ -1881,6 +1889,8 @@ pub const Lowerer = struct {
     }
 
     fn lowerUnary(self: *Lowerer, node_idx: NodeIdx, u: anytype) !api.Value {
+        if (u.op == .ref or u.op == .mut_ref) return self.lowerRef(node_idx, u.operand);
+
         const operand = try self.lowerExpr(u.operand);
         const sem = self.type_pool.get(self.checker.nodeType(u.operand));
         const is_float = sem == .float;
@@ -1893,42 +1903,29 @@ pub const Lowerer = struct {
                 self.ctx.buildSub(ir_ty, try self.ctx.buildIntConst(ir_ty, 0), operand),
             .not => self.ctx.buildXor(self.bool_ty, operand, try self.ctx.buildIntConst(self.bool_ty, 1)),
             .bit_not => self.ctx.buildXor(ir_ty, operand, try self.ctx.buildIntConst(ir_ty, -1)),
-            .ref, .mut_ref => self.lowerRef(node_idx, u.operand),
+            .ref, .mut_ref => unreachable,
         };
     }
 
-    /// `&x` / `&mut x`. An aggregate value (`struct`, `enum`, `String`, pointer)
-    /// is already a pointer to its block under this lowering's value
-    /// convention, so its reference is the value itself; this is what makes
-    /// the free-function mutation model work — `scale(&mut v, 2.0)` passes the
-    /// struct's block straight to `fn scale(v: &mut Vec2)`, and the callee's
-    /// `&mut T` parameter arrives as that same pointer. A scalar local's
-    /// reference is its stack slot; a scalar parameter (an SSA value with no
-    /// address) is spilled to a fresh slot first.
+    /// Address-of uses the operand's storage, never the temporary produced by
+    /// reading it. Scalar parameters are SSA values, so their first address-of
+    /// spills them to one cached slot; subsequent references alias that slot.
     fn lowerRef(self: *Lowerer, node_idx: NodeIdx, operand_idx: NodeIdx) !api.Value {
-        switch (self.type_pool.get(self.exprType(operand_idx))) {
-            .struct_type,
-            .enum_type,
-            .string_type,
-            .array,
-            .pointer,
-            .applied_struct,
-            .applied_enum,
-            => return self.lowerExpr(operand_idx),
-            else => {},
-        }
-
         const node = self.arena.get(operand_idx);
         if (node.* == .identifier) {
             const name = self.nameSlice(node.identifier);
-            if (self.locals.get(name)) |binding| return binding.value;
-            if (self.params.get(name)) |param| {
+            if (self.params.getPtr(name)) |param| {
+                if (self.aggregateByteSize(param.ty) > 8) return param.value;
+                if (param.address) |address| return address;
                 const slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
                 _ = try self.ctx.buildStore(self.i64_ty, slot, param.value);
+                param.address = slot;
                 return slot;
             }
         }
-        self.codegenError(node_idx, "cannot take a reference of this expression", .{});
+
+        if (try self.lowerLvalue(operand_idx)) |address| return address;
+        self.codegenError(node_idx, "cannot take the address of an rvalue", .{});
         return self.ctx.buildIntConst(self.i64_ty, 0);
     }
 
@@ -3198,7 +3195,9 @@ pub const Lowerer = struct {
                 break :blk null;
             },
             .field_access => |fa| try self.lowerFieldAddr(node_idx, fa),
+            .index_access => |ia| try self.lowerIndexAddr(node_idx, ia),
             .deref => |operand| try self.lowerExpr(operand),
+            .paren_expr => |inner| try self.lowerLvalue(inner),
             else => null,
         };
     }
@@ -3958,6 +3957,48 @@ test "lower: scalar reference dereference loads and stores" {
     try std.testing.expect(std.mem.indexOf(u8, text, "= load %2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "store %1,") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "store %2,") != null);
+}
+
+test "lower: address-of uses field index deref and pointer storage" {
+    var res = try checkLower(std.testing.allocator,
+        \\struct Box { value: i32 }
+        \\fn set(pp: &mut &mut i32, value: i32) { pp.*.* = value }
+        \\fn main() -> i32 {
+        \\    mut b = Box{ .value = 1 }
+        \\    let field = &b.value
+        \\    mut x = 2
+        \\    mut p: &mut i32 = &mut x
+        \\    set(&mut p, 3)
+        \\    let same = &p.*
+        \\    let text = "a"
+        \\    let ch = &text[0]
+        \\    return field.* + same.* + ch.*
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [16384]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "load") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "store") != null);
+}
+
+test "lower: repeated address-of a scalar parameter reuses its spill slot" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn both(x: i32) -> i32 {
+        \\    let p = &x
+        \\    let q = &mut x
+        \\    q.* = 7
+        \\    return p.*
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    // Two pointer locals plus one shared spill for the parameter, not two spills.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "alloca 8"));
 }
 
 test "lower: dot-call on a struct value is not method dispatch" {

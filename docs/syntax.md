@@ -302,6 +302,28 @@ Dereferencing a non-reference is a semantic error. Plain references are non-null
 represented as `Option[&T]`, not by assigning `null`. Shared and exclusive reference
 types are distinct, so an argument's reference mutability must match the parameter.
 
+`&` and `&mut` accept any lvalue: a local or parameter, a field, an index, a
+dereference, or a parenthesized lvalue. Taking the address of a dereference yields
+the pointee's address, which permits pointer-to-pointer chains:
+
+```wfr
+struct Box { value: i32 }
+
+fn replaceIndirect(pp: &mut &mut i32, value: i32) { pp.*.* = value }
+
+fn addresses(box: Box, p: &mut i32, text: String) {
+    let field = &box.value
+    let same = &p.*
+    let byte = &text[0]
+}
+```
+
+Taking the address of a literal, call result, arithmetic result, or other rvalue is
+an error. `&mut` also cannot pass through a shared reference. An address of local or
+parameter storage is confined to that storage's block and shorter nested blocks: it
+cannot be returned or assigned into outer, global, or otherwise longer-lived storage,
+including an aggregate that would carry it out of the block.
+
 ### 4.9 Struct initializers
 
 ```

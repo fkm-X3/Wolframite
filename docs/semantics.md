@@ -692,6 +692,22 @@ runtime-only fn writing `x` + newline to stdout:
   non-null: `null` is rejected in every position that expects `&T` or `&mut T`,
   including initializers, arguments, returns, fields, and assignments. Nullability is
   represented by `Option[&T]`, not by a null plain reference.
+- **R44 (address-of lvalues and storage escape).** `&` and `&mut` accept identifiers,
+  fields, indices, dereferences, and parenthesized lvalues. Addressing a dereference
+  produces the pointee address without a load; addressing a field or index produces
+  the corresponding storage address. Addressing an rvalue is a semantic error, as is
+  forming `&mut` through a shared reference. Every address of local or parameter
+  storage carries that storage's lexical block depth. It may move into bindings and
+  aggregates at the same or a deeper depth, but may not be returned or assigned into
+  shallower, module-global, or unknown-lifetime storage. Bindings, aggregates, branch
+  results, closure capture sets, and reference/aggregate-returning calls conservatively
+  propagate this origin; retaining the deepest known origin is intentional. A function
+  may accept a local address as a temporary argument, and a reference parameter may be
+  returned directly because its pointee storage belongs to the caller. Raising a closure
+  environment under R10 does not extend the lifetime of any local address carried by
+  that environment. Lowering uses stable local slots, one cached spill slot per scalar
+  parameter, field/index address arithmetic, or the existing pointee pointer as
+  appropriate; it never takes the address of an SSA temporary.
 
 ## 11. Conformance checklist
 
@@ -712,6 +728,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `break` / `continue`, including targeted labels | R40–R41 |
 | `unreachable` / native trap | R42 |
 | `&T` / `&mut T`, postfix `.*`, non-null references | R43 |
+| address-of lvalues and local-storage escape checks | R44 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -723,8 +740,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R43; backend tests for R3/R16/R42; lowerer tests for R13–R18,
-   R28, R31, R40–R43); and
+   (compiler tests for R4–R29 and R40–R44; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R44); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.
