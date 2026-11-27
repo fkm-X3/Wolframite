@@ -126,7 +126,7 @@ pub const Mangler = struct {
     /// | `i8`..`i64`, `u8`..`u64`, `f32`, `f64` | the spelled name, e.g. `i32` |
     /// | `bool` | `b` |
     /// | `String` | `str` |
-    /// | pointer `*T` | `pt_<T>` |
+    /// | `&T` / `&mut T` | `pt_<T>` / `pm_<T>` |
     /// | fn type | `fn_<ret>__<arg1>_<arg2>...` |
     /// | struct/enum instance | `<name>_<mangled args>` |
     pub fn mangleType(self: *Mangler, ty: TypeIdx) !void {
@@ -138,9 +138,9 @@ pub const Mangler = struct {
             }),
             .float => |f| try self.out.appendSlice(self.gpa, @tagName(f)),
             .string_type => try self.out.appendSlice(self.gpa, "str"),
-            .pointer => |elem| {
-                try self.out.appendSlice(self.gpa, "pt_");
-                try self.mangleType(elem);
+            .pointer => |ptr| {
+                try self.out.appendSlice(self.gpa, if (ptr.mutable) "pm_" else "pt_");
+                try self.mangleType(ptr.elem);
             },
             .function => |f| {
                 try self.out.appendSlice(self.gpa, "fn_");
@@ -223,10 +223,10 @@ pub fn substType(pool: *TypePool, ty: TypeIdx, args: []const TypeIdx) !TypeIdx {
             if (gp.index < args.len) return args[gp.index];
             return ty;
         },
-        .pointer => |elem| {
-            const new_elem = try substType(pool, elem, args);
-            if (new_elem == elem) return ty;
-            return pool.add(.{ .pointer = new_elem });
+        .pointer => |ptr| {
+            const new_elem = try substType(pool, ptr.elem, args);
+            if (new_elem == ptr.elem) return ty;
+            return pool.add(.{ .pointer = .{ .elem = new_elem, .mutable = ptr.mutable } });
         },
         .function => |f| {
             const params = try pool.allocator.alloc(TypeIdx, f.param_types.len);
@@ -327,12 +327,13 @@ fn hashType(pool: *const TypePool, ty: TypeIdx, h: *u64, depth: u32) void {
         },
         .float => |f| {
             h.* = mix(h.*, 4);
-            h.* = mix(h.*, @intFromEnum(f));
+            h.* = mix(h.*, @backingInt(f));
         },
         .string_type => h.* = mix(h.*, 5),
-        .pointer => |elem| {
+        .pointer => |ptr| {
             h.* = mix(h.*, 6);
-            hashType(pool, elem, h, depth + 1);
+            h.* = mix(h.*, if (ptr.mutable) 1 else 0);
+            hashType(pool, ptr.elem, h, depth + 1);
         },
         .function => |f| {
             h.* = mix(h.*, 7);
@@ -341,25 +342,25 @@ fn hashType(pool: *const TypePool, ty: TypeIdx, h: *u64, depth: u32) void {
         },
         .struct_type => |decl| {
             h.* = mix(h.*, 8);
-            h.* = mix(h.*, @intFromEnum(decl));
+            h.* = mix(h.*, @backingInt(decl));
         },
         .applied_struct => |a| {
             h.* = mix(h.*, 9);
-            h.* = mix(h.*, @intFromEnum(a.decl));
+            h.* = mix(h.*, @backingInt(a.decl));
             for (a.args) |x| hashType(pool, x, h, depth + 1);
         },
         .enum_type => |decl| {
             h.* = mix(h.*, 10);
-            h.* = mix(h.*, @intFromEnum(decl));
+            h.* = mix(h.*, @backingInt(decl));
         },
         .applied_enum => |a| {
             h.* = mix(h.*, 11);
-            h.* = mix(h.*, @intFromEnum(a.decl));
+            h.* = mix(h.*, @backingInt(a.decl));
             for (a.args) |x| hashType(pool, x, h, depth + 1);
         },
         .applied_fn => |a| {
             h.* = mix(h.*, 12);
-            h.* = mix(h.*, @intFromEnum(a.decl));
+            h.* = mix(h.*, @backingInt(a.decl));
             for (a.args) |x| hashType(pool, x, h, depth + 1);
             hashType(pool, a.sig, h, depth + 1);
         },
@@ -391,7 +392,7 @@ pub fn typesEqual(pool: *const TypePool, a: TypeIdx, b: TypeIdx) bool {
         .void, .bool_type, .string_type, .inferred => true,
         .int => |ia| ia.signed == tb.int.signed and ia.bits == tb.int.bits,
         .float => |fa| fa == tb.float,
-        .pointer => |pa| typesEqual(pool, pa, tb.pointer),
+        .pointer => |pa| pa.mutable == tb.pointer.mutable and typesEqual(pool, pa.elem, tb.pointer.elem),
         .function => |fa| blk: {
             const fb = tb.function;
             if (fa.param_types.len != fb.param_types.len) break :blk false;
@@ -475,9 +476,11 @@ pub const Bindings = struct {
 pub fn unifyTemplate(pool: *const TypePool, template: TypeIdx, arg: TypeIdx, bindings: *Bindings) void {
     switch (pool.get(template)) {
         .generic_param => |gp| bindings.bind(pool, gp.index, arg),
-        .pointer => |elem| {
+        .pointer => |ptr| {
             const arg_sem = pool.get(arg);
-            if (arg_sem == .pointer) unifyTemplate(pool, elem, arg_sem.pointer, bindings);
+            if (arg_sem == .pointer and arg_sem.pointer.mutable == ptr.mutable) {
+                unifyTemplate(pool, ptr.elem, arg_sem.pointer.elem, bindings);
+            }
         },
         .function => |tf| {
             const arg_sem = pool.get(arg);
@@ -578,10 +581,10 @@ test "subst: substitution reaches through a pointer" {
 
     const i32_ty = try pool.add(.{ .int = .{ .signed = true, .bits = 32 } });
     const gp_ty = try pool.add(.{ .generic_param = .{ .name = .{ .start = 0, .end = 1 }, .index = 0 } });
-    const ptr_ty = try pool.add(.{ .pointer = gp_ty });
+    const ptr_ty = try pool.add(.{ .pointer = .{ .elem = gp_ty, .mutable = false } });
 
     const sub = try substType(&pool, ptr_ty, &.{i32_ty});
-    try std.testing.expectEqual(i32_ty, pool.get(sub).pointer);
+    try std.testing.expectEqual(i32_ty, pool.get(sub).pointer.elem);
 }
 
 test "typeHash: the same shape hashes the same" {

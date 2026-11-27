@@ -1233,7 +1233,7 @@ pub const Lowerer = struct {
         const obj = try self.lowerExpr(ia.object);
         const index = try self.lowerExpr(ia.index);
         var sem = self.type_pool.get(self.exprType(ia.object));
-        if (sem == .pointer) sem = self.type_pool.get(sem.pointer);
+        if (sem == .pointer) sem = self.type_pool.get(sem.pointer.elem);
         switch (sem) {
             .string_type => {
                 const data_addr = try self.ctx.buildPtrAdd(self.ptr_ty, obj, try self.ctx.buildIntConst(self.i64_ty, @intCast(string_mod.data_offset)));
@@ -1541,6 +1541,7 @@ pub const Lowerer = struct {
             },
             .binary_op => |b| return self.lowerBinary(node_idx, b),
             .unary_op => |u| return self.lowerUnary(node_idx, u),
+            .deref => |operand| return self.lowerDeref(node_idx, operand),
             .call => |c| return self.lowerCall(node_idx, c),
             .field_access => |fa| {
                 if (try self.lowerFieldAddr(node_idx, fa)) |addr| {
@@ -1863,6 +1864,20 @@ pub const Lowerer = struct {
         };
         _ = try self.ctx.buildStore(self.i64_ty, addr, result);
         return result;
+    }
+
+    /// Load through a reference. Aggregate pointees already use their block
+    /// address as the value representation; scalar pointees are loaded from it.
+    fn lowerDeref(self: *Lowerer, node_idx: NodeIdx, operand_idx: NodeIdx) !api.Value {
+        const addr = try self.lowerExpr(operand_idx);
+        const reference_sem = self.type_pool.get(self.exprType(operand_idx));
+        if (reference_sem != .pointer) {
+            self.codegenError(node_idx, "cannot dereference a non-reference value", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+        const pointee = reference_sem.pointer.elem;
+        if (self.aggregateByteSize(pointee) > 8) return addr;
+        return self.ctx.buildLoad(self.irTypeFor(pointee), addr);
     }
 
     fn lowerUnary(self: *Lowerer, node_idx: NodeIdx, u: anytype) !api.Value {
@@ -3147,7 +3162,7 @@ pub const Lowerer = struct {
         switch (sem) {
             .struct_type => |n| decl_node = n,
             .applied_struct => |a| decl_node = a.decl,
-            .pointer => |elem| switch (self.type_pool.get(elem)) {
+            .pointer => |ptr| switch (self.type_pool.get(ptr.elem)) {
                 .struct_type => |n| decl_node = n,
                 .applied_struct => |a| decl_node = a.decl,
                 else => {},
@@ -3183,6 +3198,7 @@ pub const Lowerer = struct {
                 break :blk null;
             },
             .field_access => |fa| try self.lowerFieldAddr(node_idx, fa),
+            .deref => |operand| try self.lowerExpr(operand),
             else => null,
         };
     }
@@ -3222,16 +3238,18 @@ pub const Lowerer = struct {
         };
     }
 
-    /// Semantic type of a function parameter's type node. The checker caches
-    /// the pointee's type on `&T`/`&mut T` unary nodes but not the reference
-    /// itself, so reference types are rebuilt here.
+    /// Semantic type of a function parameter's type node, rebuilt when the
+    /// parameter uses reference syntax so its mutability is explicit here.
     fn paramType(self: *Lowerer, ty_node: NodeIdx) !TypeIdx {
         const node = self.arena.get(ty_node);
         if (node.* == .unary_op) {
             switch (node.unary_op.op) {
                 .ref, .mut_ref => {
                     const pointee = self.checker.nodeType(node.unary_op.operand);
-                    return try self.type_pool.add(.{ .pointer = pointee });
+                    return try self.type_pool.add(.{ .pointer = .{
+                        .elem = pointee,
+                        .mutable = node.unary_op.op == .mut_ref,
+                    } });
                 },
                 else => {},
             }
@@ -3340,7 +3358,7 @@ pub const Lowerer = struct {
                     const decl_node: ?NodeIdx = switch (sem) {
                         .struct_type => |n| n,
                         .applied_struct => |a| a.decl,
-                        .pointer => |elem| switch (self.type_pool.get(elem)) {
+                        .pointer => |ptr| switch (self.type_pool.get(ptr.elem)) {
                             .struct_type => |n| n,
                             .applied_struct => |a| a.decl,
                             else => null,
@@ -3913,6 +3931,33 @@ test "lower: a free function mutates a struct through a `&mut` parameter" {
     try std.testing.expect(std.mem.indexOf(u8, text, "store") != null);
     // `scale(&mut v, 2.0)` is a plain direct call with the block and the factor.
     try std.testing.expect(std.mem.indexOf(u8, text, "call @fn") != null);
+}
+
+test "lower: scalar reference dereference loads and stores" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn swap(a: &mut i32, b: &mut i32) {
+        \\    let tmp = a.*
+        \\    a.* = b.*
+        \\    b.* = tmp
+        \\}
+        \\fn read(p: &i32) -> i32 {
+        \\    return p.*
+        \\}
+        \\fn main() -> i32 {
+        \\    mut x = 3
+        \\    mut y = 7
+        \\    swap(&mut x, &mut y)
+        \\    return read(&x) * 10 + read(&y)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "= load %1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "= load %2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "store %1,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "store %2,") != null);
 }
 
 test "lower: dot-call on a struct value is not method dispatch" {

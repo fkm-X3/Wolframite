@@ -79,6 +79,8 @@ pub const Node = union(enum) {
     // Expressions
     binary_op: struct { op: BinaryOp, left: NodeIdx, right: NodeIdx },
     unary_op: struct { op: UnaryOp, operand: NodeIdx },
+    /// Postfix `.*` dereference of a shared or exclusive reference.
+    deref: NodeIdx,
     call: struct { func: NodeIdx, args: NodeList },
     field_access: struct { object: NodeIdx, field: StringRef },
     index_access: struct { object: NodeIdx, index: NodeIdx },
@@ -274,6 +276,10 @@ fn cloneNode(
         .unary_op => |u| {
             const operand = try cloneNode(arena, u.operand, map);
             return appendClone(arena, idx, map, .{ .unary_op = .{ .op = u.op, .operand = operand } });
+        },
+        .deref => |operand| {
+            const cloned = try cloneNode(arena, operand, map);
+            return appendClone(arena, idx, map, .{ .deref = cloned });
         },
         .call => |c| {
             const func = try cloneNode(arena, c.func, map);

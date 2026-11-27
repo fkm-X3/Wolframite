@@ -851,6 +851,15 @@ pub const Parser = struct {
                 break;
             }
 
+            if (tok.tag == .dot and self.peekNext().tag == .star) {
+                const deref_prec = Precedence.postfix.toInt();
+                if (deref_prec < min_prec) break;
+                _ = self.advance();
+                _ = self.advance();
+                left = self.appendNode(.{ .deref = left });
+                continue;
+            }
+
             if (tok.tag == .question) {
                 const qprec = Precedence.postfix.toInt();
                 if (qprec < min_prec) break;
@@ -2167,6 +2176,28 @@ test "parser: match guard" {
     try std.testing.expect(arm0.match_arm.guard != null);
     const arm1 = res.arena.get(match.match_expr.arms.indices[1]);
     try std.testing.expect(arm1.match_arm.guard == null);
+}
+
+test "parser: postfix dereference reads and assignment" {
+    var res = try runTest(std.testing.allocator,
+        \\fn f(p: &mut i32, q: &i32) -> i32 {
+        \\    p.* = q.*
+        \\    return p.*
+        \\}
+    );
+    defer res.arena.deinit();
+
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    const assign = res.arena.get(stmt.expr_stmt.expr);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .binary_op), tagOf(assign));
+    try std.testing.expectEqual(BinaryOp.assign, assign.binary_op.op);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .deref), tagOf(res.arena.get(assign.binary_op.left)));
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .deref), tagOf(res.arena.get(assign.binary_op.right)));
+
+    const ret = res.arena.get(body.block.stmts.indices[1]);
+    const value = res.arena.get(ret.return_stmt.value orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .deref), tagOf(value));
 }
 
 test "parser: reference type representations" {

@@ -29,7 +29,7 @@ Implementation targets, per layer:
 | `compiler/semantic/types.zig` | `SemType` union incl. the `function` member and generic `app` representation, `TypePool` |
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
-| `compiler/semantic/typecheck.zig` | typing rules R4–R40, `?` rules R26–R29, constraint eval ordering |
+| `compiler/semantic/typecheck.zig` | typing rules R4–R43, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
 
@@ -433,7 +433,7 @@ Instance function names are compiler-internal and deterministic:
 | `i8..i64`, `u8..u64`, `f32`, `f64` | the spelled name, e.g. `i32`, `f64` |
 | `bool` | `b` |
 | `String` | `str` |
-| pointer `*T` | `pt_<T>`; `*mut T` `pm_<T>` |
+| `&T` / `&mut T` | `pt_<T>` / `pm_<T>` |
 | fn type | `fn_<ret>__<arg1>_<arg2>...` |
 | struct/enum instance | `<name>_<mangled args>` |
 | closure type (only inside instances) | `cl_<n>` |
@@ -683,6 +683,15 @@ runtime-only fn writing `x` + newline to stdout:
   lowering emits `int3` (`0xcc`); the IR simulator stops with the hard error `Trap`. `trap` is
   a terminator alongside `br`, `cond_br`, `ret`, and `ret_void`, so IR verification rejects any
   instruction following it in the same block.
+- **R43 (reference dereference and non-null references).** `&x` has type `&T` and
+  `&mut x` has type `&mut T`; shared and exclusive references are distinct types and
+  argument mutability must match the parameter. Postfix `p.*` is legal only when `p`
+  is a reference. It reads the pointee for either reference kind, while assignment or
+  compound assignment through `p.*` requires `&mut T`. Scalar reads lower to a load
+  through the reference and writes lower to a store through it. Plain references are
+  non-null: `null` is rejected in every position that expects `&T` or `&mut T`,
+  including initializers, arguments, returns, fields, and assignments. Nullability is
+  represented by `Option[&T]`, not by a null plain reference.
 
 ## 11. Conformance checklist
 
@@ -702,6 +711,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `print` IO prelude | R39 |
 | `break` / `continue`, including targeted labels | R40–R41 |
 | `unreachable` / native trap | R42 |
+| `&T` / `&mut T`, postfix `.*`, non-null references | R43 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -713,8 +723,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R42; backend tests for R3/R16/R42; lowerer tests for R13–R18,
-   R28, R31, R40–R42); and
+   (compiler tests for R4–R29 and R40–R43; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R43); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

@@ -252,7 +252,7 @@ Precedence, loosest→tightest. Assumed left-associative except assignment/arrow
 | 12 term | `+` `-` | left |
 | 13 factor | `*` `/` `%` | left |
 | 14 prefix | `-` `!` `~` `&` `&mut` `move` `@name` | — |
-| 15 postfix | call `(...)`, index `[...]`, field `.x`, `?` | left |
+| 15 postfix | call `(...)`, index `[...]`, field `.x`, deref `.*`, `?` | left |
 | 16 primary | literals, identifiers, `(expr)`, `{ block }`, closure | — |
 
 (This mirrors the parser's `Precedence` ladder in `parser.zig`.)
@@ -274,7 +274,7 @@ Precedence, loosest→tightest. Assumed left-associative except assignment/arrow
 <factor_expr> ::= <unary_expr> ( ('*'|'/'|'%') <unary_expr> )*
 <unary_expr>  ::= prefix_op <unary_expr> | <postfix_expr>
 <postfix_expr>::= <primary> postfix_op*
-<postfix_op>  ::= '(' <arg_list> ')' | '[' <expr> ']' | '.' <identifier> | '?'
+<postfix_op>  ::= '(' <arg_list> ')' | '[' <expr> ']' | '.' <identifier> | '.' '*' | '?'
 <primary>     ::= int_literal | float_literal | string_literal | char_literal
                 | 'true' | 'false' | 'null'
                 | <identifier>                 -- incl. struct/enum type names & fn names
@@ -288,6 +288,19 @@ Precedence, loosest→tightest. Assumed left-associative except assignment/arrow
                 | <struct_init>
                 | <fn_type_literal>            -- fn-type as first-class expr, see §4.10
 ```
+
+Postfix `.*` dereferences a reference. Both `&T` and `&mut T` permit reads;
+assignment through the dereference requires `&mut T`:
+
+```wfr
+fn read(p: &i32) -> i32 { return p.* }
+fn replace(p: &mut i32, value: i32) { p.* = value }
+```
+
+Dereferencing a non-reference is a semantic error. Plain references are non-null:
+`null` is rejected wherever `&T` or `&mut T` is expected. A nullable reference is
+represented as `Option[&T]`, not by assigning `null`. Shared and exclusive reference
+types are distinct, so an argument's reference mutability must match the parameter.
 
 ### 4.9 Struct initializers
 

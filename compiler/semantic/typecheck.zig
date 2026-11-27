@@ -549,7 +549,10 @@ pub const TypeChecker = struct {
                 switch (u.op) {
                     .ref, .mut_ref => {
                         const pointee = self.resolveTemplateType(gparams, u.operand);
-                        return self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
+                        return self.type_pool.add(.{ .pointer = .{
+                            .elem = pointee,
+                            .mutable = u.op == .mut_ref,
+                        } }) catch @panic("OOM");
                     },
                     else => return self.inferExprType(node),
                 }
@@ -1196,7 +1199,10 @@ pub const TypeChecker = struct {
             .unary_op => |u| switch (u.op) {
                 .ref, .mut_ref => {
                     const pointee = self.comptimeTypeArg(u.operand) orelse return null;
-                    return self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
+                    return self.type_pool.add(.{ .pointer = .{
+                        .elem = pointee,
+                        .mutable = u.op == .mut_ref,
+                    } }) catch @panic("OOM");
                 },
                 else => return null,
             },
@@ -1415,8 +1421,7 @@ pub const TypeChecker = struct {
                 if (self.genericParamMention(p.lhs)) |n| return n;
                 return self.genericParamMention(p.rhs);
             },
-            .try_propagate => |inner| return self.genericParamMention(inner),
-            .move_expr => |inner| return self.genericParamMention(inner),
+            .try_propagate, .move_expr, .deref => |inner| return self.genericParamMention(inner),
             .block => |b| {
                 for (b.stmts.indices) |stmt| {
                     if (self.genericParamMention(stmt)) |n| return n;
@@ -1475,6 +1480,10 @@ pub const TypeChecker = struct {
             .unary_op => |u| {
                 self.appendTo(buf, len, unaryOpName(u.op));
                 self.renderComptimeExprInto(u.operand, buf, len);
+            },
+            .deref => |operand| {
+                self.renderComptimeExprInto(operand, buf, len);
+                self.appendTo(buf, len, ".*");
             },
             .comptime_expr => |inner| {
                 self.appendTo(buf, len, "comptime ");
@@ -1891,7 +1900,9 @@ pub const TypeChecker = struct {
                 if (b.op == .assign or b.op == .add_assign or b.op == .sub_assign or
                     b.op == .mul_assign or b.op == .div_assign)
                 {
-                    if (!self.typesEqual(left_ty, right_ty)) {
+                    self.checkAssignmentTarget(b.left);
+                    const null_rejected = self.rejectNullForReference(b.right, left_ty);
+                    if (!null_rejected and !self.typesEqual(left_ty, right_ty)) {
                         self.errorAt(expr_idx, "assignment type mismatch: '{s}' and '{s}'", .{
                             self.typeName(left_ty), self.typeName(right_ty),
                         });
@@ -1927,7 +1938,24 @@ pub const TypeChecker = struct {
                 return left_ty;
             },
             .unary_op => |u| {
-                return self.inferExprType(u.operand);
+                const operand_ty = self.inferExprType(u.operand);
+                return switch (u.op) {
+                    .ref, .mut_ref => self.type_pool.add(.{ .pointer = .{
+                        .elem = operand_ty,
+                        .mutable = u.op == .mut_ref,
+                    } }) catch @panic("OOM"),
+                    else => operand_ty,
+                };
+            },
+            .deref => |operand| {
+                const operand_ty = self.inferExprType(operand);
+                return switch (self.type_pool.get(operand_ty)) {
+                    .pointer => |ptr| ptr.elem,
+                    else => blk: {
+                        self.errorAt(expr_idx, "cannot dereference non-reference type '{s}'", .{self.typeName(operand_ty)});
+                        break :blk self.void_ty;
+                    },
+                };
             },
             .call => |c| {
                 return self.inferCallType(expr_idx, c);
@@ -1956,8 +1984,8 @@ pub const TypeChecker = struct {
                         });
                         return self.void_ty;
                     },
-                    .pointer => |elem| {
-                        const elem_type = self.type_pool.get(elem);
+                    .pointer => |ptr| {
+                        const elem_type = self.type_pool.get(ptr.elem);
                         switch (elem_type) {
                             .struct_type => |decl_node| {
                                 if (self.structFieldType(decl_node, self.nameSlice(fa.field))) |ft| {
@@ -2232,10 +2260,33 @@ pub const TypeChecker = struct {
         return .{ .left = left_ty, .right = right_ty };
     }
 
+    /// Reject a write through a shared reference. Other assignment-target
+    /// rules are owned by their respective lvalue forms.
+    fn checkAssignmentTarget(self: *TypeChecker, target: NodeIdx) void {
+        const node = self.arena.get(target);
+        if (node.* != .deref) return;
+        const reference_ty = self.inferExprType(node.deref);
+        const sem = self.type_pool.get(reference_ty);
+        if (sem == .pointer and !sem.pointer.mutable) {
+            self.errorAt(target, "cannot write through a shared reference; use '&mut' to mutate the pointee", .{});
+        }
+    }
+
+    /// Plain references are non-null. The `null` literal keeps its existing
+    /// unit meaning in contexts that do not expect a reference.
+    fn rejectNullForReference(self: *TypeChecker, expr_idx: NodeIdx, expected: TypeIdx) bool {
+        const node = self.arena.get(expr_idx);
+        if (node.* != .null_literal or self.type_pool.get(expected) != .pointer) return false;
+        self.errorAt(expr_idx, "'null' cannot be used as a non-null reference", .{});
+        self.setNodeType(expr_idx, expected);
+        return true;
+    }
+
     /// Infer `expr_idx` with an expected type, threading it into closure params
     /// (R11a). For anything but a closure this is a plain inference plus, when
     /// the expression is an unresolved placeholder, adopting the expected type.
     fn inferExprTypeExpected(self: *TypeChecker, expr_idx: NodeIdx, expected: TypeIdx) TypeIdx {
+        if (self.rejectNullForReference(expr_idx, expected)) return expected;
         const prev = self.getNodeType(expr_idx);
         if (prev != self.void_ty) return prev;
 
@@ -2608,7 +2659,7 @@ pub const TypeChecker = struct {
                 self.walkCaptures(p.lhs, cs);
                 self.walkCaptures(p.rhs, cs);
             },
-            .try_propagate, .move_expr => |inner| self.walkCaptures(inner, cs),
+            .try_propagate, .move_expr, .deref => |inner| self.walkCaptures(inner, cs),
             .region_expr => |r| {
                 if (r.allocator) |a| self.walkCaptures(a, cs);
                 self.walkCaptures(r.body, cs);
@@ -3471,7 +3522,7 @@ pub const TypeChecker = struct {
     fn mentionsGenericParam(self: *const TypeChecker, ty: TypeIdx) bool {
         return switch (self.type_pool.get(ty)) {
             .generic_param => true,
-            .pointer => |elem| self.mentionsGenericParam(elem),
+            .pointer => |ptr| self.mentionsGenericParam(ptr.elem),
             .function => |f| blk: {
                 for (f.param_types) |p| {
                     if (self.mentionsGenericParam(p)) break :blk true;
@@ -3610,7 +3661,7 @@ pub const TypeChecker = struct {
     /// Element type produced by `obj[index]`.
     fn inferElementType(self: *TypeChecker, node_idx: NodeIdx, obj_ty: TypeIdx) TypeIdx {
         var sem = self.type_pool.get(obj_ty);
-        if (sem == .pointer) sem = self.type_pool.get(sem.pointer);
+        if (sem == .pointer) sem = self.type_pool.get(sem.pointer.elem);
         return switch (sem) {
             .string_type => self.i32_ty,
             .array => |a| a.elem,
@@ -3631,7 +3682,7 @@ pub const TypeChecker = struct {
     /// Element type of a `for ... in` iterable, or void if not iterable.
     fn forEachElemType(self: *TypeChecker, node_idx: NodeIdx, iter_ty: TypeIdx) TypeIdx {
         var sem = self.type_pool.get(iter_ty);
-        if (sem == .pointer) sem = self.type_pool.get(sem.pointer);
+        if (sem == .pointer) sem = self.type_pool.get(sem.pointer.elem);
         return switch (sem) {
             .string_type => self.i32_ty,
             .array => |a| a.elem,
@@ -3680,7 +3731,10 @@ pub const TypeChecker = struct {
             .reference, .mut_reference => |n| {
                 if (self.genericParamIndex(generic_params, n)) |i| {
                     const inner = self.genericParamType(n, i);
-                    return self.type_pool.add(.{ .pointer = inner }) catch @panic("OOM");
+                    return self.type_pool.add(.{ .pointer = .{
+                        .elem = inner,
+                        .mutable = ty == .mut_reference,
+                    } }) catch @panic("OOM");
                 }
             },
         }
@@ -3692,7 +3746,10 @@ pub const TypeChecker = struct {
             .plain => |n| self.inferExprType(n),
             .reference, .mut_reference => |n| blk: {
                 const pointee = self.inferExprType(n);
-                break :blk self.type_pool.add(.{ .pointer = pointee }) catch @panic("OOM");
+                break :blk self.type_pool.add(.{ .pointer = .{
+                    .elem = pointee,
+                    .mutable = ty == .mut_reference,
+                } }) catch @panic("OOM");
             },
         };
     }
@@ -3751,7 +3808,7 @@ pub const TypeChecker = struct {
             .void, .bool_type, .string_type, .inferred => return true,
             .int => |ai| return ai.signed == b.int.signed and ai.bits == b.int.bits,
             .float => |af| return af == b.float,
-            .pointer => |ap| return self.typesEqual(ap, b.pointer),
+            .pointer => |ap| return ap.mutable == b.pointer.mutable and self.typesEqual(ap.elem, b.pointer.elem),
             .function => |af| {
                 const bf = b.function;
                 if (!self.typesEqual(af.return_type, bf.return_type)) return false;
@@ -3795,7 +3852,7 @@ pub const TypeChecker = struct {
             .void => "void",
             .bool_type => "bool",
             .float => |f| @tagName(f),
-            .pointer => "pointer",
+            .pointer => |ptr| if (ptr.mutable) "&mut reference" else "shared reference",
             .function => "function",
             .string_type => "String",
             .struct_type => |decl| self.declName(decl),
@@ -4426,6 +4483,84 @@ test "typecheck: generic application is accepted in type position" {
     );
     defer deinitCheck(&res);
     try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// References and dereference (R43)
+// ---------------------------------------------------------------------------
+
+test "typecheck: mutable and shared references support scalar dereference" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn swap(a: &mut i32, b: &mut i32) {
+        \\    let tmp = a.*
+        \\    a.* = b.*
+        \\    b.* = tmp
+        \\}
+        \\fn read(p: &i32) -> i32 {
+        \\    return p.*
+        \\}
+        \\fn main() -> i32 {
+        \\    mut x = 3
+        \\    mut y = 7
+        \\    swap(&mut x, &mut y)
+        \\    return read(&x) * 10 + read(&y)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: dereference rejects a non-reference operand" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x = 1
+        \\    return x.*
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot dereference non-reference type 'i32'"));
+}
+
+test "typecheck: dereference assignment requires an exclusive reference" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn write(p: &i32) {
+        \\    p.* = 2
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot write through a shared reference"));
+}
+
+test "typecheck: shared references cannot satisfy exclusive parameters" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn write(p: &mut i32) {
+        \\    p.* = 2
+        \\}
+        \\fn main() {
+        \\    let x = 1
+        \\    write(&x)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "argument 1 expects '&mut reference' but got 'shared reference'"));
+}
+
+test "typecheck: null is rejected for plain references" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn read(p: &i32) -> i32 {
+        \\    return p.*
+        \\}
+        \\fn main() {
+        \\    let p: &mut i32 = null
+        \\    let x = read(null)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expect(hasMessage(&res.diagnostics, "'null' cannot be used as a non-null reference"));
 }
 
 // ---------------------------------------------------------------------------

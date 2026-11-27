@@ -476,6 +476,10 @@ const Fmt = struct {
             .fn_ref => |sr| try self.write(sr.slice(self.source)),
             .binary_op => |b| try self.fmtBinary(b),
             .unary_op => |u| try self.fmtUnary(u),
+            .deref => |operand| {
+                try self.fmtExprWrapped(operand, 15);
+                try self.write(".*");
+            },
             .call => |c| try self.fmtCall(c),
             .field_access => |fa| {
                 try self.fmtExprWrapped(fa.object, 15);
@@ -570,7 +574,7 @@ const Fmt = struct {
             .pipeline => 1,
             .unary_op => 14,
             .move_expr => 14,
-            .try_propagate => 15,
+            .try_propagate, .deref => 15,
             .call, .field_access, .index_access, .generic_app => 15,
             else => 16,
         };

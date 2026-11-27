@@ -26,7 +26,9 @@ pub const SemType = union(enum) {
     bool_type,
     int: struct { signed: bool, bits: u16 },
     float: FloatKind,
-    pointer: TypeIdx,
+    /// A non-null reference. Mutability is part of the type so a shared
+    /// reference cannot be used where an exclusive reference is required.
+    pointer: struct { elem: TypeIdx, mutable: bool },
     function: struct {
         param_types: []const TypeIdx,
         return_type: TypeIdx,
@@ -105,11 +107,11 @@ pub const TypePool = struct {
     pub fn add(self: *TypePool, sem_type: SemType) !TypeIdx {
         const idx: u32 = @intCast(self.types.items.len);
         try self.types.append(self.allocator, sem_type);
-        return @enumFromInt(idx);
+        return @fromBackingInt(@intCast(idx));
     }
 
     pub fn get(self: *const TypePool, idx: TypeIdx) SemType {
-        return self.types.items[@intFromEnum(idx)];
+        return self.types.items[@backingInt(idx)];
     }
 
     pub fn count(self: *const TypePool) usize {

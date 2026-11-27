@@ -1,0 +1,21 @@
+fn swap(a: &mut i32, b: &mut i32) {
+    let tmp = a.*
+    a.* = b.*
+    b.* = tmp
+}
+
+fn read(p: &i32) -> i32 {
+    return p.*
+}
+
+fn main() -> i32 {
+    mut left = 3
+    mut right = 7
+    swap(&mut left, &mut right)
+
+    if read(&left) == 7 && read(&right) == 3 {
+        print("pointer swap ok")
+        return 0
+    }
+    return 1
+}

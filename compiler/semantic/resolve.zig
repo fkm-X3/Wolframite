@@ -562,8 +562,7 @@ pub const Resolver = struct {
                     try self.resolveAt(.value, p.rhs);
                 }
             },
-            .try_propagate => |inner| try self.resolveAt(.value, inner),
-            .move_expr => |inner| try self.resolveAt(.value, inner),
+            .try_propagate, .move_expr, .deref => |inner| try self.resolveAt(.value, inner),
             .region_expr => |r| {
                 if (r.allocator) |alloc_ty| {
                     try self.resolveTypeRef(alloc_ty);
