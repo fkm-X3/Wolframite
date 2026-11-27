@@ -4,7 +4,7 @@ The libc-free Wolframite runtime. This is what a compiled program links against:
 every entry point in `src/std.zig` is `export`ed with the platform's native C ABI,
 which is the shape the compiler's extern-call lowering expects. Prelude functions such
 as `print` lower to direct calls into this archive, and `ore` links it alongside the
-program's NASM-assembled object files.
+program's Tungsten-emitted relocatable object files.
 
 There is no libc here. Output goes to the kernel directly and the runtime never
 allocates: each entry point either takes caller-owned memory or formats into a
@@ -14,7 +14,7 @@ fixed-size stack buffer.
 
 The root `build.zig` builds this as the static library `wfr_std` and installs it to
 `zig-out/lib` (`wfr_std.lib` on Windows, `libwfr_std.a` on ELF targets).
-`src/ore/link.zig` looks for that archive and passes it to `zig cc`.
+`src/ore/link.zig` looks for that archive and passes it to Ferro.
 
 The library also builds standalone:
 

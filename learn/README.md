@@ -14,8 +14,9 @@ reinforce what you learned in the core sections. Work through them in order.
 You will need:
 
 - **Zig 0.17.1** (pinned in `build.zig.zon`)
-- **NASM** and **zig cc** on PATH if you want to *run* compiled programs
-  (`ore run` / `ore build --emit-bin`). Building and testing don't need them.
+
+Tungsten emits relocatable objects directly, and Ferro links them for `ore run` /
+`ore build --emit-bin`; no external assembler or linker is needed.
 
 ## Compile and run a Wolframite file
 

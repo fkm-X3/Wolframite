@@ -4,10 +4,11 @@ Wolframite is a **functional-imperative systems language**. It gives you
 fine-grained hardware control and predictable execution costs without exposing
 you to explicit lifetime parameters or a borrow checker.
 
-It is implemented in Zig and targets **Tungsten**, a Zig backend that emits
-x86-64 machine code (currently via NASM assembly; a native object emitter plus
-the **Ferro** internal linker is planned — see `core/11_memory.md` for the
-memory side, and the final project for the linker story).
+It is implemented in Zig and targets **Tungsten**, a Zig backend that lowers IR
+to x86-64 machine code and emits relocatable objects (ELF64 on Linux, PE/COFF on
+Windows). The **Ferro** internal linker combines those objects with the runtime
+to produce executables — see `core/11_memory.md` for the memory side, and the
+final project for the linker story.
 
 ## The core ideas
 

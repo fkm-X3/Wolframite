@@ -76,7 +76,7 @@ test "String header is 16 bytes: len at 0, data at 8" {
     try testing.expectEqualStrings(bytes, bytesOf(&header)[0..13]);
 
     // The pointer fields must be readable at the documented offsets, since
-    // that is exactly what a NASM-emitted call site hands us.
+    // that is exactly what a compiler-emitted call site hands us.
     try testing.expectEqual(@as(i64, 13), lenAt(@ptrCast(&header)));
     try testing.expectEqualStrings("Hello", std.mem.sliceTo(dataAt(@ptrCast(&header)), 0)[0..5]);
 }

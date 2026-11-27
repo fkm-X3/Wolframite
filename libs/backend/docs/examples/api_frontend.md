@@ -318,13 +318,13 @@ fn buildMax(ctx: *api.Context) !void {
 
 ---
 
-## Example 9: Emitting Assembly
+## Example 9: Emitting a Relocatable Object
 
-Building a function and emitting x86-64 NASM assembly.
+Building a function and emitting an ELF64 relocatable object.
 
 ```zig
 fn emitAdd() !void {
-    var ctx = try api.Context.init(std.heap.page_allocator);
+    const ctx = try api.Context.init(std.heap.page_allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -340,14 +340,9 @@ fn emitAdd() !void {
     const sum = try ctx.buildAdd(i32_ty, a, b);
     _ = try ctx.buildRet(sum);
 
-    // Emit assembly
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
-
-    // Write to file
-    const file = try std.fs.cwd().createFile("output.asm", .{});
-    defer file.close();
-    try file.writeAll(asm_text);
+    // Emit x86-64 machine code and package it as an ELF64 object.
+    const obj_bytes = try ctx.emitObject();
+    defer ctx.gpa.free(obj_bytes);
 }
 ```
 
@@ -363,7 +358,7 @@ const tungsten = @import("Tungsten");
 const api = tungsten.api;
 
 pub fn main() !void {
-    var ctx = try api.Context.init(std.heap.page_allocator);
+    const ctx = try api.Context.init(std.heap.page_allocator, .linux_x86_64);
     defer ctx.deinit();
 
     const i32_ty = try ctx.intType(true, 32);
@@ -398,10 +393,10 @@ pub fn main() !void {
     std.debug.print("--- Textual IR ---\n", .{});
     try ctx.print(std.io.getStdOut().writer());
 
-    // Assembly
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
-    std.debug.print("\n--- Assembly ---\n{s}\n", .{asm_text});
+    // ELF64 relocatable object
+    const obj_bytes = try ctx.emitObject();
+    defer ctx.gpa.free(obj_bytes);
+    std.debug.print("\n--- ELF64 object: {d} bytes ---\n", .{obj_bytes.len});
 }
 ```
 
@@ -433,7 +428,12 @@ _ = try builder.buildRet(sum);
 
 var cg = codegen.CodeGen.init(allocator, &module);
 defer cg.deinit();
-try cg.emitModule();
+const input = try cg.emitObjectModule();
+
+var object_writer = obj_elf.Writer.init(allocator);
+defer object_writer.deinit();
+const obj_bytes = try object_writer.writeObject(input);
+defer allocator.free(obj_bytes);
 
 try ir.printModule(&module, std.io.getStdOut().writer());
 ```
@@ -441,7 +441,7 @@ try ir.printModule(&module, std.io.getStdOut().writer());
 ### Frontend API (recommended)
 
 ```zig
-var ctx = try api.Context.init(allocator);
+const ctx = try api.Context.init(allocator, .linux_x86_64);
 defer ctx.deinit();
 
 const i32_ty = try ctx.intType(true, 32);
@@ -459,12 +459,12 @@ _ = try ctx.buildRet(sum);
 
 try ctx.print(std.io.getStdOut().writer());
 
-const asm_text = try ctx.emitAssembly();
-defer ctx.gpa.free(asm_text);
+const obj_bytes = try ctx.emitObject();
+defer ctx.gpa.free(obj_bytes);
 ```
 
 **Key differences:**
-- Single `Context` object vs separate `Module` + `Builder` + `CodeGen`
+- Single `Context` object vs separate `Module` + `Builder` + `CodeGen` + object writer
 - `ctx.getParam(0)` vs `@as(ir.Value, @enumFromInt(0))`
-- `ctx.emitAssembly()` vs manual `CodeGen` setup
-- No need to import `ir.zig` or `codegen.zig` directly
+- `ctx.emitObject()` vs manual `CodeGen` and `obj_elf.Writer` setup
+- No need to import `ir.zig`, `codegen.zig`, or `obj_elf.zig` directly

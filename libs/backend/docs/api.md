@@ -68,7 +68,7 @@ const api = tungsten.api;
 
 pub fn main() !void {
     // 1. Create context
-    var ctx = try api.Context.init(std.heap.page_allocator);
+    const ctx = try api.Context.init(std.heap.page_allocator, .linux_x86_64);
     defer ctx.deinit();
 
     // 2. Define types
@@ -87,9 +87,9 @@ pub fn main() !void {
     const sum = try ctx.buildAdd(i32_ty, a, b);
     _ = try ctx.buildRet(sum);
 
-    // 5. Emit code
-    const asm_text = try ctx.emitAssembly();
-    defer ctx.gpa.free(asm_text);
+    // 5. Emit an ELF64 relocatable object
+    const obj_bytes = try ctx.emitObject();
+    defer ctx.gpa.free(obj_bytes);
 
     // Or print textual IR:
     try ctx.print(std.io.getStdOut().writer());
@@ -103,12 +103,12 @@ pub fn main() !void {
 ### `Context.init`
 
 ```zig
-pub fn init(gpa: Allocator) !*Context
+pub fn init(gpa: Allocator, target: ferro.Target) !*Context
 ```
 
-Create a new Tungsten context. Allocates the context on the heap so that
-internal pointers remain stable. Returns a pointer that must be freed via
-`deinit`.
+Create a new Tungsten context for `target`. Allocates the context on the heap so
+that internal pointers remain stable. Returns a pointer that must be freed via
+`deinit`. The target determines whether `emitObject` writes ELF64 or PE/COFF.
 
 ### `Context.deinit`
 
@@ -121,7 +121,7 @@ Destroy the context, free the IR module, and release all associated memory.
 **Usage:**
 
 ```zig
-var ctx = try api.Context.init(allocator);
+const ctx = try api.Context.init(allocator, .linux_x86_64);
 defer ctx.deinit(); // must be called exactly once
 ```
 
@@ -734,22 +734,6 @@ Print the module's textual IR to `writer`. Useful for debugging.
 try ctx.print(std.io.getStdOut().writer());
 ```
 
-### `emitAssembly`
-
-```zig
-pub fn emitAssembly(self: *Context) ![]u8
-```
-
-Emit x86-64 NASM assembly for the entire module. Returns an allocated byte
-slice that **the caller must free** with `ctx.gpa.free(result)`.
-
-```zig
-const asm_text = try ctx.emitAssembly();
-defer ctx.gpa.free(asm_text);
-```
-
----
-
 ## Target & Object Format
 
 ### `Context.init` — the target parameter
@@ -797,7 +781,7 @@ Emit a relocatable object file (ELF64 on Linux, PE/COFF on Windows) for `self.ta
 
 The pipeline:
 
-1. Codegen lowers the module's IR to raw x86-64 machine-code bytes plus relocation records (`codegen.CodeGen.emitObjectModule()`), reusing the existing instruction encoding but targeting a byte buffer instead of NASM text.
+1. Codegen lowers the module's IR to raw x86-64 machine-code bytes plus relocation records (`codegen.CodeGen.emitObjectModule()`), using the byte-level instruction encoder directly.
 2. The object writer (`obj_elf.Writer` / `obj_pe.Writer`) lays out sections, the symbol table, the string table, and relocation entries.
 
 Returns an allocated byte slice that **the caller must free** with `ctx.gpa.free(result)`.
@@ -844,13 +828,13 @@ Each symbol carries its name, binding (`LOCAL`/`GLOBAL`/`WEAK`), section index (
 
 Allocation failures from the underlying arrays propagate as standard `error.OutOfMemory` etc.
 
-The object file is a **relocatable object**, not a final executable. Feed it to Ferro (`linkObject`) together with the `wfr_std` runtime archive to produce a runnable executable — see "Ferro Linker" below. There is no `nasm` invocation and no `zig cc` link step.
+The object file is a **relocatable object**, not a final executable. Feed it to Ferro (`linkObject`) together with the `wfr_std` runtime archive to produce a runnable executable — see "Ferro Linker" below. The build/run path needs no external assembler or linker.
 
 ---
 
 ## Ferro Linker
 
-Ferro (Ferrotungsten: the linker Ferro added to Tungsten) is Tungsten's internal linker. It consumes Tungsten-emitted relocatable objects (ELF64 on Linux, PE/COFF on Windows) plus the Wolframite runtime archive (`wfr_std`) and produces a runnable executable — no external `nasm`, `ld`, or `zig cc`.
+Ferro (Ferrotungsten: the linker Ferro added to Tungsten) is Tungsten's internal linker. It consumes Tungsten-emitted relocatable objects (ELF64 on Linux, PE/COFF on Windows) plus the Wolframite runtime archive (`wfr_std`) and produces a runnable executable without external assembler or linker tools.
 
 The linker interface is frozen in `libs/backend/docs/adr/adr_ferro_linker.md`.
 
