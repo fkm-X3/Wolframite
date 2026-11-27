@@ -761,6 +761,10 @@ pub const Lowerer = struct {
             .return_stmt => |r| try self.lowerReturn(r),
             .break_stmt => |control| try self.lowerLoopControl(node_idx, .break_loop, control.label),
             .continue_stmt => |control| try self.lowerLoopControl(node_idx, .continue_loop, control.label),
+            .unreachable_stmt => {
+                _ = try self.ctx.buildTrap();
+                self.terminated();
+            },
             .expr_stmt => |e| _ = try self.lowerExpr(e.expr),
             .defer_stmt => |d| try self.pending_defers.append(self.gpa, d.expr),
             .if_expr => try self.lowerIf(node_idx),
@@ -3586,6 +3590,21 @@ test "lower: int return" {
     try std.testing.expect(std.mem.indexOf(u8, text, "fn @main() {") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "iconst 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ret %0") != null);
+}
+
+test "lower: unreachable emits a trap without a fallthrough return" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    unreachable
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "    trap\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret %") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret_void") == null);
 }
 
 test "lower: arithmetic and calls" {

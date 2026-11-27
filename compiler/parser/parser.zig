@@ -147,7 +147,7 @@ pub const Parser = struct {
         }
         const tok = self.peek();
         switch (tok.tag) {
-            .fn_kw, .let_kw, .mut_kw, .struct_kw, .enum_kw, .return_kw, .break_kw, .continue_kw, .if_kw, .else_kw, .while_kw, .for_kw, .in_kw, .match_kw, .import_kw, .as_kw, .defer_kw, .true_kw, .false_kw, .null_kw, .comptime_kw, .move_kw, .region_kw, .test_kw => {
+            .fn_kw, .let_kw, .mut_kw, .struct_kw, .enum_kw, .return_kw, .break_kw, .continue_kw, .unreachable_kw, .if_kw, .else_kw, .while_kw, .for_kw, .in_kw, .match_kw, .import_kw, .as_kw, .defer_kw, .true_kw, .false_kw, .null_kw, .comptime_kw, .move_kw, .region_kw, .test_kw => {
                 _ = self.advance();
                 return tok;
             },
@@ -584,6 +584,10 @@ pub const Parser = struct {
                     .keyword = self.makeStringRef(tok),
                     .label = label,
                 } });
+            },
+            .unreachable_kw => {
+                _ = self.advance();
+                return self.appendNode(.{ .unreachable_stmt = self.makeStringRef(tok) });
             },
             .if_kw => {
                 _ = self.advance();
@@ -1676,6 +1680,20 @@ test "parser: break and continue statements" {
     try std.testing.expectEqual(@as(usize, 2), loop_body.block.stmts.indices.len);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .break_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[0])));
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .continue_stmt), tagOf(res.arena.get(loop_body.block.stmts.indices[1])));
+}
+
+test "parser: unreachable statement" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    unreachable
+        \\}
+    );
+    defer res.arena.deinit();
+    const decl = res.arena.get(getMod(&res).module.decls.indices[0]);
+    const body = res.arena.get(decl.fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .unreachable_stmt), tagOf(stmt));
+    try std.testing.expectEqualStrings("unreachable", stmt.unreachable_stmt.slice(res.source));
 }
 
 test "parser: labeled loops and targeted loop control" {

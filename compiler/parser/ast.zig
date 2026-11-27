@@ -14,11 +14,11 @@ pub const NodeIdx = enum(u32) {
     _,
 
     pub fn toInt(self: NodeIdx) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn fromInt(v: u32) NodeIdx {
-        return @enumFromInt(v);
+        return @fromBackingInt(@intCast(v));
     }
 };
 
@@ -121,6 +121,7 @@ pub const Node = union(enum) {
     return_stmt: struct { value: ?NodeIdx },
     break_stmt: LoopControlStmt,
     continue_stmt: LoopControlStmt,
+    unreachable_stmt: StringRef,
     expr_stmt: struct { expr: NodeIdx },
     defer_stmt: struct { expr: NodeIdx },
 
@@ -261,6 +262,7 @@ fn cloneNode(
         .fn_ref,
         .break_stmt,
         .continue_stmt,
+        .unreachable_stmt,
         => {
             return appendClone(arena, idx, map, node.*);
         },

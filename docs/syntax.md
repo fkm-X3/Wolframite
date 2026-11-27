@@ -25,7 +25,7 @@ longer keywords and re-lex as ordinary identifiers. No token grammar depends on 
 ### 2.1 Keywords
 
 ```
-fn  let  mut  struct  enum  return  break  continue  if  else  while  for  in
+fn  let  mut  struct  enum  return  break  continue  unreachable  if  else  while  for  in
 match  import  as  defer  true  false  null  comptime  move  region
 ```
 
@@ -152,7 +152,7 @@ From `examples/imports.wfr`.
 ### 4.6 Statements & bindings
 
 ```
-<stmt>        ::= <let_stmt> | <return_stmt> | <break_stmt> | <continue_stmt> | <expr_stmt>
+<stmt>        ::= <let_stmt> | <return_stmt> | <break_stmt> | <continue_stmt> | <unreachable_stmt> | <expr_stmt>
                 | <if_expr> | <while_expr> | <for_stmt> | <match_expr>
                 | <block> | <defer_stmt>
 
@@ -161,6 +161,7 @@ From `examples/imports.wfr`.
 <return_stmt> ::= 'return' <expr>?                       -- no value => unit
 <break_stmt>  ::= 'break' <identifier>? <terminator>
 <continue_stmt> ::= 'continue' <identifier>? <terminator>
+<unreachable_stmt> ::= 'unreachable' <terminator>
 <expr_stmt>  ::= <expr> <terminator>
 <defer_stmt>  ::= 'defer' <expr> <terminator>            -- RAII hook, runs at scope exit
 <block>       ::= '{' <stmt>* '}'
@@ -202,6 +203,11 @@ and `continue outer`. A targeted statement names an enclosing loop; labels must 
 among the enclosing loops in the same function or closure, and may be reused by sibling
 loops. Label lookup does not cross a function or closure boundary. Deferred expressions in
 every scope exited by labeled or unlabeled loop control run before control transfers.
+
+`unreachable` marks a path that must never be executed. It is a statement, produces no value,
+and may end a function of any return type. Reaching it executes a raw processor trap rather
+than returning normally.
+
 `if` and `match` are **expressions** (each arm/body yields a value when used as an expression).
 `match` arms are delimited by newlines/commas; arms may share commas.
 From `examples/control_flow.wfr`:
@@ -556,6 +562,7 @@ The grammar above is the target for every rewritten example:
 | `functions.wfr` | fn decl, block + `=` shorthand, no-return fn, call nesting |
 | `variables.wfr` | `let`/`mut`, annotations, assignment, inference |
 | `control_flow.wfr` | `if` expr, labeled `while`/`for in a..b`, targeted `break`/`continue`, `defer`, block |
+| `unreachable.wfr` | `unreachable` statement, non-void function terminated by a trap |
 | `enums.wfr` | generic enum, variant payload `Some(T)`, `Ok(T)`/`Err(E)` |
 | `match.wfr` | `match` expr, literal patterns, variant patterns, `_` wildcard, guard |
 | `structs.wfr` | pure-data struct, struct init, field access, free fns |

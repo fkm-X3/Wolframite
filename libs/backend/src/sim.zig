@@ -76,6 +76,8 @@ pub const Simulator = struct {
         self.slots.deinit(self.gpa);
         self.defined.deinit(self.gpa);
         self.call_stack.deinit(self.gpa);
+        self.gpa.free(self.block_pcs);
+        self.gpa.free(self.block_counts);
     }
 
     pub fn setTrace(self: *Simulator, w: *std.Io.Writer) void {
@@ -293,8 +295,7 @@ pub const Simulator = struct {
                 try self.writeSlot(result_slot, @bitCast(res));
                 self.traceInst(@tagName(op), result_slot, @bitCast(res));
             },
-            .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge,
-            .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => |cond| {
+            .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge, .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => |cond| {
                 const a = try self.readSlot(ops[0]);
                 const b = try self.readSlot(ops[1]);
                 const au: u64 = @bitCast(a);
@@ -355,6 +356,10 @@ pub const Simulator = struct {
             .ret_void => {
                 self.halted = true;
                 self.traceInst("ret_void", 0, 0);
+            },
+            .trap => {
+                self.traceInst("trap", 0, 0);
+                return error.Trap;
             },
             .call => {
                 const callee = @as(usize, @intCast(ops[0]));
@@ -526,6 +531,7 @@ pub const SimError = error{
     UnsupportedOpcode,
     MissingBlock,
     InvalidBranchTarget,
+    Trap,
     ExternalCallUnimplemented,
     MallocUnimplemented,
 };
@@ -548,17 +554,34 @@ test "sim executes add of two params" {
     builder.setCurrentFunction(func);
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
-    const a = @as(ir.Value, @enumFromInt(0));
-    const b = @as(ir.Value, @enumFromInt(1));
+    const a = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    const b = @as(ir.Value, @fromBackingInt(@intCast(1)));
     const sum = try builder.buildAdd(i32_ty, a, b);
     _ = try builder.buildRet(sum);
 
-    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @intFromEnum(func)));
+    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @backingInt(func)));
     defer sim.deinit();
     try sim.writeSlot(0, 3);
     try sim.writeSlot(1, 7);
     try sim.run();
     try std.testing.expectEqual(10, sim.retval);
+}
+
+test "sim reports a hard error on trap" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const void_ty = try builder.addVoidType();
+    const func = try builder.addFunction("stop", void_ty, 0);
+    builder.setCurrentFunction(func);
+    const entry = try builder.appendBlock();
+    builder.setCurrentBlock(entry);
+    _ = try builder.buildTrap();
+
+    var sim = try Simulator.init(std.testing.allocator, &module, @backingInt(func));
+    defer sim.deinit();
+    try std.testing.expectError(error.Trap, sim.run());
+    try std.testing.expect(!sim.halted);
 }
 
 test "sim executes conditional branch between two blocks" {
@@ -572,7 +595,7 @@ test "sim executes conditional branch between two blocks" {
     const bb1 = try builder.appendBlock();
     const bb2 = try builder.appendBlock();
     builder.setCurrentBlock(bb0);
-    const flag = @as(ir.Value, @enumFromInt(0));
+    const flag = @as(ir.Value, @fromBackingInt(@intCast(0)));
     const zero = try builder.buildIntConst(i32_ty, 0);
     const cond = try builder.buildIcmp(.icmp_eq, i32_ty, flag, zero);
     _ = try builder.buildCondBr(cond, bb1, bb2);
@@ -585,7 +608,7 @@ test "sim executes conditional branch between two blocks" {
 
     // flag == 0 → bb1 → 42
     {
-        var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @intFromEnum(func)));
+        var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @backingInt(func)));
         defer sim.deinit();
         try sim.writeSlot(0, 0);
         try sim.run();
@@ -593,7 +616,7 @@ test "sim executes conditional branch between two blocks" {
     }
     // flag != 0 → bb2 → 7
     {
-        var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @intFromEnum(func)));
+        var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @backingInt(func)));
         defer sim.deinit();
         try sim.writeSlot(0, 1);
         try sim.run();
@@ -611,9 +634,9 @@ test "sim detects uninitialized slot read" {
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
     // ret reads slot 5, which no instruction defines (param_count=0).
-    _ = try builder.buildRet(@as(ir.Value, @enumFromInt(5)));
+    _ = try builder.buildRet(@as(ir.Value, @fromBackingInt(@intCast(5))));
 
-    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @intFromEnum(func)));
+    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @backingInt(func)));
     defer sim.deinit();
     const err = sim.run() catch |e| e;
     try std.testing.expectEqual(error.UninitializedSlot, err);
@@ -628,8 +651,8 @@ test "sim executes function call" {
     builder.setCurrentFunction(callee);
     const c_entry = try builder.appendBlock();
     builder.setCurrentBlock(c_entry);
-    const n = @as(ir.Value, @enumFromInt(0));
-    const doubled = try builder.buildMul(i32_ty, n, @as(ir.Value, @enumFromInt(0)));
+    const n = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    const doubled = try builder.buildMul(i32_ty, n, @as(ir.Value, @fromBackingInt(@intCast(0))));
     _ = doubled;
     _ = try builder.buildRet(n);
 
@@ -637,14 +660,14 @@ test "sim executes function call" {
     builder.setCurrentFunction(caller);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const arg = @as(ir.Value, @enumFromInt(0));
+    const arg = @as(ir.Value, @fromBackingInt(@intCast(0)));
     _ = try builder.buildCall(callee, i32_ty, &.{arg});
     const one = try builder.buildIntConst(i32_ty, 1);
-    const result = try builder.buildAdd(i32_ty, one, @as(ir.Value, @enumFromInt(1)));
+    const result = try builder.buildAdd(i32_ty, one, @as(ir.Value, @fromBackingInt(@intCast(1))));
     _ = try builder.buildRet(result);
 
     // caller(5) -> callee(5) returns 5; 1 + 5 = 6
-    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @intFromEnum(caller)));
+    var sim = try Simulator.init(std.testing.allocator, &module, @as(usize, @backingInt(caller)));
     defer sim.deinit();
     try sim.writeSlot(0, 5);
     try sim.run();

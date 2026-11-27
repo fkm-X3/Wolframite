@@ -677,6 +677,12 @@ runtime-only fn writing `x` + newline to stdout:
   an unknown label is a semantic error. Label lookup never crosses a function or closure
   boundary. Targeted transfers use the selected loop's R40 destination and run deferred
   expressions from every scope they exit, last-in-first-out.
+- **R42 (unreachable and trap).** `unreachable` is a statement legal in a function or closure
+  of any return type. It terminates the current IR block, produces no value, and lowers to the
+  operand-less Tungsten `trap` opcode with no fallthrough return on that path. Native x86-64
+  lowering emits `int3` (`0xcc`); the IR simulator stops with the hard error `Trap`. `trap` is
+  a terminator alongside `br`, `cond_br`, `ret`, and `ret_void`, so IR verification rejects any
+  instruction following it in the same block.
 
 ## 11. Conformance checklist
 
@@ -695,6 +701,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `\|>` pipe + hole | R30 |
 | `print` IO prelude | R39 |
 | `break` / `continue`, including targeted labels | R40–R41 |
+| `unreachable` / native trap | R42 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -706,8 +713,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R41; backend tests for R3/R16; lowerer tests for R13–R18,
-   R28, R31, R40–R41); and
+   (compiler tests for R4–R29 and R40–R42; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R42); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

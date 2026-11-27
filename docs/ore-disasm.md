@@ -63,7 +63,7 @@ Each instruction line shows:
 - Disassembles each `.text` function using the x86-64 decoder shared with
   `ore check-codegen` (covering the instruction subset Tungsten emits:
   mov, lea, add, sub, cmp, setcc, jmp, je, call, push, pop, leave, ret,
-  idiv/div, movzx, cqo, and REX-prefixed variants).
+  int3, idiv/div, movzx, cqo, and REX-prefixed variants).
 - Annotates relocation sites inline with symbol name, kind (PC32/ADDR64),
   and addend.
 - Stops disassembling a function at undecodable bytes rather than cascading

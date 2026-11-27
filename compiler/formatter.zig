@@ -350,6 +350,7 @@ const Fmt = struct {
                     try self.write(label.slice(self.source));
                 }
             },
+            .unreachable_stmt => try self.write("unreachable"),
             .expr_stmt => |e| try self.fmtExpr(e.expr),
             .defer_stmt => |d| {
                 try self.write("defer ");

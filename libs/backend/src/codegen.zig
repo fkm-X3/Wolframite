@@ -103,7 +103,7 @@ pub const CodeGen = struct {
                             const fname = self.module.strings.get(self.module.functions.items[func_idx].name);
                             const symbol = try std.fmt.allocPrint(self.gpa, "_{s}", .{fname});
                             defer self.gpa.free(symbol);
-                            try self.obj_data.appendSlice(self.gpa, &[_]u8{0,0,0,0,0,0,0,0});
+                            try self.obj_data.appendSlice(self.gpa, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
                             const entry_off = data_off + @as(u64, @intCast(j)) * 8;
                             try self.relocData(entry_off, symbol, .addr64, 0);
                         }
@@ -198,8 +198,6 @@ pub const CodeGen = struct {
         try self.o8(0x89);
         try self.o8(0xe5);
 
-
-
         var value_slots: u32 = self.param_count;
         var alloca_data_slots: u32 = 0;
         for (func.instructions.items) |inst| {
@@ -219,7 +217,7 @@ pub const CodeGen = struct {
             var i: u32 = 0;
             while (i < self.param_count) : (i += 1) {
                 offset -= 8;
-                try self.value_offsets.put(self.gpa, @enumFromInt(i), offset);
+                try self.value_offsets.put(self.gpa, @fromBackingInt(@intCast(i)), offset);
             }
         }
 
@@ -234,11 +232,11 @@ pub const CodeGen = struct {
                     offset -= @as(i32, @intCast(slots * 8));
                     const data_off = offset;
                     offset -= 8;
-                    try self.value_offsets.put(self.gpa, @enumFromInt(value_idx), offset);
+                    try self.value_offsets.put(self.gpa, @fromBackingInt(@intCast(value_idx)), offset);
                     try self.alloca_offsets.put(self.gpa, i, data_off);
                 } else if (inst.producesValue()) {
                     offset -= 8;
-                    try self.value_offsets.put(self.gpa, @enumFromInt(value_idx), offset);
+                    try self.value_offsets.put(self.gpa, @fromBackingInt(@intCast(value_idx)), offset);
                 }
             }
         }
@@ -249,7 +247,7 @@ pub const CodeGen = struct {
             const stack_base: u32 = if (self.module.target == .linux_x86_64) 16 else 48;
             var i: u32 = first_stack;
             while (i < self.param_count) : (i += 1) {
-                const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
+                const off = self.value_offsets.get(@fromBackingInt(@intCast(i))) orelse unreachable;
                 const disp_raw: u32 = stack_base + (i - first_stack) * 8;
                 if (self.module.target == .linux_x86_64) {
                     // mov rax, qword [rbp + disp] ( SysV: stack args at rbp+16... )
@@ -289,7 +287,7 @@ pub const CodeGen = struct {
             _ = sysv_modrm;
             var i: u32 = 0;
             while (i < self.param_count and i < 6) : (i += 1) {
-                const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
+                const off = self.value_offsets.get(@fromBackingInt(@intCast(i))) orelse unreachable;
                 try self.o8(sysv_rex[i]);
                 try self.o8(0x89);
                 try self.o8(sysv_store_modrm[i]);
@@ -300,7 +298,7 @@ pub const CodeGen = struct {
             const reg_modrm = [_]u8{ 0x8d, 0x95, 0x85, 0x8d }; // [rbp+disp32]
             var i: u32 = 0;
             while (i < self.param_count and i < 4) : (i += 1) {
-                const off = self.value_offsets.get(@enumFromInt(i)) orelse unreachable;
+                const off = self.value_offsets.get(@fromBackingInt(@intCast(i))) orelse unreachable;
                 try self.o8(reg_rex[i]);
                 try self.o8(0x89);
                 try self.o8(reg_modrm[i]);
@@ -313,14 +311,14 @@ pub const CodeGen = struct {
             // Record this block's start offset for branch target resolution.
             try self.block_offsets.append(self.gpa, @intCast(self.obj_text.items.len));
 
-            const start = @intFromEnum(_block.first_inst);
+            const start = @backingInt(_block.first_inst);
             var rel: u32 = 0;
             while (rel < _block.inst_count) : (rel += 1) {
                 const inst = func.instructions.items[start + rel];
                 const is_last = rel == _block.inst_count - 1;
                 const value_idx = self.param_count + start + rel;
 
-                if (is_last and (inst.opcode == .br or inst.opcode == .cond_br or inst.opcode == .ret or inst.opcode == .ret_void)) {
+                if (is_last and inst.isTerminator()) {
                     try self.emitControlFlowObject(func, inst, @intCast(blk_idx));
                 } else {
                     try self.emitInstructionObject(func, inst, value_idx);
@@ -391,13 +389,14 @@ pub const CodeGen = struct {
     }
 
     fn valueOff(self: *@This(), v: u32) !i32 {
-        return self.value_offsets.get(@enumFromInt(v)).?;
+        return self.value_offsets.get(@fromBackingInt(@intCast(v))).?;
     }
 
     fn emitInstructionObject(self: *@This(), func: *const ir.Function, inst: ir.Instruction, value_idx: u32) !void {
         const ops = func.getOperands(inst.operands);
 
         switch (inst.opcode) {
+            .trap => try self.o8(0xcc),
             .iconst => {
                 const bits: u64 = (@as(u64, ops[1]) << 32) | ops[0];
                 const r = try self.valueOffsetOf(value_idx);
@@ -439,12 +438,12 @@ pub const CodeGen = struct {
                 try self.o8(0x85);
                 try self.emitI32(a);
                 const opc: u8 = switch (op) {
-                    .add => 0x03,   // add rax, [rbp+b]
-                    .sub => 0x2b,   // sub rax, [rbp+b]
-                    .mul => 0xaf,   // imul rax, [rbp+b] (0x0F AF /r)
-                    .and_op => 0x23,// and rax, [rbp+b]
+                    .add => 0x03, // add rax, [rbp+b]
+                    .sub => 0x2b, // sub rax, [rbp+b]
+                    .mul => 0xaf, // imul rax, [rbp+b] (0x0F AF /r)
+                    .and_op => 0x23, // and rax, [rbp+b]
                     .or_op => 0x0b, // or rax, [rbp+b]
-                    .xor_op => 0x31,// xor rax, [rbp+b]
+                    .xor_op => 0x31, // xor rax, [rbp+b]
                     else => unreachable,
                 };
                 const modrm = 0x85; // mod=10, reg=0(rax), r/m=101(rbp)
@@ -569,9 +568,16 @@ pub const CodeGen = struct {
                 const a = try self.valueOff(ops[0]);
                 const b = try self.valueOff(ops[1]);
                 const sc: u8 = switch (cond) {
-                    .icmp_eq => 0x94, .icmp_ne => 0x95, .icmp_slt => 0x9c, .icmp_sle => 0x9e,
-                    .icmp_sgt => 0x9f, .icmp_sge => 0x9d, .icmp_ult => 0x92, .icmp_ule => 0x96,
-                    .icmp_ugt => 0x97, .icmp_uge => 0x93,
+                    .icmp_eq => 0x94,
+                    .icmp_ne => 0x95,
+                    .icmp_slt => 0x9c,
+                    .icmp_sle => 0x9e,
+                    .icmp_sgt => 0x9f,
+                    .icmp_sge => 0x9d,
+                    .icmp_ult => 0x92,
+                    .icmp_ule => 0x96,
+                    .icmp_ugt => 0x97,
+                    .icmp_uge => 0x93,
                     else => unreachable,
                 };
                 // mov rax, [rbp + a]
@@ -611,7 +617,6 @@ pub const CodeGen = struct {
                 try self.o8(0x89);
                 try self.o8(0x85);
                 try self.emitI32(r);
-
             },
             .load => {
                 const r = try self.valueOffsetOf(value_idx);
@@ -948,7 +953,7 @@ pub const CodeGen = struct {
     }
 
     fn valueOffsetOf(self: *@This(), value_idx: u32) !i32 {
-        return self.value_offsets.get(@enumFromInt(value_idx)).?;
+        return self.value_offsets.get(@fromBackingInt(@intCast(value_idx))).?;
     }
 
     fn isSignedType(self: *@This(), type_idx: ir.TypeIdx) bool {
@@ -984,7 +989,7 @@ pub const CodeGen = struct {
                 extra_stack = num_stack_args * 8;
                 if (extra_stack % 16 != 0) extra_stack += 8;
             }
-            // Ensure 16-byte alignment of RSP before call: if no stack args, allocate 0? 
+            // Ensure 16-byte alignment of RSP before call: if no stack args, allocate 0?
             // SysV requires RSP 16-aligned before call; caller's RSP already aligned if frame is.
             // But to be safe, if extra_stack==0, no adjustment needed.
 
@@ -1081,7 +1086,7 @@ pub const CodeGen = struct {
     fn emitPhiResolutionObject(self: *@This(), func: *const ir.Function, from_block: u32, to_block: u32) !void {
         if (to_block >= func.blocks.items.len) return;
         const target_block = func.blocks.items[to_block];
-        const start = @intFromEnum(target_block.first_inst);
+        const start = @backingInt(target_block.first_inst);
         var rel: u32 = 0;
         while (rel < target_block.inst_count) : (rel += 1) {
             const inst = func.instructions.items[start + rel];
@@ -1182,6 +1187,7 @@ pub const CodeGen = struct {
                 try self.o8(0xc9);
                 try self.o8(0xc3);
             },
+            .trap => try self.o8(0xcc),
             else => unreachable,
         }
     }
@@ -1204,13 +1210,28 @@ pub const CodeGen = struct {
         const size: u32 = if (ops.len == 0) 8 else ops[0];
         return (size + 7) / 8;
     }
-
 };
 
 // ============================================================================
 // Tests
 // ============================================================================
 
+test "object emission: trap emits int3" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const void_ty = try builder.addVoidType();
+    const func = try builder.addFunction("stop", void_ty, 0);
+    builder.setCurrentFunction(func);
+    const entry = try builder.appendBlock();
+    builder.setCurrentBlock(entry);
+    _ = try builder.buildTrap();
+
+    var cg = CodeGen.init(std.testing.allocator, &module);
+    defer cg.deinit();
+    const input = try cg.emitObjectModule();
+    try std.testing.expect(std.mem.indexOfScalar(u8, input.text, 0xcc) != null);
+}
 
 test "object emission: trivial main returns 42 (ELF64)" {
     var module = ir.Module.empty;
@@ -1255,7 +1276,9 @@ test "object emission: trivial main returns 42 (ELF64)" {
     try std.testing.expect(text_size > 0);
     // Should contain ret (0xc3) somewhere in .text.
     var found_ret = false;
-    for (bytes[text_off..text_off + text_size]) |b| { if (b == 0xc3) found_ret = true; }
+    for (bytes[text_off .. text_off + text_size]) |b| {
+        if (b == 0xc3) found_ret = true;
+    }
     try std.testing.expect(found_ret);
 
     // _main symbol in .text.
@@ -1350,7 +1373,7 @@ test "object emission: global string literal in .data with ADDR64 relocation (EL
     const data_off = readU64(bytes, sh_data_off + 24);
     const data_size = readU64(bytes, sh_data_off + 32);
     try std.testing.expectEqual(3, data_size); // "hi\0"
-    try std.testing.expectEqualSlices(u8, bytes[data_off..data_off + 3], &[_]u8{ 'h', 'i', 0 });
+    try std.testing.expectEqualSlices(u8, bytes[data_off .. data_off + 3], &[_]u8{ 'h', 'i', 0 });
 
     // __g0 symbol in .data.
     const sh_symtab_off = e_shoff + 4 * 64;
@@ -1442,7 +1465,7 @@ test "object emission: function call between two functions (ELF64)" {
     builder.setCurrentFunction(callee);
     const c_entry = try builder.appendBlock();
     builder.setCurrentBlock(c_entry);
-    const n = @as(ir.Value, @enumFromInt(0));
+    const n = @as(ir.Value, @fromBackingInt(@intCast(0)));
     _ = try builder.buildRet(n);
 
     // main(i32) -> i32 { return callee(n); }
@@ -1450,8 +1473,8 @@ test "object emission: function call between two functions (ELF64)" {
     builder.setCurrentFunction(main);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const n2 = @as(ir.Value, @enumFromInt(0));
-    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{ n2 });
+    const n2 = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{n2});
     const zero = try builder.buildIntConst(i32_ty, 0);
     _ = try builder.buildRet(zero);
 
@@ -1521,8 +1544,8 @@ test "object emission: closure env + call_ptr (ELF64)" {
     builder.setCurrentFunction(lifted);
     const l_entry = try builder.appendBlock();
     builder.setCurrentBlock(l_entry);
-    const env_param = @as(ir.Value, @enumFromInt(0));
-    const x_param = @as(ir.Value, @enumFromInt(1));
+    const env_param = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    const x_param = @as(ir.Value, @fromBackingInt(@intCast(1)));
     const captured = try builder.buildLoad(i64_ty, env_param);
     _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
 
@@ -1533,7 +1556,7 @@ test "object emission: closure env + call_ptr (ELF64)" {
     builder.setCurrentFunction(caller);
     const c_entry = try builder.appendBlock();
     builder.setCurrentBlock(c_entry);
-    const x_arg = @as(ir.Value, @enumFromInt(0));
+    const x_arg = @as(ir.Value, @fromBackingInt(@intCast(0)));
 
     const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
     const forty = try builder.buildIntConst(i64_ty, 40);
@@ -1605,15 +1628,15 @@ test "object emission: function call between two functions (PE/COFF)" {
     builder.setCurrentFunction(callee);
     const c_entry = try builder.appendBlock();
     builder.setCurrentBlock(c_entry);
-    const n = @as(ir.Value, @enumFromInt(0));
+    const n = @as(ir.Value, @fromBackingInt(@intCast(0)));
     _ = try builder.buildRet(n);
 
     const main = try builder.addFunction("main", i32_ty, 1);
     builder.setCurrentFunction(main);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const n2 = @as(ir.Value, @enumFromInt(0));
-    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{ n2 });
+    const n2 = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    _ = try builder.buildCall(callee, i32_ty, &[_]ir.Value{n2});
     const zero = try builder.buildIntConst(i32_ty, 0);
     _ = try builder.buildRet(zero);
 
@@ -1644,22 +1667,21 @@ test "object emission: function call between two functions (PE/COFF)" {
 
     // Section table (40 bytes each, starting at 20): .text, .data, .bss.
     const sh_text_off = 20 + 0 * 40;
-    try std.testing.expectEqual(obj_pe.ScnCntCode | obj_pe.ScnMemExecute | obj_pe.ScnMemRead,
-        readU32(bytes, sh_text_off + 36));
+    try std.testing.expectEqual(obj_pe.ScnCntCode | obj_pe.ScnMemExecute | obj_pe.ScnMemRead, readU32(bytes, sh_text_off + 36));
     const text_size = readU32(bytes, sh_text_off + 16);
     try std.testing.expect(text_size > 0);
     const text_ptr = readU32(bytes, sh_text_off + 20);
     try std.testing.expectEqual(text_ptr, 20 + 40 * 3); // raw data after headers
     var found_ret = false;
-    for (bytes[text_ptr..text_ptr + text_size]) |b| { if (b == 0xc3) found_ret = true; }
+    for (bytes[text_ptr .. text_ptr + text_size]) |b| {
+        if (b == 0xc3) found_ret = true;
+    }
     try std.testing.expect(found_ret);
 
     const sh_data_off = 20 + 1 * 40;
-    try std.testing.expectEqual(obj_pe.ScnCntInitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite,
-        readU32(bytes, sh_data_off + 36));
+    try std.testing.expectEqual(obj_pe.ScnCntInitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite, readU32(bytes, sh_data_off + 36));
     const sh_bss_off = 20 + 2 * 40;
-    try std.testing.expectEqual(obj_pe.ScnCntUninitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite,
-        readU32(bytes, sh_bss_off + 36));
+    try std.testing.expectEqual(obj_pe.ScnCntUninitializedData | obj_pe.ScnMemRead | obj_pe.ScnMemWrite, readU32(bytes, sh_bss_off + 36));
 
     // .text relocation: PC32 (REL32 = 4) for _callee.
     const data_size = readU32(bytes, sh_data_off + 16);
@@ -1680,8 +1702,8 @@ test "object emission: closure env + call_ptr (PE/COFF)" {
     builder.setCurrentFunction(lifted);
     const l_entry = try builder.appendBlock();
     builder.setCurrentBlock(l_entry);
-    const env_param = @as(ir.Value, @enumFromInt(0));
-    const x_param = @as(ir.Value, @enumFromInt(1));
+    const env_param = @as(ir.Value, @fromBackingInt(@intCast(0)));
+    const x_param = @as(ir.Value, @fromBackingInt(@intCast(1)));
     const captured = try builder.buildLoad(i64_ty, env_param);
     _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
 
@@ -1691,7 +1713,7 @@ test "object emission: closure env + call_ptr (PE/COFF)" {
     builder.setCurrentFunction(caller);
     const c_entry = try builder.appendBlock();
     builder.setCurrentBlock(c_entry);
-    const x_arg = @as(ir.Value, @enumFromInt(0));
+    const x_arg = @as(ir.Value, @fromBackingInt(@intCast(0)));
 
     const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
     const forty = try builder.buildIntConst(i64_ty, 40);
@@ -1756,10 +1778,7 @@ fn readU16(bytes: []const u8, off: usize) u16 {
 }
 
 fn readU32(bytes: []const u8, off: usize) u32 {
-    return @as(u32, bytes[off])
-        | (@as(u32, bytes[off + 1]) << 8)
-        | (@as(u32, bytes[off + 2]) << 16)
-        | (@as(u32, bytes[off + 3]) << 24);
+    return @as(u32, bytes[off]) | (@as(u32, bytes[off + 1]) << 8) | (@as(u32, bytes[off + 2]) << 16) | (@as(u32, bytes[off + 3]) << 24);
 }
 
 fn readU64(bytes: []const u8, off: usize) u64 {

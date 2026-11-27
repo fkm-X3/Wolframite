@@ -82,7 +82,10 @@ pub fn disassembleObject(gpa: Allocator, obj: *const Object) !Report {
         const name = try gpa.dupe(u8, sym.name);
         try funcs.append(gpa, .{ .name = name, .offset = sym.value, .size = sym.size });
     }
-    defer { for (funcs.items) |*f| gpa.free(f.name); funcs.deinit(gpa); }
+    defer {
+        for (funcs.items) |*f| gpa.free(f.name);
+        funcs.deinit(gpa);
+    }
     std.mem.sort(FuncSym, funcs.items, {}, byOffset);
 
     // Collect .text relocations for inline annotation (linear scan per
@@ -157,7 +160,7 @@ fn relocAnnotationFor(gpa: Allocator, relocs: []const Relocation, offset: u64, i
         if (rel.offset < offset or rel.offset >= offset + inst_len) continue;
         if (!first) try out.appendSlice(gpa, ", ");
         first = false;
-        const s = try std.fmt.allocPrint(gpa, "{s} {s} +{d}", .{relocKindName(rel.kind), rel.symbol, rel.addend});
+        const s = try std.fmt.allocPrint(gpa, "{s} {s} +{d}", .{ relocKindName(rel.kind), rel.symbol, rel.addend });
         defer gpa.free(s);
         try out.appendSlice(gpa, s);
     }
@@ -204,6 +207,9 @@ fn findFuncAt(funcs: []const FuncSym, pc: u64) ?*const FuncSym {
 }
 
 fn mnemonicText(gpa: Allocator, d: DecodedInstruction) ![]const u8 {
+    if (!d.has_rex and d.opcode == 0xcc and d.opcode2 == 0) {
+        return gpa.dupe(u8, "int3");
+    }
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
     if (d.has_rex) {
@@ -230,14 +236,21 @@ fn mnemonicText(gpa: Allocator, d: DecodedInstruction) ![]const u8 {
         try out.appendSlice(gpa, s4);
     }
     if (d.disp_len > 0) {
-        const s5 = try std.fmt.allocPrint(gpa, " disp{d}={d}", .{d.disp_len, d.disp});
+        const s5 = try std.fmt.allocPrint(gpa, " disp{d}={d}", .{ d.disp_len, d.disp });
         defer gpa.free(s5);
         try out.appendSlice(gpa, s5);
     }
     if (d.imm_len > 0) {
-        const s6 = try std.fmt.allocPrint(gpa, " imm{d}={x}", .{d.imm_len, d.imm});
+        const s6 = try std.fmt.allocPrint(gpa, " imm{d}={x}", .{ d.imm_len, d.imm });
         defer gpa.free(s6);
         try out.appendSlice(gpa, s6);
     }
     return try out.toOwnedSlice(gpa);
+}
+
+test "disasm renders trap as int3" {
+    const decoded = try decodeInstruction(&.{0xcc});
+    const text = try mnemonicText(std.testing.allocator, decoded);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("int3", text);
 }

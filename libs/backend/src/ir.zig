@@ -68,6 +68,8 @@ pub const Opcode = enum(u8) {
     cond_br,
     ret,
     ret_void,
+    /// Terminate execution immediately with a processor trap.
+    trap,
     call,
     /// Indirect call through a fn value (docs/semantics.md §6.4, R16c).
     /// Operand 0 is an SSA value of type `function_value`: the address of a
@@ -110,9 +112,17 @@ pub const Instruction = struct {
     /// Returns whether this opcode produces an SSA value.
     pub fn producesValue(self: Instruction) bool {
         return switch (self.opcode) {
-            .br, .cond_br, .ret, .ret_void, .store, .extern_call => false,
+            .br, .cond_br, .ret, .ret_void, .trap, .store, .extern_call => false,
             .func_addr => true,
             else => true,
+        };
+    }
+
+    /// Returns whether this opcode ends a basic block.
+    pub fn isTerminator(self: Instruction) bool {
+        return switch (self.opcode) {
+            .br, .cond_br, .ret, .ret_void, .trap => true,
+            else => false,
         };
     }
 };
@@ -241,7 +251,7 @@ pub const Function = struct {
 
     pub const empty: Function = .{
         .name = .{ .start = 0, .len = 0 },
-        .return_type = @enumFromInt(0),
+        .return_type = @fromBackingInt(@intCast(0)),
         .param_count = 0,
         .blocks = .empty,
         .instructions = .empty,
@@ -255,7 +265,7 @@ pub const Function = struct {
     }
 
     pub fn getOperand(self: Function, val: Value) u32 {
-        return self.extra_data.items[@intFromEnum(val)];
+        return self.extra_data.items[@backingInt(val)];
     }
 
     pub fn getOperands(self: Function, slice: OperandSlice) []const u32 {
@@ -350,22 +360,22 @@ pub const Module = struct {
     pub fn addType(self: *Module, gpa: Allocator, ir_type: IrType) !TypeIdx {
         const idx: u32 = @intCast(self.types.items.len);
         try self.types.append(gpa, ir_type);
-        return @enumFromInt(idx);
+        return @fromBackingInt(@intCast(idx));
     }
 
     pub fn getIrType(self: Module, idx: TypeIdx) IrType {
-        return self.types.items[@intFromEnum(idx)];
+        return self.types.items[@backingInt(idx)];
     }
 
     pub fn addGlobal(self: *Module, gpa: Allocator, name: []const u8, kind: GlobalKind) !GlobalIdx {
         const name_ref = try self.strings.intern(gpa, name);
         const idx: u32 = @intCast(self.globals.items.len);
         try self.globals.append(gpa, .{ .name = name_ref, .kind = kind });
-        return @enumFromInt(idx);
+        return @fromBackingInt(@intCast(idx));
     }
 
     pub fn getGlobal(self: Module, idx: GlobalIdx) Global {
-        return self.globals.items[@intFromEnum(idx)];
+        return self.globals.items[@backingInt(idx)];
     }
 };
 
@@ -398,8 +408,8 @@ pub const Builder = struct {
         // Pin the block's first_inst to the current end of the instruction
         // list so that all subsequent appends land in this block.
         const func = self.getCurrentFunction();
-        func.blocks.items[@intFromEnum(block)].first_inst =
-            @enumFromInt(@as(u32, @intCast(func.instructions.items.len)));
+        func.blocks.items[@backingInt(block)].first_inst =
+            @fromBackingInt(@intCast(@as(u32, @intCast(func.instructions.items.len))));
     }
 
     // -- Type helpers --
@@ -448,11 +458,11 @@ pub const Builder = struct {
         func.return_type = return_type;
         func.param_count = param_count;
         try self.module.functions.append(self.gpa, func);
-        return @enumFromInt(idx);
+        return @fromBackingInt(@intCast(idx));
     }
 
     pub fn getCurrentFunction(self: *Builder) *Function {
-        return &self.module.functions.items[@intFromEnum(self.current_func.?)];
+        return &self.module.functions.items[@backingInt(self.current_func.?)];
     }
 
     // -- Globals --
@@ -468,7 +478,7 @@ pub const Builder = struct {
     /// declaration order.
     pub fn addFnArrayGlobal(self: *Builder, name: []const u8, funcs: []const FunctionIdx) !GlobalIdx {
         const owned = try self.gpa.alloc(u32, funcs.len);
-        for (funcs, 0..) |func, i| owned[i] = @intFromEnum(func);
+        for (funcs, 0..) |func, i| owned[i] = @backingInt(func);
         return self.module.addGlobal(self.gpa, name, .{ .fn_array = owned });
     }
 
@@ -478,14 +488,14 @@ pub const Builder = struct {
         const func = self.getCurrentFunction();
         const idx: u32 = @intCast(func.blocks.items.len);
         try func.blocks.append(self.gpa, .{
-            .first_inst = @enumFromInt(@as(u32, @intCast(func.instructions.items.len))),
+            .first_inst = @fromBackingInt(@intCast(@as(u32, @intCast(func.instructions.items.len)))),
             .inst_count = 0,
         });
-        return @enumFromInt(idx);
+        return @fromBackingInt(@intCast(idx));
     }
 
     pub fn getCurrentBlock(self: *Builder) *BasicBlock {
-        return &self.getCurrentFunction().blocks.items[@intFromEnum(self.current_block.?)];
+        return &self.getCurrentFunction().blocks.items[@backingInt(self.current_block.?)];
     }
 
     // -- Operand helpers --
@@ -506,7 +516,7 @@ pub const Builder = struct {
         if (inst.producesValue()) {
             // Function parameters occupy values 0..param_count-1, so
             // instruction results start at param_count (matches codegen).
-            return @enumFromInt(func.param_count + idx);
+            return @fromBackingInt(@intCast(func.param_count + idx));
         }
         return .none;
     }
@@ -538,7 +548,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = opcode,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{ @intFromEnum(lhs), @intFromEnum(rhs) }),
+            .operands = try self.appendOperands(&.{ @backingInt(lhs), @backingInt(rhs) }),
         });
     }
 
@@ -617,31 +627,39 @@ pub const Builder = struct {
     pub fn buildBr(self: *Builder, target: BasicBlockIdx) !Value {
         return self.appendInstruction(.{
             .opcode = .br,
-            .type_idx = @enumFromInt(0),
-            .operands = try self.appendOperands(&.{@intFromEnum(target)}),
+            .type_idx = @fromBackingInt(@intCast(0)),
+            .operands = try self.appendOperands(&.{@backingInt(target)}),
         });
     }
 
     pub fn buildCondBr(self: *Builder, cond: Value, true_block: BasicBlockIdx, false_block: BasicBlockIdx) !Value {
         return self.appendInstruction(.{
             .opcode = .cond_br,
-            .type_idx = @enumFromInt(0),
-            .operands = try self.appendOperands(&.{ @intFromEnum(cond), @intFromEnum(true_block), @intFromEnum(false_block) }),
+            .type_idx = @fromBackingInt(@intCast(0)),
+            .operands = try self.appendOperands(&.{ @backingInt(cond), @backingInt(true_block), @backingInt(false_block) }),
         });
     }
 
     pub fn buildRet(self: *Builder, val: Value) !Value {
         return self.appendInstruction(.{
             .opcode = .ret,
-            .type_idx = @enumFromInt(0),
-            .operands = try self.appendOperands(&.{@intFromEnum(val)}),
+            .type_idx = @fromBackingInt(@intCast(0)),
+            .operands = try self.appendOperands(&.{@backingInt(val)}),
         });
     }
 
     pub fn buildRetVoid(self: *Builder) !Value {
         return self.appendInstruction(.{
             .opcode = .ret_void,
-            .type_idx = @enumFromInt(0),
+            .type_idx = @fromBackingInt(@intCast(0)),
+            .operands = try self.appendOperands(&.{}),
+        });
+    }
+
+    pub fn buildTrap(self: *Builder) !Value {
+        return self.appendInstruction(.{
+            .opcode = .trap,
+            .type_idx = @fromBackingInt(@intCast(0)),
             .operands = try self.appendOperands(&.{}),
         });
     }
@@ -649,9 +667,9 @@ pub const Builder = struct {
     pub fn buildCall(self: *Builder, func_idx: FunctionIdx, type_idx: TypeIdx, args: []const Value) !Value {
         var ops = std.ArrayList(u32).empty;
         defer ops.deinit(self.gpa);
-        try ops.append(self.gpa, @intFromEnum(func_idx));
+        try ops.append(self.gpa, @backingInt(func_idx));
         for (args) |arg| {
-            try ops.append(self.gpa, @intFromEnum(arg));
+            try ops.append(self.gpa, @backingInt(arg));
         }
         return self.appendInstruction(.{
             .opcode = .call,
@@ -671,9 +689,9 @@ pub const Builder = struct {
     pub fn buildCallPtr(self: *Builder, type_idx: TypeIdx, callee: Value, args: []const Value) !Value {
         var ops = std.ArrayList(u32).empty;
         defer ops.deinit(self.gpa);
-        try ops.append(self.gpa, @intFromEnum(callee));
+        try ops.append(self.gpa, @backingInt(callee));
         for (args) |arg| {
-            try ops.append(self.gpa, @intFromEnum(arg));
+            try ops.append(self.gpa, @backingInt(arg));
         }
         return self.appendInstruction(.{
             .opcode = .call_ptr,
@@ -770,7 +788,7 @@ pub const Builder = struct {
         defer ops.deinit(self.gpa);
         try ops.append(self.gpa, ext_idx);
         for (args) |arg| {
-            try ops.append(self.gpa, @intFromEnum(arg));
+            try ops.append(self.gpa, @backingInt(arg));
         }
         return self.appendInstruction(.{
             .opcode = .extern_call,
@@ -805,7 +823,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = .load,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{@intFromEnum(ptr)}),
+            .operands = try self.appendOperands(&.{@backingInt(ptr)}),
         });
     }
 
@@ -813,7 +831,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = .store,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{ @intFromEnum(ptr), @intFromEnum(val) }),
+            .operands = try self.appendOperands(&.{ @backingInt(ptr), @backingInt(val) }),
         });
     }
 
@@ -821,8 +839,8 @@ pub const Builder = struct {
         var ops = std.ArrayList(u32).empty;
         defer ops.deinit(self.gpa);
         for (incoming) |inc| {
-            try ops.append(self.gpa, @intFromEnum(inc.value));
-            try ops.append(self.gpa, @intFromEnum(inc.block));
+            try ops.append(self.gpa, @backingInt(inc.value));
+            try ops.append(self.gpa, @backingInt(inc.block));
         }
         return self.appendInstruction(.{
             .opcode = .phi,
@@ -841,7 +859,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = .malloc,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{@intFromEnum(size)}),
+            .operands = try self.appendOperands(&.{@backingInt(size)}),
         });
     }
 
@@ -850,7 +868,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = .global_addr,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{@intFromEnum(global)}),
+            .operands = try self.appendOperands(&.{@backingInt(global)}),
         });
     }
 
@@ -859,7 +877,7 @@ pub const Builder = struct {
         return self.appendInstruction(.{
             .opcode = .func_addr,
             .type_idx = type_idx,
-            .operands = try self.appendOperands(&.{@intFromEnum(func_idx)}),
+            .operands = try self.appendOperands(&.{@backingInt(func_idx)}),
         });
     }
 };
@@ -914,7 +932,7 @@ pub fn printModule(module: *Module, writer: anytype) !void {
         for (func.blocks.items, 0..) |block, block_idx| {
             try w.print("  bb{}:\n", .{block_idx});
 
-            const start = @intFromEnum(block.first_inst);
+            const start = @backingInt(block.first_inst);
             const end = start + block.inst_count;
             for (func.instructions.items[start..end], 0..) |inst, i| {
                 const inst_idx = start + i;
@@ -973,6 +991,7 @@ fn printInstruction(module: *Module, func: Function, inst: Instruction, writer: 
         .cond_br => try w.print("cond_br %{d}, bb{d}, bb{d}", .{ ops[0], ops[1], ops[2] }),
         .ret => try w.print("ret %{d}", .{ops[0]}),
         .ret_void => try w.print("ret_void", .{}),
+        .trap => try w.print("trap", .{}),
         .call => {
             try w.print("call @fn{d}(", .{ops[0]});
             for (ops[1..], 0..) |arg, i| {
@@ -1042,7 +1061,7 @@ test "basic module construction" {
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
 
-    _ = try builder.buildRet(@enumFromInt(0));
+    _ = try builder.buildRet(@fromBackingInt(@intCast(0)));
 
     try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
     try std.testing.expectEqual(@as(usize, 1), module.functions.items[0].blocks.items.len);
@@ -1063,10 +1082,10 @@ test "fibonacci construction" {
     builder.setCurrentBlock(entry);
 
     // %cond = icmp sle %n, 1
-    const n_param = @as(Value, @enumFromInt(0));
-    const one = @as(Value, @enumFromInt(1));
+    const n_param = @as(Value, @fromBackingInt(@intCast(0)));
+    const one = @as(Value, @fromBackingInt(@intCast(1)));
     _ = one;
-    const cond = try builder.buildIcmp(.icmp_sle, i32_type, n_param, @enumFromInt(0));
+    const cond = try builder.buildIcmp(.icmp_sle, i32_type, n_param, @fromBackingInt(@intCast(0)));
 
     const base = try builder.appendBlock();
     const recurse = try builder.appendBlock();
@@ -1105,9 +1124,9 @@ test "extended opcodes and globals" {
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
 
-    const a = @as(Value, @enumFromInt(0));
-    const b = @as(Value, @enumFromInt(1));
-    const callee_addr = @as(Value, @enumFromInt(2));
+    const a = @as(Value, @fromBackingInt(@intCast(0)));
+    const b = @as(Value, @fromBackingInt(@intCast(1)));
+    const callee_addr = @as(Value, @fromBackingInt(@intCast(2)));
 
     _ = try builder.buildIntConst(i64_ty, 10);
     _ = try builder.buildFloatConst(f64_ty, 1.5);
@@ -1182,8 +1201,8 @@ test "function value type and record materialization" {
     builder.setCurrentFunction(lifted);
     const l_entry = try builder.appendBlock();
     builder.setCurrentBlock(l_entry);
-    const env_param = @as(Value, @enumFromInt(0));
-    const x_param = @as(Value, @enumFromInt(1));
+    const env_param = @as(Value, @fromBackingInt(@intCast(0)));
+    const x_param = @as(Value, @fromBackingInt(@intCast(1)));
     const captured = try builder.buildLoad(i64_ty, env_param);
     _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
 
@@ -1193,7 +1212,7 @@ test "function value type and record materialization" {
     builder.setCurrentFunction(make);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const fn_ptr_param = @as(Value, @enumFromInt(0)); // callee address
+    const fn_ptr_param = @as(Value, @fromBackingInt(@intCast(0))); // callee address
 
     const env = try builder.buildAllocaBytes(i64_ty, 8);
     const capture_val = try builder.buildIntConst(i64_ty, 42);
@@ -1240,8 +1259,8 @@ test "call through fn value with captured env record" {
     builder.setCurrentFunction(lifted);
     const l_entry = try builder.appendBlock();
     builder.setCurrentBlock(l_entry);
-    const env_param = @as(Value, @enumFromInt(0));
-    const x_param = @as(Value, @enumFromInt(1));
+    const env_param = @as(Value, @fromBackingInt(@intCast(0)));
+    const x_param = @as(Value, @fromBackingInt(@intCast(1)));
     const captured = try builder.buildLoad(i64_ty, env_param);
     _ = try builder.buildRet(try builder.buildAdd(i64_ty, captured, x_param));
 
@@ -1252,7 +1271,7 @@ test "call through fn value with captured env record" {
     builder.setCurrentFunction(make);
     const m_entry = try builder.appendBlock();
     builder.setCurrentBlock(m_entry);
-    const x2 = @as(Value, @enumFromInt(0));
+    const x2 = @as(Value, @fromBackingInt(@intCast(0)));
 
     const fn_addr = try builder.buildFuncAddr(i64_ty, lifted);
     const forty = try builder.buildIntConst(i64_ty, 40);

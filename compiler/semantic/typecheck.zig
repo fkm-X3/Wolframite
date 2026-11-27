@@ -1662,6 +1662,9 @@ pub const TypeChecker = struct {
                 }
                 self.setNodeType(stmt_idx, self.void_ty);
             },
+            .unreachable_stmt => {
+                self.setNodeType(stmt_idx, self.void_ty);
+            },
             .expr_stmt => |e| {
                 _ = self.inferExprType(e.expr);
                 self.setNodeType(stmt_idx, self.void_ty);

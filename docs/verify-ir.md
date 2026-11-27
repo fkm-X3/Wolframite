@@ -13,6 +13,8 @@
 3. **Phi predecessor check** — every phi incoming block is a valid source for
    the value it consumes (a phi operand's `(value, block)` pair must list the
    defining block of that value).
+4. **Terminator placement** — `br`, `cond_br`, `ret`, `ret_void`, and `trap`
+   must be the final instruction in their basic block.
 
 This is **Tool 6**. It operates on Tungsten IR (not assembly), reusing
 `ir.zig`'s `Module`/`Function`/`Block`/`Instruction`/`Value` structures.
@@ -42,7 +44,7 @@ pub const Verifier = struct {
 
 pub fn init(gpa: Allocator, module: *const ir.Module) Verifier
 pub fn deinit(self: *Verifier) void
-pub fn verifyAll(self: *Verifier) !u32   // returns report count
+pub fn verifyAll(verifier: *Verifier) !u32   // returns report count
 ```
 
 - `init` builds no state beyond the module reference; per-function analysis
@@ -58,6 +60,7 @@ pub fn verifyAll(self: *Verifier) !u32   // returns report count
 |-------------|---------|---------|
 | Undefined slot | `use of undefined slot %{d} at %{d}.{d}` | An operand slot was never defined in any block up to the use site. |
 | Slot used without phi | `slot %{d} defined in block %{d} used at %{d}.{d} without phi` | A slot defined in another block is read here, and no phi incoming pair lists that defining block for that slot. |
+| Instruction after terminator | `terminator is not the last instruction in its block` | A branch, return, or trap is followed by another instruction in the same block. |
 
 `verifyAll` also maintains a `VerifyError` set (`OutOfBoundsSlot`,
 `SlotUsedWithoutPhi`, `UndefinedSlot`) that is not currently raised by the
@@ -77,11 +80,13 @@ The analysis is intentionally conservative and simple:
 
 ## Tests
 
-Three tests live in `verify_ir.zig` and run under `zig build test-backend`:
+Five tests live in `verify_ir.zig` and run under `zig build test-backend`:
 
 1. Clean function reports zero violations.
-2. `ret` reading an undefined slot is flagged (`use of undefined slot`).
-3. A phi whose incoming block is not a predecessor is flagged (`without phi`).
+2. A block ending in `trap` is accepted.
+3. An instruction following `trap` is flagged as a terminator-placement error.
+4. `ret` reading an undefined slot is flagged (`use of undefined slot`).
+5. A phi whose incoming block is not a predecessor is flagged.
 
 ## CLI integration
 

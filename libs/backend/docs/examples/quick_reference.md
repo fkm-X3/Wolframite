@@ -59,6 +59,7 @@
 | `br` | `br bb_target` | Unconditional branch |
 | `cond_br` | `cond_br %c, bb_true, bb_false` | Conditional branch |
 | `ret` | `ret %value` | Return |
+| `trap` | `trap` | Terminate execution with a processor trap |
 
 ### Memory
 | Opcode | Format | Description |

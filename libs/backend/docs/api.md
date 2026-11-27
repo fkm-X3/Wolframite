@@ -527,6 +527,15 @@ pub fn buildRet(self: *Context, val: Value) !Value
 
 `ret %val` — return the value from the current function.
 
+#### `buildTrap`
+
+```zig
+pub fn buildTrap(self: *Context) !Value
+```
+
+`trap` — terminate execution immediately. The instruction has no operands and
+produces no SSA value; x86-64 code generation emits `int3` (`0xcc`).
+
 ### Function Calls
 
 #### `buildCall`

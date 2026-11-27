@@ -211,6 +211,7 @@ pub fn locationFromNode(arena: *const ast.AstArena, source: []const u8, node: as
         .fn_ref => |r| r,
         .let_stmt => |l| l.name,
         .break_stmt, .continue_stmt => |control| control.keyword,
+        .unreachable_stmt => |keyword| keyword,
         .fn_decl => |f| f.name,
         .struct_decl => |s| s.name,
         .enum_decl => |e| e.name,

@@ -384,6 +384,11 @@ pub const Context = struct {
         return self.builder.buildRetVoid();
     }
 
+    /// Build a trap instruction that terminates execution immediately.
+    pub fn buildTrap(self: *Context) !Value {
+        return self.builder.buildTrap();
+    }
+
     // ========================================================================
     // Instruction Building — Function Calls
     // ========================================================================
@@ -611,6 +616,28 @@ test "function and instruction building" {
     try std.testing.expectEqual(@as(usize, 1), ctx.getBlockCountIn(func));
     try std.testing.expectEqual(@as(usize, 2), ctx.getInstructionCountIn(func));
     try std.testing.expectEqualStrings("add", ctx.getFunctionName(func));
+}
+
+test "trap instruction building and printing" {
+    const ctx = try Context.init(std.testing.allocator, .linux_x86_64);
+    defer ctx.deinit();
+
+    const void_ty = try ctx.voidType();
+    const func = try ctx.addFunction("stop", void_ty, 0);
+    ctx.setCurrentFunction(func);
+    const entry = try ctx.appendBlock();
+    ctx.setCurrentBlock(entry);
+
+    try std.testing.expectEqual(Value.none, try ctx.buildTrap());
+    const inst = ctx.getFunction(func).instructions.items[0];
+    try std.testing.expectEqual(Opcode.trap, inst.opcode);
+    try std.testing.expect(!inst.producesValue());
+    try std.testing.expect(inst.isTerminator());
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try ctx.print(&w);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..w.end], "    trap\n") != null);
 }
 
 test "fibonacci with control flow" {

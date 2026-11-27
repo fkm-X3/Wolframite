@@ -230,6 +230,7 @@ fn @abs_diff(i32 %a, i32 %b) -> i32 {
 | `br` | `br bb_target` | No |
 | `cond_br` | `cond_br %cond, bb_true, bb_false` | No |
 | `ret` | `ret %value` | No |
+| `trap` | `trap` | No |
 | `call` | `%result = call @fn(args...)` | Yes |
 | `alloca` | `%result = alloca` | Yes |
 | `load` | `%result = load %ptr` | Yes |

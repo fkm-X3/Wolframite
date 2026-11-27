@@ -18,11 +18,11 @@ pub const Report = struct {
     function: []const u8,
     /// Human-readable description of the violation.
     message: []const u8,
-    /// Instruction index where the violation was detected (or u32.max for
+    /// Instruction index where the violation was detected (or std.math.maxInt(u32) for
     /// block/function-level issues such as a non-predecessor phi).
     inst: u32,
     /// Byte offset of the offending operand within the instruction's operand
-    /// slice (or u32.max when not applicable).
+    /// slice (or std.math.maxInt(u32) when not applicable).
     operand: u32,
 };
 
@@ -48,6 +48,10 @@ pub fn init(gpa: Allocator, module: *const ir.Module) Verifier {
 }
 
 pub fn deinit(self: *Verifier) void {
+    for (self.reports.items) |report| {
+        self.gpa.free(report.function);
+        self.gpa.free(report.message);
+    }
     self.reports.deinit(self.gpa);
 }
 
@@ -55,7 +59,7 @@ pub fn deinit(self: *Verifier) void {
 /// number of reports recorded.
 pub fn verifyAll(self: *Verifier) !u32 {
     for (self.module.functions.items) |*func| {
-        try self.verifyFunction(func);
+        try verifyFunction(self, func);
     }
     return @intCast(self.reports.items.len);
 }
@@ -64,12 +68,12 @@ fn verifyFunction(self: *Verifier, func: *const ir.Function) !void {
     const fname = self.module.strings.get(func.name);
     const param_count = func.param_count;
 
-    // Value => the block index where it was first defined, or u32.max when
+    // Value => the block index where it was first defined, or std.math.maxInt(u32) when
     // it has been defined in more than one block (requiring a phi).
     var defined_block = try self.gpa.alloc(u32, func.instructions.items.len + @as(usize, @intCast(param_count)));
     var i: u32 = 0;
     while (i < @as(usize, @intCast(param_count)) + func.instructions.items.len) : (i += 1) {
-        defined_block[@as(usize, i)] = u32.max; // u32.max = not yet defined
+        defined_block[@as(usize, i)] = std.math.maxInt(u32); // std.math.maxInt(u32) = not yet defined
     }
 
     // Track which block each value was defined in for phi conflict detection.
@@ -82,7 +86,7 @@ fn verifyFunction(self: *Verifier, func: *const ir.Function) !void {
     var block: u32 = 0;
     while (block < func.blocks.items.len) : (block += 1) {
         const b = &func.blocks.items[@as(usize, block)];
-        var inst_off: u32 = @intFromEnum(b.first_inst);
+        var inst_off: u32 = @backingInt(b.first_inst);
         const inst_end: u32 = inst_off + b.inst_count;
         while (inst_off < inst_end) : (inst_off += 1) {
             const inst = func.instructions.items[@as(usize, inst_off)];
@@ -96,38 +100,55 @@ fn verifyFunction(self: *Verifier, func: *const ir.Function) !void {
             // below.
             var o: u32 = 0;
             while (o < ops.len) : (o += 1) {
+                if (!isValueOperand(inst, o)) continue;
                 const operand = ops[@as(usize, o)];
-                const operand_block = defined_block[@as(usize, @intFromEnum(operand))];
-                if (operand_block == u32.max) {
-                    const msg = try fmt.allocPrint(self.gpa,
-                        "use of undefined slot %{d} at %{d}.{d}", .{ operand, inst_off, o });
+                const operand_idx: usize = @intCast(operand);
+                if (operand_idx >= defined_block.len) {
+                    const msg = try fmt.allocPrint(self.gpa, "use of undefined slot %{d} at %{d}.{d}", .{ operand, inst_off, o });
                     defer self.gpa.free(msg);
-                    try self.addReport(fname, msg, inst_off, o);
-                } else if (operand_block != block and operand_block != u32.max) {
+                    try addReport(self, fname, msg, inst_off, o);
+                    continue;
+                }
+                const operand_block = defined_block[operand_idx];
+                if (operand_block == std.math.maxInt(u32)) {
+                    const msg = try fmt.allocPrint(self.gpa, "use of undefined slot %{d} at %{d}.{d}", .{ operand, inst_off, o });
+                    defer self.gpa.free(msg);
+                    try addReport(self, fname, msg, inst_off, o);
+                } else if (operand_block != block and operand_block != std.math.maxInt(u32)) {
                     // Defined in another block; only legal if consumed by a
                     // phi whose incoming pair lists this defining block.
                     if (!isPhiConsumingDefinedBlock(func, inst_off, operand, operand_block)) {
-                        const msg = try fmt.allocPrint(self.gpa,
-                            "slot %{d} defined in block %{d} used at %{d}.{d} without phi",
-                            .{ operand, operand_block, inst_off, o });
+                        const msg = try fmt.allocPrint(self.gpa, "slot %{d} defined in block %{d} used at %{d}.{d} without phi", .{ operand, operand_block, inst_off, o });
                         defer self.gpa.free(msg);
-                        try self.addReport(fname, msg, inst_off, o);
+                        try addReport(self, fname, msg, inst_off, o);
                     }
                 }
-                o += 1;
+            }
+
+            if (inst.opcode == .phi) {
+                var pair: usize = 0;
+                while (pair + 1 < ops.len) : (pair += 2) {
+                    if (!isPredecessor(func, ops[pair + 1], block)) {
+                        try addReport(self, fname, "phi incoming block is not a predecessor", inst_off, @intCast(pair + 1));
+                    }
+                }
+            }
+
+            if (inst.isTerminator() and inst_off + 1 != inst_end) {
+                try addReport(self, fname, "terminator is not the last instruction in its block", inst_off, std.math.maxInt(u32));
             }
 
             // Mark results as defined in this block.
             if (inst.producesValue()) {
                 const result_slot = @as(usize, @intCast(func.param_count + inst_off));
                 const prev = defined_block[result_slot];
-                if (prev == u32.max) {
+                if (prev == std.math.maxInt(u32)) {
                     defined_block[result_slot] = @as(u32, block);
                 } else if (prev != block) {
                     // Defined in more than one block: requires a phi at some
                     // use site. We flag at definition; phi-consume checks
                     // validate each use site individually.
-                    defined_block[result_slot] = u32.max - 1; // sentinel: multi-defined
+                    defined_block[result_slot] = std.math.maxInt(u32) - 1; // sentinel: multi-defined
                 }
             }
         }
@@ -138,6 +159,32 @@ fn verifyFunction(self: *Verifier, func: *const ir.Function) !void {
     }
 
     self.gpa.free(defined_block);
+}
+
+/// Whether an operand is an SSA slot rather than an immediate, function/global
+/// index, block index, or the block half of a phi incoming pair.
+fn isValueOperand(inst: ir.Instruction, operand: u32) bool {
+    return switch (inst.opcode) {
+        .iconst, .fconst, .br, .ret_void, .trap, .alloca, .global_addr, .func_addr => false,
+        .cond_br => operand == 0,
+        .call, .call_ptr, .extern_call => operand > 0,
+        .phi => operand % 2 == 0,
+        else => true,
+    };
+}
+
+fn isPredecessor(func: *const ir.Function, from_block: u32, to_block: u32) bool {
+    if (from_block >= func.blocks.items.len) return false;
+    const block = func.blocks.items[@as(usize, from_block)];
+    if (block.inst_count == 0) return false;
+    const last_idx = @backingInt(block.first_inst) + block.inst_count - 1;
+    const terminator = func.instructions.items[@as(usize, last_idx)];
+    const ops = func.getOperands(terminator.operands);
+    return switch (terminator.opcode) {
+        .br => ops.len == 1 and ops[0] == to_block,
+        .cond_br => ops.len == 3 and (ops[1] == to_block or ops[2] == to_block),
+        else => false,
+    };
 }
 
 /// True when `inst_off` is a phi instruction and one of its incoming pairs
@@ -191,15 +238,50 @@ test "verify clean function reports nothing" {
     builder.setCurrentFunction(func);
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
-    const a = @as(ir.Value, @enumFromInt(0));
+    const a = @as(ir.Value, @fromBackingInt(@intCast(0)));
     const one = try builder.buildIntConst(i32_ty, 1);
     const sum = try builder.buildAdd(i32_ty, a, one);
     _ = try builder.buildRet(sum);
 
     var verifier = init(std.testing.allocator, &module);
-    defer verifier.deinit();
-    const count = try verifier.verifyAll();
+    defer deinit(&verifier);
+    const count = try verifyAll(&verifier);
     try std.testing.expectEqual(0, count);
+}
+
+test "verify accepts trap as a block terminator" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const void_ty = try builder.addVoidType();
+    const func = try builder.addFunction("stop", void_ty, 0);
+    builder.setCurrentFunction(func);
+    const entry = try builder.appendBlock();
+    builder.setCurrentBlock(entry);
+    _ = try builder.buildTrap();
+
+    var verifier = init(std.testing.allocator, &module);
+    defer deinit(&verifier);
+    try std.testing.expectEqual(0, try verifyAll(&verifier));
+}
+
+test "verify rejects instructions after a trap terminator" {
+    var module = ir.Module.empty;
+    defer module.deinit(std.testing.allocator);
+    var builder = ir.Builder.init(std.testing.allocator, &module);
+    const i32_ty = try builder.addIntType(true, 32);
+    const func = try builder.addFunction("bad_stop", i32_ty, 0);
+    builder.setCurrentFunction(func);
+    const entry = try builder.appendBlock();
+    builder.setCurrentBlock(entry);
+    _ = try builder.buildTrap();
+    const zero = try builder.buildIntConst(i32_ty, 0);
+    _ = try builder.buildRet(zero);
+
+    var verifier = init(std.testing.allocator, &module);
+    defer deinit(&verifier);
+    try std.testing.expectEqual(1, try verifyAll(&verifier));
+    try std.testing.expectEqualStrings("terminator is not the last instruction in its block", verifier.reports.items[0].message);
 }
 
 test "verify catches use of undefined slot" {
@@ -212,11 +294,11 @@ test "verify catches use of undefined slot" {
     const entry = try builder.appendBlock();
     builder.setCurrentBlock(entry);
     // ret reads slot 5, which no instruction defines (param_count=0).
-    _ = try builder.buildRet(@as(ir.Value, @enumFromInt(5)));
+    _ = try builder.buildRet(@as(ir.Value, @fromBackingInt(@intCast(5))));
 
     var verifier = init(std.testing.allocator, &module);
-    defer verifier.deinit();
-    const count = try verifier.verifyAll();
+    defer deinit(&verifier);
+    const count = try verifyAll(&verifier);
     try std.testing.expectEqual(1, count);
     if (verifier.reports.items.len > 0) {
         try std.testing.expectEqualStrings("bad", verifier.reports.items[0].function);
@@ -235,7 +317,7 @@ test "verify phi incoming block must be a predecessor" {
     const bb1 = try builder.appendBlock();
     const bb2 = try builder.appendBlock();
     builder.setCurrentBlock(bb0);
-    const n = @as(ir.Value, @enumFromInt(0));
+    const n = @as(ir.Value, @fromBackingInt(@intCast(0)));
     const one = try builder.buildIntConst(i32_ty, 1);
     const cond = try builder.buildIcmp(.icmp_sgt, i32_ty, n, one);
     _ = try builder.buildCondBr(cond, bb1, bb2);
@@ -251,8 +333,8 @@ test "verify phi incoming block must be a predecessor" {
     _ = try builder.buildRet(v7);
 
     var verifier = init(std.testing.allocator, &module);
-    defer verifier.deinit();
-    const count = try verifier.verifyAll();
+    defer deinit(&verifier);
+    const count = try verifyAll(&verifier);
     try std.testing.expectEqual(1, count);
 }
 

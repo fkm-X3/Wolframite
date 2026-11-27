@@ -46,6 +46,7 @@ pub const SimError = error{
     UnsupportedOpcode,
     MissingBlock,
     InvalidBranchTarget,
+    Trap,
     ExternalCallUnimplemented,
     MallocUnimplemented,
 };
@@ -98,7 +99,7 @@ All opcodes Tungsten emits:
 | Float arithmetic | `fadd`, `fsub`, `fmul`, `fdiv` |
 | Integer comparison | `icmp_eq`, `icmp_ne`, `icmp_slt`, `icmp_sle`, `icmp_sgt`, `icmp_sge`, `icmp_ult`, `icmp_ule`, `icmp_ugt`, `icmp_uge` |
 | Float comparison | `fcmp_oeq`, `fcmp_one`, `fcmp_olt`, `fcmp_ole`, `fcmp_ogt`, `fcmp_oge` |
-| Control flow | `br`, `cond_br`, `ret`, `ret_void` |
+| Control flow | `br`, `cond_br`, `ret`, `ret_void`, `trap` |
 | Calls | `call`, `call_ptr` |
 | Memory | `alloca`, `load`, `store`, `ptr_add` (`malloc` unimplemented) |
 | Globals / addresses | `global_addr`, `func_addr` |
@@ -110,6 +111,7 @@ All opcodes Tungsten emits:
 - `DivideByZero` — `sdiv`/`udiv`/`srem`/`urem` by zero.
 - `InvalidBranchTarget` — branch to a block index out of range, or falling off
   the end of a function without `ret`.
+- `Trap` — execution reached the `trap` terminator; this is a hard error, not a return.
 - `ExternalCallUnimplemented` — `extern_call` has no simulator implementation.
 - `MallocUnimplemented` — `malloc` has no simulator implementation.
 - `UnsupportedOpcode` — defensive; all emitted opcodes are handled.
@@ -153,13 +155,14 @@ try s.run();
 
 ### Tests
 
-Four tests live in `sim.zig` and run under `zig build test-backend`:
+Five tests live in `sim.zig` and run under `zig build test-backend`:
 
 1. `sim executes add of two params` — `add(3, 7) == 10`.
-2. `sim executes conditional branch between two blocks` — both branch targets
+2. `sim reports a hard error on trap` — `trap` returns `Trap` without halting normally.
+3. `sim executes conditional branch between two blocks` — both branch targets
    (`bb1 → 42`, `bb2 → 7`) produce correct results.
-3. `sim detects uninitialized slot read` — returns `UninitializedSlot`.
-4. `sim executes function call` — `caller(5)` calls `callee(5) → 5`; result `6`.
+4. `sim detects uninitialized slot read` — returns `UninitializedSlot`.
+5. `sim executes function call` — `caller(5)` calls `callee(5) → 5`; result `6`.
 
 ### CLI integration (not yet done)
 

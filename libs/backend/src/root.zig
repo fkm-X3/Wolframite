@@ -24,6 +24,8 @@ test {
     _ = @import("obj_elf.zig");
     _ = @import("obj_pe.zig");
     _ = @import("api.zig");
+    _ = @import("sim.zig");
+    _ = @import("verify_ir.zig");
     _ = @import("closure_tests.zig");
     _ = @import("check_codegen.zig");
     _ = @import("disasm.zig");

@@ -15,7 +15,7 @@
 //!
 //! The decoder handles only the x86-64 subset Tungsten emits:
 //! mov, lea, add, sub, cmp, setcc, jmp, je, call, push, pop, leave, ret,
-//! idiv/div, movzx, cqo, and REX-prefixed variants.
+//! int3, idiv/div, movzx, cqo, and REX-prefixed variants.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -96,8 +96,7 @@ pub fn checkObject(gpa: Allocator, obj: *const Object) !Report {
         const decoded = if (decodeInstruction(text[pc..])) |d| d else |_| {
             // If we can't decode, stop disassembling this function to avoid
             // cascading false positives, but report the truncation.
-            _ = try reportViolation(gpa, &report, func_name, inst_start,
-                "undecodable bytes at end of function", text[inst_start..]);
+            _ = try reportViolation(gpa, &report, func_name, inst_start, "undecodable bytes at end of function", text[inst_start..]);
             break;
         };
         pc = inst_start + @as(u64, decoded.len);
@@ -136,10 +135,8 @@ fn findFuncAt(funcs: []const FuncInfo, pc: u64) ?*const FuncInfo {
     return null;
 }
 
-fn reportViolation(gpa: Allocator, report: *Report, func_name: []const u8, offset: u64,
-    message: []const u8, bytes: []const u8) !void {
-    var v = Violation{ .function = func_name, .offset = offset, .message = message,
-        .bytes = undefined, .byte_len = 0 };
+fn reportViolation(gpa: Allocator, report: *Report, func_name: []const u8, offset: u64, message: []const u8, bytes: []const u8) !void {
+    var v = Violation{ .function = func_name, .offset = offset, .message = message, .bytes = undefined, .byte_len = 0 };
     var i: usize = 0;
     while (i < bytes.len and i < 16) : (i += 1) {
         v.bytes[i] = bytes[i];
@@ -154,11 +151,26 @@ fn reportViolation(gpa: Allocator, report: *Report, func_name: []const u8, offse
 
 /// Registers referenced by Tungsten codegen (REX.R/B and ModR/M reg fields).
 pub const Reg = enum(u8) {
-    rax = 0, rcx = 1, rdx = 2, rbx = 3,
-    rsp = 4, rbp = 5, rsi = 6, rdi = 7,
-    r8 = 8, r9 = 9, r10 = 10, r11 = 11,
-    r12 = 12, r13 = 13, r14 = 14, r15 = 15,
-    xmm0 = 0, xmm1 = 1, xmm2 = 2, xmm3 = 3,
+    rax = 0,
+    rcx = 1,
+    rdx = 2,
+    rbx = 3,
+    rsp = 4,
+    rbp = 5,
+    rsi = 6,
+    rdi = 7,
+    r8 = 8,
+    r9 = 9,
+    r10 = 10,
+    r11 = 11,
+    r12 = 12,
+    r13 = 13,
+    r14 = 14,
+    r15 = 15,
+    xmm0 = 0,
+    xmm1 = 1,
+    xmm2 = 2,
+    xmm3 = 3,
 };
 
 /// The decoded form of one instruction.
@@ -385,10 +397,7 @@ pub fn decodeInstruction(bytes: []const u8) !DecodedInstruction {
 }
 
 fn readU32(bytes: []const u8, off: usize) u32 {
-    return @as(u32, bytes[off])
-        | (@as(u32, bytes[off + 1]) << 8)
-        | (@as(u32, bytes[off + 2]) << 16)
-        | (@as(u32, bytes[off + 3]) << 24);
+    return @as(u32, bytes[off]) | (@as(u32, bytes[off + 1]) << 8) | (@as(u32, bytes[off + 2]) << 16) | (@as(u32, bytes[off + 3]) << 24);
 }
 
 fn readU64(bytes: []const u8, off: usize) u64 {
@@ -412,8 +421,13 @@ fn rmIndexOf(rex: u8, modrm: u8) u8 {
 }
 
 /// Validate a single decoded instruction against the encoding rules.
-fn validateInstruction(gpa: Allocator, report: *Report, func_name: []const u8,
-    inst_start: u64, d: DecodedInstruction, text: []const u8,
+fn validateInstruction(
+    gpa: Allocator,
+    report: *Report,
+    func_name: []const u8,
+    inst_start: u64,
+    d: DecodedInstruction,
+    text: []const u8,
     funcs: []const FuncInfo,
 ) !void {
     const inst_bytes = text[inst_start .. inst_start + @as(usize, d.len)];
@@ -449,8 +463,7 @@ fn validateInstruction(gpa: Allocator, report: *Report, func_name: []const u8,
         if (d.opcode2 >= 0x90 and d.opcode2 <= 0x9F) {
             // setcc / cmov group (0x0F 0x90-0x9F)
             if (!d.has_modrm) {
-                try reportViolation(gpa, report, func_name, inst_start,
-                    "setcc/cmov missing ModR/M byte", inst_bytes);
+                try reportViolation(gpa, report, func_name, inst_start, "setcc/cmov missing ModR/M byte", inst_bytes);
             }
         }
     }
@@ -463,8 +476,7 @@ fn validateInstruction(gpa: Allocator, report: *Report, func_name: []const u8,
         // the index field must be none.
         if (sib_base == 0b100 or sib_base == 0b101) {
             if (sib_index != 0b100) {
-                try reportViolation(gpa, report, func_name, inst_start,
-                    "SIB index != none with rsp/rbp base", inst_bytes);
+                try reportViolation(gpa, report, func_name, inst_start, "SIB index != none with rsp/rbp base", inst_bytes);
             }
         }
     }
@@ -480,8 +492,7 @@ fn validateInstruction(gpa: Allocator, report: *Report, func_name: []const u8,
             const rex_x = (d.rex >> 1) & 1;
             const rex_b = d.rex & 1;
             if (rex_w != 1 or rex_r != 0 or rex_x != 0 or rex_b != 0) {
-                try reportViolation(gpa, report, func_name, inst_start,
-                    "mov rax, imm64 has inconsistent REX prefix", inst_bytes);
+                try reportViolation(gpa, report, func_name, inst_start, "mov rax, imm64 has inconsistent REX prefix", inst_bytes);
             }
         }
     }
@@ -510,8 +521,7 @@ fn validateInstruction(gpa: Allocator, report: *Report, func_name: []const u8,
             const foff: i64 = @as(i64, @intCast(f.offset));
             const fsize: i64 = @as(i64, @intCast(f.size));
             if (target_pc < foff or target_pc >= foff + fsize) {
-                try reportViolation(gpa, report, func_name, inst_start,
-                    "branch target outside enclosing function", inst_bytes);
+                try reportViolation(gpa, report, func_name, inst_start, "branch target outside enclosing function", inst_bytes);
             }
         }
     }
@@ -561,10 +571,29 @@ test "check_codegen: well-formed object reports no violations" {
     // push rbp; mov rbp, rsp; mov rax, 42; mov [rbp-8], rax; leave; ret
     const text = [_]u8{
         0x55, 0x48, 0x89, 0xe5,
-        0x48, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x89, 0x85, 0xf8, 0xff, 0xff, 0xff,
-        0xc9, 0xc3,
+        0x48, 0xb8, 0x2a, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x48, 0x89,
+        0x85, 0xf8, 0xff, 0xff,
+        0xff, 0xc9, 0xc3,
     };
+    var obj = try testObject(gpa, &text);
+    defer obj.deinit(gpa);
+    var report = try checkObject(gpa, &obj);
+    defer report.deinit(gpa);
+    try std.testing.expectEqual(0, report.violations.items.len);
+}
+
+test "check_codegen: int3 is a one-byte instruction" {
+    const decoded = try decodeInstruction(&.{0xcc});
+    try std.testing.expectEqual(1, decoded.len);
+    try std.testing.expectEqual(0xcc, decoded.opcode);
+    try std.testing.expectEqual(0, decoded.opcode2);
+    try std.testing.expect(!decoded.has_modrm);
+    try std.testing.expectEqual(0, decoded.imm_len);
+
+    const gpa = std.testing.allocator;
+    const text = [_]u8{ 0xcc, 0xc9, 0xc3 };
     var obj = try testObject(gpa, &text);
     defer obj.deinit(gpa);
     var report = try checkObject(gpa, &obj);
