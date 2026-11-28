@@ -3945,7 +3945,9 @@ test "lower: scalar reference dereference loads and stores" {
         \\fn main() -> i32 {
         \\    mut x = 3
         \\    mut y = 7
-        \\    swap(&mut x, &mut y)
+        \\    {
+        \\        swap(&mut x, &mut y)
+        \\    }
         \\    return read(&x) * 10 + read(&y)
         \\}
     );
@@ -3967,9 +3969,11 @@ test "lower: address-of uses field index deref and pointer storage" {
         \\    mut b = Box{ .value = 1 }
         \\    let field = &b.value
         \\    mut x = 2
-        \\    mut p: &mut i32 = &mut x
-        \\    set(&mut p, 3)
-        \\    let same = &p.*
+        \\    {
+        \\        mut p: &mut i32 = &mut x
+        \\        set(&mut p, 3)
+        \\    }
+        \\    let same = &x
         \\    let text = "a"
         \\    let ch = &text[0]
         \\    return field.* + same.* + ch.*
@@ -3988,9 +3992,8 @@ test "lower: repeated address-of a scalar parameter reuses its spill slot" {
     var res = try checkLower(std.testing.allocator,
         \\fn both(x: i32) -> i32 {
         \\    let p = &x
-        \\    let q = &mut x
-        \\    q.* = 7
-        \\    return p.*
+        \\    let q = &x
+        \\    return p.* + q.*
         \\}
     );
     defer res.deinit();

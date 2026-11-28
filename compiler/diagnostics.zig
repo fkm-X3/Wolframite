@@ -202,7 +202,13 @@ pub fn locationFromNode(arena: *const ast.AstArena, source: []const u8, node: as
         },
         .expr_stmt => |e| return locationFromNode(arena, source, e.expr),
         .defer_stmt => |d| return locationFromNode(arena, source, d.expr),
-        .deref => |operand| return locationFromNode(arena, source, operand),
+        .deref,
+        .paren_expr,
+        .move_expr,
+        .comptime_expr,
+        .try_propagate,
+        => |operand| return locationFromNode(arena, source, operand),
+        .unary_op => |u| return locationFromNode(arena, source, u.operand),
         else => {},
     }
     const ref: ?ast.StringRef = switch (n.*) {

@@ -324,6 +324,26 @@ parameter storage is confined to that storage's block and shorter nested blocks:
 cannot be returned or assigned into outer, global, or otherwise longer-lived storage,
 including an aggregate that would carry it out of the block.
 
+Address-of borrows use lexical scope lifetimes. Multiple `&` borrows of a binding may
+coexist, but a live `&mut` borrow excludes both another `&mut` and any `&` of that same
+binding. The borrow ends when its enclosing block exits, not at its last use:
+
+```wfr
+fn scopedBorrows() -> i32 {
+    mut value = 1
+    {
+        let exclusive = &mut value
+        exclusive.* = 2
+    }
+    let shared = &value
+    return shared.*
+}
+```
+
+Fields and indices conservatively borrow their root binding. Calls additionally reject
+passing the same borrowed place as two `&mut` arguments, or as both `&mut` and `&`;
+passing it as multiple shared arguments is valid. See `docs/semantics.md` R45.
+
 ### 4.9 Struct initializers
 
 ```

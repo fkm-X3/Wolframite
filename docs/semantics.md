@@ -29,7 +29,7 @@ Implementation targets, per layer:
 | `compiler/semantic/types.zig` | `SemType` union incl. the `function` member and generic `app` representation, `TypePool` |
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
-| `compiler/semantic/typecheck.zig` | typing rules R4–R43, `?` rules R26–R29, constraint eval ordering |
+| `compiler/semantic/typecheck.zig` | typing rules R4–R45, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
 
@@ -708,6 +708,32 @@ runtime-only fn writing `x` + newline to stdout:
   that environment. Lowering uses stable local slots, one cached spill slot per scalar
   parameter, field/index address arithmetic, or the existing pointee pointer as
   appropriate; it never takes the address of an SSA temporary.
+- **R45 (scope-based borrows and argument aliasing).** Every value-position `&` or
+  `&mut` creates a borrow of the addressed root local or parameter binding. Any number
+  of shared borrows of one root may coexist. An exclusive borrow excludes every other
+  shared or exclusive borrow of that root, and a shared borrow is rejected while an
+  exclusive borrow is live. Field and index projections conservatively share their root
+  binding, so two exclusive borrows of different fields of one binding conflict; known
+  reference chains are canonicalized to their original local root. For caller-owned
+  reference parameters, the reference binding plus dereference depth identifies the
+  borrowed pointee conservatively.
+- **R45a.** An address-of borrow remains live until the lexical scope in which the
+  address-of expression is evaluated exits. Exiting that scope ends every borrow created
+  directly in it; borrows from enclosing scopes remain live. This rule is lexical, not
+  flow-sensitive: last use, branch takenness, and reference-value copies do not shorten
+  a borrow. Nested blocks, loop bodies, match arms, function bodies, and closure bodies
+  are borrow scopes in the same way that they are name-resolution scopes.
+- **R45b.** At every call, reference-typed arguments are also compared pairwise after
+  their types are known. Reusing the same borrowed place as two exclusive arguments, or
+  as an exclusive and a shared argument, is an error even when the arguments are existing
+  reference variables rather than new address-of expressions. Two shared arguments may
+  name the same place. Different root bindings do not conflict. Pipeline arguments are
+  included in their effective argument positions, and enum payload constructors follow
+  the same rule.
+- **R45c.** A conflict is diagnosed at the later borrow and accompanied by a note at the
+  earlier borrow; both source locations and the root binding's name are reported. These
+  checks have no runtime representation and add no IR instructions, copies, drops, or
+  ABI state. Legal programs lower exactly as they would without the borrow checks.
 
 ## 11. Conformance checklist
 
@@ -729,6 +755,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `unreachable` / native trap | R42 |
 | `&T` / `&mut T`, postfix `.*`, non-null references | R43 |
 | address-of lvalues and local-storage escape checks | R44 |
+| scope-based shared/exclusive borrows and call-argument aliasing | R45 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -740,8 +767,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R44; backend tests for R3/R16/R42; lowerer tests for R13–R18,
-   R28, R31, R40–R44); and
+   (compiler tests for R4–R29 and R40–R45; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R45); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

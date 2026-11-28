@@ -58,6 +58,35 @@ const BorrowOrigin = struct {
     depth: u32,
 };
 
+const BorrowKind = enum {
+    shared,
+    exclusive,
+
+    fn name(self: BorrowKind) []const u8 {
+        return if (self == .shared) "shared" else "exclusive";
+    }
+};
+
+/// The root binding addressed by a borrow. Field and index projections share
+/// their root conservatively. A nonzero `indirect` identifies a pointee in a
+/// caller-owned reference chain whose ultimate local storage is unknown.
+const BorrowPlace = struct {
+    storage: NodeIdx,
+    indirect: u32 = 0,
+};
+
+const Borrow = struct {
+    place: BorrowPlace,
+    kind: BorrowKind,
+    site: NodeIdx,
+    scope: u32,
+};
+
+const BorrowConflict = struct {
+    site: NodeIdx,
+    previous: NodeIdx,
+};
+
 /// Walking state for closure capture-set inference (R7): the captures found so
 /// far (in source order of first appearance), the set of binders already
 /// captured (dedup), and the names bound inside the closure, one set per lexical
@@ -128,6 +157,10 @@ pub const TypeChecker = struct {
     binding_origins: std.AutoHashMapUnmanaged(NodeIdx, BorrowOrigin) = .empty,
     /// Origins computed while an expression's lexical scope was still active.
     expression_origins: std.AutoHashMapUnmanaged(NodeIdx, BorrowOrigin) = .empty,
+    /// Address-of borrows that remain live in their lexical scopes.
+    active_borrows: std.ArrayListUnmanaged(Borrow) = .empty,
+    /// Conflict pairs already diagnosed, including pairs found at call sites.
+    borrow_conflicts: std.AutoHashMapUnmanaged(BorrowConflict, void) = .empty,
 
     type_name_buf: [2][16]u8,
     type_name_toggle: u1 = 0,
@@ -298,6 +331,8 @@ pub const TypeChecker = struct {
         self.storage_depths.deinit(self.allocator);
         self.binding_origins.deinit(self.allocator);
         self.expression_origins.deinit(self.allocator);
+        self.active_borrows.deinit(self.allocator);
+        self.borrow_conflicts.deinit(self.allocator);
         var info_it = self.generic_info.iterator();
         while (info_it.next()) |entry| {
             const info = entry.value_ptr.*;
@@ -326,6 +361,14 @@ pub const TypeChecker = struct {
         };
         const loc = diag.locationFromNode(self.arena, self.source, node);
         self.diagnostics.add(.@"error", .semantic, msg, loc) catch {};
+    }
+
+    fn noteAt(self: *TypeChecker, node: NodeIdx, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.allocPrint(self.allocator, fmt, args) catch |err| {
+            std.debug.panic("OOM in typechecker: {s}", .{@errorName(err)});
+        };
+        const loc = diag.locationFromNode(self.arena, self.source, node);
+        self.diagnostics.add(.note, .semantic, msg, loc) catch {};
     }
 
     fn setNodeType(self: *TypeChecker, node: NodeIdx, ty: TypeIdx) void {
@@ -386,13 +429,13 @@ pub const TypeChecker = struct {
         self.fn_ret_type = self.void_ty;
         self.setNodeType(test_idx, self.void_ty);
 
-        const test_scope = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+        const test_scope = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
 
         if (t.body != NodeIdx.none) {
             try self.checkStmt(t.body);
         }
 
-        self.scopes.popScope();
+        self.popBorrowScope();
         _ = test_scope;
 
         self.fn_ret_type = prev_ret;
@@ -432,7 +475,7 @@ pub const TypeChecker = struct {
 
         self.setNodeType(fn_idx, self.fn_ret_type);
 
-        const fn_scope = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+        const fn_scope = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
 
         for (f.generic_params.indices) |gp_idx| {
             const gp = self.arena.get(gp_idx);
@@ -463,7 +506,7 @@ pub const TypeChecker = struct {
             try self.checkStmt(f.body);
         }
 
-        self.scopes.popScope();
+        self.popBorrowScope();
         _ = fn_scope;
 
         self.fn_ret_type = prev_ret;
@@ -714,7 +757,7 @@ pub const TypeChecker = struct {
 
         // A fresh scope whose parent is the module scope: the instance body
         // sees the module's names, but none of the caller's locals.
-        _ = self.scopes.pushScope(0) catch @panic("OOM");
+        _ = self.pushBorrowScope(0) catch @panic("OOM");
 
         // The generic parameters, bound to their concrete types.
         for (clone.generic_params.indices, 0..) |gp_idx, i| {
@@ -747,7 +790,7 @@ pub const TypeChecker = struct {
         // The next instance starts from a clean slate.
         self.constraint_failed = false;
 
-        self.scopes.popScope();
+        self.popBorrowScope();
 
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
@@ -1616,11 +1659,11 @@ pub const TypeChecker = struct {
         const stmt = self.arena.get(stmt_idx);
         switch (stmt.*) {
             .block => |b| {
-                _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+                _ = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
                 for (b.stmts.indices) |inner| {
                     try self.checkStmt(inner);
                 }
-                self.scopes.popScope();
+                self.popBorrowScope();
             },
             .let_stmt => |l| {
                 var declared_ty: TypeIdx = self.void_ty;
@@ -1733,7 +1776,7 @@ pub const TypeChecker = struct {
             .for_range => |fr| {
                 _ = self.inferExprType(fr.start);
                 _ = self.inferExprType(fr.end);
-                _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+                _ = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
                 self.recordStorage(stmt_idx);
                 self.scopes.insert(self.nameSlice(fr.var_name), .{
                     .name = fr.var_name,
@@ -1742,13 +1785,13 @@ pub const TypeChecker = struct {
                     .type_idx = self.i32_ty,
                 }) catch @panic("OOM");
                 try self.checkLoopBody(stmt_idx, fr.body, fr.label);
-                self.scopes.popScope();
+                self.popBorrowScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
             .for_each => |fe| {
                 const iter_ty = self.inferExprType(fe.iterable);
                 const var_ty = self.forEachElemType(stmt_idx, iter_ty);
-                _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+                _ = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
                 self.recordStorage(stmt_idx);
                 self.scopes.insert(self.nameSlice(fe.var_name), .{
                     .name = fe.var_name,
@@ -1757,7 +1800,7 @@ pub const TypeChecker = struct {
                     .type_idx = var_ty,
                 }) catch @panic("OOM");
                 try self.checkLoopBody(stmt_idx, fe.body, fe.label);
-                self.scopes.popScope();
+                self.popBorrowScope();
                 self.setNodeType(stmt_idx, self.void_ty);
             },
             .match_expr => |m| {
@@ -2311,6 +2354,151 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn pushBorrowScope(self: *TypeChecker, parent: ?u32) !u32 {
+        return self.scopes.pushScope(parent);
+    }
+
+    fn popBorrowScope(self: *TypeChecker) void {
+        const scope = self.scopes.currentScope();
+        var kept: usize = 0;
+        for (self.active_borrows.items) |borrow| {
+            if (borrow.scope == scope) continue;
+            self.active_borrows.items[kept] = borrow;
+            kept += 1;
+        }
+        self.active_borrows.items.len = kept;
+        self.scopes.popScope();
+    }
+
+    fn sameBorrowPlace(a: BorrowPlace, b: BorrowPlace) bool {
+        return a.storage == b.storage and a.indirect == b.indirect;
+    }
+
+    fn createBorrow(self: *TypeChecker, place: BorrowPlace, kind: BorrowKind, site: NodeIdx) void {
+        const borrow = Borrow{
+            .place = place,
+            .kind = kind,
+            .site = site,
+            .scope = self.scopes.currentScope(),
+        };
+        var i = self.active_borrows.items.len;
+        while (i > 0) {
+            i -= 1;
+            const previous = self.active_borrows.items[i];
+            if (!sameBorrowPlace(place, previous.place)) continue;
+            if (kind == .shared and previous.kind == .shared) continue;
+            self.reportBorrowConflict(borrow, previous);
+            break;
+        }
+        self.active_borrows.append(self.allocator, borrow) catch @panic("OOM");
+    }
+
+    fn reportBorrowConflict(self: *TypeChecker, borrow: Borrow, previous: Borrow) void {
+        const conflict = BorrowConflict{ .site = borrow.site, .previous = previous.site };
+        const gop = self.borrow_conflicts.getOrPut(self.allocator, conflict) catch @panic("OOM");
+        if (gop.found_existing) return;
+
+        const name = self.storageName(borrow.place.storage);
+        if (diag.locationFromNode(self.arena, self.source, previous.site)) |previous_loc| {
+            self.errorAt(borrow.site, "cannot use {s} borrow of '{s}': {s} borrow at {d}:{d} is still live until its scope exits", .{
+                borrow.kind.name(), name, previous.kind.name(), previous_loc.line, previous_loc.column,
+            });
+        } else {
+            self.errorAt(borrow.site, "cannot use {s} borrow of '{s}': a {s} borrow is still live until its scope exits", .{
+                borrow.kind.name(), name, previous.kind.name(),
+            });
+        }
+
+        if (diag.locationFromNode(self.arena, self.source, borrow.site)) |borrow_loc| {
+            self.noteAt(previous.site, "conflicting {s} borrow of '{s}' is here; the {s} borrow at {d}:{d} overlaps it", .{
+                previous.kind.name(), name, borrow.kind.name(), borrow_loc.line, borrow_loc.column,
+            });
+        } else {
+            self.noteAt(previous.site, "conflicting {s} borrow of '{s}' is here and overlaps the later borrow", .{
+                previous.kind.name(), name,
+            });
+        }
+    }
+
+    /// Compare all reference-typed arguments pairwise. Address-of expressions
+    /// are already scope-live borrows; this also catches passing an existing
+    /// reference value twice without creating a second borrow AST node.
+    fn checkCallBorrowConflicts(self: *TypeChecker, args: []const NodeIdx) void {
+        var checked: std.ArrayListUnmanaged(Borrow) = .empty;
+        defer checked.deinit(self.allocator);
+
+        for (args) |arg| {
+            const sem = self.type_pool.get(self.getNodeType(arg));
+            if (sem != .pointer) continue;
+            const place = self.referenceTarget(arg) orelse continue;
+            const borrow = Borrow{
+                .place = place,
+                .kind = if (sem.pointer.mutable) .exclusive else .shared,
+                .site = arg,
+                .scope = self.scopes.currentScope(),
+            };
+            for (checked.items) |previous| {
+                if (!sameBorrowPlace(place, previous.place)) continue;
+                if (borrow.kind == .shared and previous.kind == .shared) continue;
+                self.reportBorrowConflict(borrow, previous);
+                break;
+            }
+            checked.append(self.allocator, borrow) catch @panic("OOM");
+        }
+    }
+
+    /// The storage addressed by an lvalue, keyed by its root binding.
+    fn borrowPlaceForLvalue(self: *TypeChecker, expr_idx: NodeIdx) ?BorrowPlace {
+        const node = self.arena.get(expr_idx);
+        return switch (node.*) {
+            .identifier => |id| blk: {
+                const sym = self.scopes.lookup(self.nameSlice(id), self.scopes.currentScope()) orelse
+                    break :blk null;
+                if (sym.kind != .local and sym.kind != .param) break :blk null;
+                break :blk BorrowPlace{ .storage = sym.decl_node };
+            },
+            .field_access => |fa| if (self.type_pool.get(self.getNodeType(fa.object)) == .pointer)
+                self.referenceTarget(fa.object)
+            else
+                self.borrowPlaceForLvalue(fa.object),
+            .index_access => |ia| if (self.type_pool.get(self.getNodeType(ia.object)) == .pointer)
+                self.referenceTarget(ia.object)
+            else
+                self.borrowPlaceForLvalue(ia.object),
+            .deref => |operand| self.referenceTarget(operand),
+            .paren_expr => |inner| self.borrowPlaceForLvalue(inner),
+            else => null,
+        };
+    }
+
+    /// The storage pointed to by a reference value. Known local origins are
+    /// canonicalized to the original binding; otherwise the reference binding
+    /// and dereference depth form a conservative caller-owned identity.
+    fn referenceTarget(self: *TypeChecker, expr_idx: NodeIdx) ?BorrowPlace {
+        if (self.localOrigin(expr_idx)) |origin| {
+            return .{ .storage = origin.storage };
+        }
+        const node = self.arena.get(expr_idx);
+        return switch (node.*) {
+            .identifier => |id| blk: {
+                const sym = self.scopes.lookup(self.nameSlice(id), self.scopes.currentScope()) orelse
+                    break :blk null;
+                if (sym.kind != .local and sym.kind != .param) break :blk null;
+                break :blk BorrowPlace{ .storage = sym.decl_node, .indirect = 1 };
+            },
+            .unary_op => |u| switch (u.op) {
+                .ref, .mut_ref => self.borrowPlaceForLvalue(u.operand),
+                else => null,
+            },
+            .deref => |operand| blk: {
+                const base = self.referenceTarget(operand) orelse break :blk null;
+                break :blk BorrowPlace{ .storage = base.storage, .indirect = base.indirect + 1 };
+            },
+            .paren_expr, .move_expr, .comptime_expr, .try_propagate => |inner| self.referenceTarget(inner),
+            else => null,
+        };
+    }
+
     fn recordStorage(self: *TypeChecker, decl_idx: NodeIdx) void {
         const depth = self.scopes.depth(self.scopes.currentScope());
         self.storage_depths.put(self.allocator, decl_idx, depth) catch @panic("OOM");
@@ -2386,11 +2574,17 @@ pub const TypeChecker = struct {
     }
 
     fn checkAddressOf(self: *TypeChecker, expr_idx: NodeIdx, op: ast.UnaryOp, operand: NodeIdx) void {
-        if (!self.isLvalue(operand)) {
+        const valid_lvalue = self.isLvalue(operand);
+        if (!valid_lvalue) {
             self.errorAt(expr_idx, "cannot take the address of an rvalue; address-of requires an lvalue", .{});
         }
-        if (op == .mut_ref and self.throughSharedReference(operand)) {
+        const through_shared = op == .mut_ref and self.throughSharedReference(operand);
+        if (through_shared) {
             self.errorAt(expr_idx, "cannot take an exclusive reference through a shared reference", .{});
+        }
+        if (!valid_lvalue or through_shared) return;
+        if (self.borrowPlaceForLvalue(operand)) |place| {
+            self.createBorrow(place, if (op == .mut_ref) .exclusive else .shared, expr_idx);
         }
     }
 
@@ -2731,7 +2925,7 @@ pub const TypeChecker = struct {
         self.in_function = true;
         self.loop_label_base = self.loop_labels.items.len;
 
-        _ = self.scopes.pushScope(self.scopes.currentScope()) catch @panic("OOM");
+        _ = self.pushBorrowScope(self.scopes.currentScope()) catch @panic("OOM");
         for (cl.params.indices, 0..) |param_idx, i| {
             const pname = self.arena.get(param_idx).param.name;
             self.recordStorage(param_idx);
@@ -2747,7 +2941,7 @@ pub const TypeChecker = struct {
         const body_ty = self.inferExprType(cl.body);
         if (!body_is_block) self.checkEscapeReturn(cl.body);
 
-        self.scopes.popScope();
+        self.popBorrowScope();
         self.fn_ret_type = prev_ret;
         self.in_function = prev_in_fn;
         self.loop_labels.items.len = self.loop_label_base;
@@ -3062,30 +3256,29 @@ pub const TypeChecker = struct {
         piped: ?NodeIdx,
         hole: ?usize,
     ) void {
-        const effective = args.indices.len + (if (piped != null and hole == null) @as(usize, 1) else 0);
-        if (param_types.len != effective) {
+        const effective_count = args.indices.len + (if (piped != null and hole == null) @as(usize, 1) else 0);
+        if (param_types.len != effective_count) {
             self.errorAt(node_idx, "call has {d} arguments but the function takes {d}", .{
-                effective, param_types.len,
+                effective_count, param_types.len,
             });
         }
 
-        var pi: usize = 0;
+        var effective: std.ArrayList(NodeIdx) = .empty;
+        defer effective.deinit(self.allocator);
         if (piped != null and hole == null) {
-            self.checkOneArg(node_idx, param_types, pi, piped.?);
-            pi += 1;
+            effective.append(self.allocator, piped.?) catch @panic("OOM");
         }
-        var ai: usize = 0;
-        while (ai < args.indices.len) : (ai += 1) {
-            if (hole) |h| {
-                if (ai == h) {
-                    self.checkOneArg(node_idx, param_types, pi, piped.?);
-                    pi += 1;
-                    continue;
-                }
+        for (args.indices, 0..) |arg, ai| {
+            if (hole != null and ai == hole.?) {
+                effective.append(self.allocator, piped.?) catch @panic("OOM");
+                continue;
             }
-            self.checkOneArg(node_idx, param_types, pi, args.indices[ai]);
-            pi += 1;
+            effective.append(self.allocator, arg) catch @panic("OOM");
         }
+        for (effective.items, 0..) |arg, pi| {
+            self.checkOneArg(node_idx, param_types, pi, arg);
+        }
+        self.checkCallBorrowConflicts(effective.items);
     }
 
     /// Check one argument against parameter `pi` (if a parameter exists),
@@ -3718,6 +3911,7 @@ pub const TypeChecker = struct {
             }
         }
 
+        self.checkCallBorrowConflicts(args.indices);
         if (gparams.indices.len == 0) {
             return self.type_pool.add(.{ .enum_type = vi.enum_decl }) catch self.void_ty;
         }
@@ -3858,8 +4052,8 @@ pub const TypeChecker = struct {
         const pattern = self.arena.get(arm.match_arm.pattern);
         // The `_` wildcard matches every variant and binds no payload.
         if (self.isWildcardPattern(pattern)) {
-            _ = try self.scopes.pushScope(self.scopes.currentScope());
-            defer self.scopes.popScope();
+            _ = try self.pushBorrowScope(self.scopes.currentScope());
+            defer self.popBorrowScope();
             _ = self.inferExprType(arm.match_arm.pattern);
             if (arm.match_arm.guard) |guard| {
                 const guard_ty = self.inferExprType(guard);
@@ -3875,7 +4069,7 @@ pub const TypeChecker = struct {
             return self.inferExprType(arm.match_arm.body);
         };
 
-        _ = try self.scopes.pushScope(self.scopes.currentScope());
+        _ = try self.pushBorrowScope(self.scopes.currentScope());
         const variant_node = self.arena.get(variant.variant_node);
         const gparams = self.arena.get(enum_node).enum_decl.generic_params;
         if (pattern.* == .call) {
@@ -3901,7 +4095,7 @@ pub const TypeChecker = struct {
             }
         }
         const body_ty = self.inferExprType(arm.match_arm.body);
-        self.scopes.popScope();
+        self.popBorrowScope();
         return body_ty;
     }
 
@@ -4774,7 +4968,9 @@ test "typecheck: mutable and shared references support scalar dereference" {
         \\fn main() -> i32 {
         \\    mut x = 3
         \\    mut y = 7
-        \\    swap(&mut x, &mut y)
+        \\    {
+        \\        swap(&mut x, &mut y)
+        \\    }
         \\    return read(&x) * 10 + read(&y)
         \\}
     );
@@ -4841,12 +5037,21 @@ test "typecheck: address-of accepts fields indices and dereferences" {
         \\fn write(p: &mut i32) { p.* = 2 }
         \\fn f(p: &mut i32, text: String) -> i32 {
         \\    mut b = Box{ .value = 1 }
-        \\    let field = &b.value
-        \\    let same = &p.*
-        \\    let ch = &text[0]
+        \\    let field_value = {
+        \\        let field = &b.value
+        \\        field.*
+        \\    }
+        \\    let same_value = {
+        \\        let same = &p.*
+        \\        same.*
+        \\    }
+        \\    let char_value = {
+        \\        let ch = &text[0]
+        \\        ch.*
+        \\    }
         \\    write(&mut b.value)
         \\    write(&mut p.*)
-        \\    return field.* + same.* + ch.*
+        \\    return field_value + same_value + char_value
         \\}
     );
     defer deinitCheck(&res);
@@ -5020,6 +5225,167 @@ test "typecheck: exclusive address-of cannot pass through a shared reference" {
     defer deinitCheck(&res);
     try std.testing.expect(res.diagnostics.hasErrors());
     try std.testing.expect(hasMessage(&res.diagnostics, "cannot take an exclusive reference through a shared reference"));
+}
+
+// ---------------------------------------------------------------------------
+// Borrow scopes and call-site aliasing (R45)
+// ---------------------------------------------------------------------------
+
+test "typecheck: shared borrows coexist and scoped borrows end at scope exit" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn read(p: &i32) -> i32 { return p.* }
+        \\fn write(p: &mut i32) { p.* = 4 }
+        \\fn swap(a: &mut i32, b: &mut i32) {
+        \\    let tmp = a.*
+        \\    a.* = b.*
+        \\    b.* = tmp
+        \\}
+        \\fn main() -> i32 {
+        \\    mut x = 1
+        \\    mut y = 2
+        \\    {
+        \\        let a = &x
+        \\        let b = &x
+        \\        if a.* != b.* { return 1 }
+        \\    }
+        \\    {
+        \\        let p = &mut x
+        \\        p.* = 3
+        \\    }
+        \\    {
+        \\        write(&mut x)
+        \\    }
+        \\    {
+        \\        read(&x)
+        \\        read(&x)
+        \\    }
+        \\    swap(&mut x, &mut y)
+        \\    return 0
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: conflicting exclusive borrows diagnose both locations" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    mut x = 1
+        \\    let first = &mut x
+        \\    let second = &mut x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.@"error"));
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.note));
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot use exclusive borrow of 'x'"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "conflicting exclusive borrow of 'x'"));
+
+    var error_at_second = false;
+    var note_at_first = false;
+    for (res.diagnostics.items.items) |item| {
+        const loc = item.location orelse continue;
+        if (item.severity == .@"error" and loc.line == 4) error_at_second = true;
+        if (item.severity == .note and loc.line == 3) note_at_first = true;
+    }
+    try std.testing.expect(error_at_second);
+    try std.testing.expect(note_at_first);
+}
+
+test "typecheck: shared and exclusive borrows conflict in either order" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn sharedThenExclusive() {
+        \\    mut x = 1
+        \\    let shared = &x
+        \\    let exclusive = &mut x
+        \\}
+        \\fn exclusiveThenShared() {
+        \\    mut x = 1
+        \\    let exclusive = &mut x
+        \\    let shared = &x
+        \\}
+        \\fn throughParameter(p: &mut i32) {
+        \\    let shared = &p.*
+        \\    let exclusive = &mut p.*
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expectEqual(@as(usize, 3), res.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot use exclusive borrow of 'x': shared borrow"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot use shared borrow of 'x': exclusive borrow"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot use exclusive borrow of 'p': shared borrow"));
+}
+
+test "typecheck: call arguments reject overlapping exclusive and shared borrows" {
+    var valid = try runCheck(std.testing.allocator,
+        \\fn bothShared(a: &i32, b: &i32) { }
+        \\fn bothExclusive(a: &mut i32, b: &mut i32) { }
+        \\fn main() {
+        \\    mut x = 1
+        \\    mut y = 2
+        \\    {
+        \\        bothShared(&x, &x)
+        \\    }
+        \\    {
+        \\        bothExclusive(&mut x, &mut y)
+        \\    }
+        \\}
+    );
+    defer deinitCheck(&valid);
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+
+    var invalid = try runCheck(std.testing.allocator,
+        \\fn bothExclusive(a: &mut i32, b: &mut i32) { }
+        \\fn mixed(a: &mut i32, b: &i32) { }
+        \\fn directExclusive() {
+        \\    mut x = 1
+        \\    bothExclusive(&mut x, &mut x)
+        \\}
+        \\fn directMixed() {
+        \\    mut x = 1
+        \\    mixed(&mut x, &x)
+        \\}
+        \\fn existingReference() {
+        \\    mut x = 1
+        \\    let p = &mut x
+        \\    bothExclusive(p, p)
+        \\}
+        \\fn throughParameter(p: &mut i32) {
+        \\    mixed(&mut p.*, &p.*)
+        \\}
+    );
+    defer deinitCheck(&invalid);
+    try std.testing.expectEqual(@as(usize, 4), invalid.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "cannot use exclusive borrow of 'x'"));
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "cannot use shared borrow of 'x'"));
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "cannot use shared borrow of 'p'"));
+}
+
+test "typecheck: borrow identity uses the root binding for projected lvalues" {
+    var valid = try runCheck(std.testing.allocator,
+        \\struct Pair { a: i32, b: i32 }
+        \\fn both(a: &mut i32, b: &mut i32) { }
+        \\fn main() {
+        \\    mut left = Pair{ .a = 1, .b = 2 }
+        \\    mut right = Pair{ .a = 3, .b = 4 }
+        \\    both(&mut left.a, &mut right.b)
+        \\}
+    );
+    defer deinitCheck(&valid);
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+
+    var invalid = try runCheck(std.testing.allocator,
+        \\struct Pair { a: i32, b: i32 }
+        \\fn both(a: &mut i32, b: &mut i32) { }
+        \\fn main() {
+        \\    mut pair = Pair{ .a = 1, .b = 2 }
+        \\    both(&mut pair.a, &mut pair.b)
+        \\}
+    );
+    defer deinitCheck(&invalid);
+    try std.testing.expectEqual(@as(usize, 1), invalid.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "cannot use exclusive borrow of 'pair'"));
 }
 
 // ---------------------------------------------------------------------------

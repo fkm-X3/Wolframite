@@ -23,7 +23,9 @@ fn replaceIndirect(pp: &mut &mut i32, value: i32) {
 fn main() -> i32 {
     mut left = 3
     mut right = 7
-    swap(&mut left, &mut right)
+    {
+        swap(&mut left, &mut right)
+    }
 
     if read(&left) != 7 || read(&right) != 3 {
         return 1
@@ -31,14 +33,17 @@ fn main() -> i32 {
     print("pointer swap ok")
 
     mut boxed = Box{ .value = 5 }
-    replace(&mut boxed.value, 8)
+    {
+        replace(&mut boxed.value, 8)
+    }
 
     mut pointed = 11
-    mut pointer: &mut i32 = &mut pointed
-    replaceIndirect(&mut pointer, 12)
-    let same = &pointer.*
+    {
+        mut pointer: &mut i32 = &mut pointed
+        replaceIndirect(&mut pointer, 12)
+    }
 
-    if read(&boxed.value) == 8 && read(same) == 12 {
+    if read(&boxed.value) == 8 && read(&pointed) == 12 {
         print("pointer lvalues ok")
         return 0
     }
