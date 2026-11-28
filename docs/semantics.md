@@ -29,6 +29,7 @@ Implementation targets, per layer:
 | `compiler/semantic/types.zig` | `SemType` union incl. the `function` member and generic `app` representation, `TypePool` |
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
+| `compiler/semantic/definite_init.zig` | flow-sensitive delayed-binding checks and closure-capture initialization (R46) |
 | `compiler/semantic/typecheck.zig` | typing rules R4–R45, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
@@ -734,6 +735,31 @@ runtime-only fn writing `x` + newline to stdout:
   earlier borrow; both source locations and the root binding's name are reported. These
   checks have no runtime representation and add no IR instructions, copies, drops, or
   ABI state. Legal programs lower exactly as they would without the borrow checks.
+- **R46 (definite initialization).** A local `let`/`mut` binding may omit its initializer
+  only when it has an explicit type annotation. The binding is then uninitialized until a
+  direct assignment to its name completes; a compound assignment is a read and therefore
+  cannot initialize it. Field, index, and dereference writes do not initialize their root
+  binding. An uninitialized binding that is never read or captured requires no assignment.
+- **R46a.** Reads of an uninitialized binding are semantic errors. After an `if`, a binding
+  is initialized only when every reachable continuation assigns it; a branch ending in
+  `return`, `unreachable`, `break`, or `continue` does not contribute a fallthrough state.
+  Consequently, one-sided assignments do not initialize for the join, while assignments
+  in both branches, or in one branch whose alternative cannot fall through, do.
+- **R46b.** A `match` join includes every arm that can fall through. An unguarded `_` arm or
+  unguarded arms covering every variant of one enum make the match exhaustive; otherwise
+  the unmatched entry state also reaches the join. `while` and `for` bodies are optional
+  for the post-loop state, so assignments only in a loop body are not definite after it.
+  The right operand of `&&`/`||` is likewise optional at their expression join.
+- **R46c.** Creating a closure reads every binding it captures. Any read or write capture
+  of an uninitialized or maybe-initialized outer binding is rejected at its use in the
+  closure, even if the closure is never called or the outer binding is assigned later.
+  Assignments inside a closure never change the definite-initialization state of the
+  enclosing continuation. Closure parameters, loop variables, and enum payload bindings
+  start initialized in their respective bodies.
+- **R46d.** The analysis runs on source generic bodies before monomorphization and has no
+  runtime representation. It introduces no IR instructions or implicit value: the existing
+  slot initialization remains only a backend implementation detail, not an observable
+  language-level initialization.
 
 ## 11. Conformance checklist
 
@@ -756,6 +782,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | `&T` / `&mut T`, postfix `.*`, non-null references | R43 |
 | address-of lvalues and local-storage escape checks | R44 |
 | scope-based shared/exclusive borrows and call-argument aliasing | R45 |
+| delayed local declarations and definite initialization | R46 |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -767,8 +794,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R45; backend tests for R3/R16/R42; lowerer tests for R13–R18,
-   R28, R31, R40–R45); and
+   (compiler tests for R4–R29 and R40–R46; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R46); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

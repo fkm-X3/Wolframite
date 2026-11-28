@@ -8,6 +8,7 @@ pub const types = @import("semantic/types.zig");
 pub const scope = @import("semantic/scope.zig");
 pub const resolve = @import("semantic/resolve.zig");
 pub const generics = @import("semantic/generics.zig");
+pub const definite_init = @import("semantic/definite_init.zig");
 pub const typecheck = @import("semantic/typecheck.zig");
 pub const codegen = @import("codegen/lower.zig");
 pub const link_description = @import("link_description.zig");
@@ -26,9 +27,11 @@ test {
     _ = @import("semantic/scope.zig");
     _ = @import("semantic/resolve.zig");
     _ = @import("semantic/generics.zig");
+    _ = @import("semantic/definite_init.zig");
     _ = @import("semantic/typecheck.zig");
     _ = @import("codegen/lower.zig");
     _ = @import("link_description.zig");
     _ = @import("smeltfile.zig");
-_ = @import("formatter.zig");
-_ = @import("fmt.zig");}
+    _ = @import("formatter.zig");
+    _ = @import("fmt.zig");
+}

@@ -169,8 +169,11 @@ From `examples/imports.wfr`.
 ```
 
 `let` = immutable (default), `mut` = explicitly mutable. Bindings are immutable unless `mut`.
-Assignment targets only `mut` bindings. There is no `:=` token; `let name = expr` (with type
-inference) is the single binding form. From `examples/variables.wfr` target:
+Assignment targets only `mut` bindings, apart from the initializing assignment to a binding
+declared without a value. Such a delayed declaration requires an explicit type (`let x: T;`);
+definite-initialization rule R46 requires every read or closure capture to be dominated by
+an assignment on every reachable path. There is no `:=` token; `let name = expr` (with type
+inference) is the ordinary binding form. From `examples/variables.wfr` target:
 
 ```wfr
 let x: i32 = 42        // immutable, annotated

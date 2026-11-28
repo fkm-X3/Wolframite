@@ -5,6 +5,7 @@ const prelude = @import("../prelude.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
 const generics_mod = @import("generics.zig");
+const definite_init = @import("definite_init.zig");
 
 const Allocator = std.mem.Allocator;
 const AstArena = ast.AstArena;
@@ -345,6 +346,7 @@ pub const TypeChecker = struct {
     }
 
     pub fn check(self: *TypeChecker) !void {
+        definite_init.check(self.allocator, self.arena, self.source, self.diagnostics, self.module_node);
         const mod = self.arena.get(self.module_node);
         for (mod.module.decls.indices) |decl_idx| {
             try self.checkDecl(decl_idx);
@@ -4815,6 +4817,179 @@ test "typecheck: let with inferred type" {
         res.diagnostics.deinit();
     }
     try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// Definite initialization (R46)
+// ---------------------------------------------------------------------------
+
+test "typecheck: definite initialization rejects a straight-line read" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x: i32
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of uninitialized binding 'x'"));
+}
+
+test "typecheck: definite initialization rejects an assignment covered by only one branch" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn choose(flag: bool) -> i32 {
+        \\    let x: i32
+        \\    if flag { x = 1 }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of possibly uninitialized binding 'x'"));
+}
+
+test "typecheck: definite initialization accepts assignments in both if branches" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn choose(flag: bool) -> i32 {
+        \\    let x: i32
+        \\    if flag { x = 1 } else { x = 2 }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: definite initialization ignores a branch that cannot fall through" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn choose(flag: bool) -> i32 {
+        \\    let x: i32
+        \\    if flag { x = 1 } else { return 0 }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: definite initialization rejects closure captures before assignment" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x: i32
+        \\    let read = || x
+        \\    x = 1
+        \\    return read()
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot capture uninitialized binding 'x' in a closure"));
+}
+
+test "typecheck: definite initialization rejects closure captures that are only maybe assigned" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main(flag: bool) -> i32 {
+        \\    let x: i32
+        \\    if flag { x = 1 }
+        \\    let read = || x
+        \\    return read()
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "cannot capture possibly uninitialized binding 'x' in a closure"));
+}
+
+test "typecheck: definite initialization does not treat loop bodies as mandatory" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main(flag: bool) -> i32 {
+        \\    let x: i32
+        \\    while flag { x = 1 }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of uninitialized binding 'x'"));
+}
+
+test "typecheck: definite initialization accepts assignments in every enum arm" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Choice { First Second }
+        \\fn choose(choice: Choice) -> i32 {
+        \\    let x: i32
+        \\    match choice {
+        \\        First => { x = 1 },
+        \\        Second => { x = 2 },
+        \\    }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: definite initialization keeps the unmatched path in a match join" {
+    var res = try runCheck(std.testing.allocator,
+        \\enum Choice { First Second }
+        \\fn choose(choice: Choice) -> i32 {
+        \\    let x: i32
+        \\    match choice {
+        \\        First => { x = 1 },
+        \\    }
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of possibly uninitialized binding 'x'"));
+}
+
+test "typecheck: definite initialization treats short-circuit right operands as optional" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main(flag: bool) -> bool {
+        \\    let x: bool
+        \\    flag && (x = true)
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of possibly uninitialized binding 'x'"));
+}
+
+test "typecheck: definite initialization checks generic bodies before instantiation" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn bad[T](value: T) -> T {
+        \\    let result: T
+        \\    return result
+        \\}
+        \\fn main() -> i32 {
+        \\    return bad(1)
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of uninitialized binding 'result'"));
+}
+
+test "typecheck: delayed declarations require a type annotation" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let x
+        \\    x = 1
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "uninitialized binding 'x' requires a type annotation"));
+}
+
+test "typecheck: an initializing assignment cannot read its own uninitialized value" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let x: i32
+        \\    x = x + 1
+        \\    return x
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expectEqual(@as(usize, 1), res.diagnostics.count(.@"error"));
+    try std.testing.expect(hasMessage(&res.diagnostics, "use of uninitialized binding 'x'"));
 }
 
 test "typecheck: struct field access" {
