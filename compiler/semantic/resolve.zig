@@ -578,6 +578,13 @@ pub const Resolver = struct {
                 try self.resolveHead(ia.object);
                 try self.resolveAt(.value, ia.index);
             },
+            .array_literal => |elements| {
+                for (elements.indices) |element| try self.resolveAt(.value, element);
+            },
+            .array_type => |at| {
+                try self.resolveAt(.value, at.size);
+                try self.resolveTypeRef(at.elem);
+            },
             .generic_app => |ga| {
                 try self.resolveHead(ga.base);
                 for (ga.args.indices) |arg| {

@@ -337,6 +337,10 @@ const Analyzer = struct {
                 self.checkExpr(i.object);
                 self.checkExpr(i.index);
             },
+            .array_literal => |elements| {
+                for (elements.indices) |element| self.checkExpr(element);
+            },
+            .array_type => {},
             .generic_app => |g| self.checkExpr(g.base),
             .struct_init => |s| {
                 for (s.fields.indices) |field_idx| {

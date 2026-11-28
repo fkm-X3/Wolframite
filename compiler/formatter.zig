@@ -492,6 +492,20 @@ const Fmt = struct {
                 try self.fmtExpr(ia.index);
                 try self.write("]");
             },
+            .array_literal => |elements| {
+                try self.write("[");
+                for (elements.indices, 0..) |element, i| {
+                    if (i > 0) try self.write(", ");
+                    try self.fmtExpr(element);
+                }
+                try self.write("]");
+            },
+            .array_type => |at| {
+                try self.write("[");
+                try self.fmtExpr(at.size);
+                try self.write("]");
+                try self.fmtExpr(at.elem);
+            },
             .generic_app => |ga| {
                 try self.fmtExprWrapped(ga.base, 15);
                 try self.write("[");

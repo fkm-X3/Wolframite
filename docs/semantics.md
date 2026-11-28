@@ -30,7 +30,7 @@ Implementation targets, per layer:
 | `compiler/semantic/scope.zig` | `SymbolKind` (no `class_type`/`interface_type`), fn-name-as-value symbols |
 | `compiler/semantic/resolve.zig` | capture-env inference, generic instance registration, fn-value resolution |
 | `compiler/semantic/definite_init.zig` | flow-sensitive delayed-binding checks and closure-capture initialization (R46) |
-| `compiler/semantic/typecheck.zig` | typing rules R4–R45, `?` rules R26–R29, constraint eval ordering |
+| `compiler/semantic/typecheck.zig` | typing rules R4–R47, `?` rules R26–R29, constraint eval ordering |
 | `libs/backend/src/ir.zig` + `api.zig` | `function_value` IR type, env-placed direct calls, call-through-ptr with env |
 | `compiler/codegen/lower.zig` | closure lifting + env record construction, hidden-env-param ABI, `?` branch-to-return, monomorphized function emission |
 
@@ -760,6 +760,19 @@ runtime-only fn writing `x` + newline to stdout:
   runtime representation. It introduces no IR instructions or implicit value: the existing
   slot initialization remains only a backend implementation detail, not an observable
   language-level initialization.
+- **R47 (fixed-length arrays).** `[N]T` denotes an array of exactly `N` values of type `T`,
+  where `N` is a non-negative compile-time integer. `[a, b, c]` infers its length and element
+  type from its contents; every element must have one common type. An expected `[N]T`
+  ascribes the literal's element type and requires exactly `N` elements. An empty literal is
+  legal only with such an expected type. Arrays have value semantics: initialization,
+  assignment, argument passing, and returns copy each element into independent destination
+  storage, using the contiguous element layout of the existing aggregate slot model.
+- **R47a (array indexing and bounds safety).** Array subscripts must be integers and produce
+  the element type; a subscript is an lvalue for both reads and writes. A compile-time index
+  must be in `0..N` or type checking rejects it. Every other array access evaluates an
+  unsigned `index < N` guard before element address arithmetic, so a negative index also
+  fails, and executes `trap` when the guard fails. No array load, store, or address-of may
+  bypass this check.
 
 ## 11. Conformance checklist
 
@@ -783,6 +796,7 @@ Each `docs/syntax.md` surface construct and its binding rule:
 | address-of lvalues and local-storage escape checks | R44 |
 | scope-based shared/exclusive borrows and call-argument aliasing | R45 |
 | delayed local declarations and definite initialization | R46 |
+| fixed-length array types, literals, value copies, checked indexing | R47–R47a |
 | `?` on `Result`/`Option` | R26–R29 |
 | `match` exhaustiveness with `?` | R28b |
 | comptime generics `first[T]` | R19–R25 |
@@ -794,8 +808,8 @@ Each `docs/syntax.md` surface construct and its binding rule:
 
 A semantic pass or lowering change is complete when:
 1. every rule in the sections that layer owns is implemented and mirrored by a test
-   (compiler tests for R4–R29 and R40–R46; backend tests for R3/R16/R42; lowerer tests for R13–R18,
-   R28, R31, R40–R46); and
+   (compiler tests for R4–R29 and R40–R47; backend tests for R3/R16/R42; lowerer tests for R13–R18,
+   R28, R31, R40–R47); and
 2. `examples/closures.wfr`, `composition.wfr`, `result_errors.wfr`, `pipeline.wfr`,
    and the generic examples all type-check and lower to IR with **zero**
    vtable/`fn_array`/hidden-`this` artifacts.

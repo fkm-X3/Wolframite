@@ -169,7 +169,7 @@ pub const Mangler = struct {
             },
             .applied_fn => |a| try self.mangleType(a.sig),
             .array => |a| {
-                try self.out.appendSlice(self.gpa, "arr_");
+                try self.out.print(self.gpa, "arr_{d}_", .{a.size orelse 0});
                 try self.mangleType(a.elem);
             },
             .slice => |elem| {
@@ -285,6 +285,11 @@ pub fn substType(pool: *TypePool, ty: TypeIdx, args: []const TypeIdx) !TypeIdx {
                 return ty;
             }
             return pool.add(.{ .applied_fn = .{ .decl = a.decl, .args = new_args, .sig = new_sig } });
+        },
+        .array => |a| {
+            const new_elem = try substType(pool, a.elem, args);
+            if (new_elem == a.elem) return ty;
+            return pool.add(.{ .array = .{ .elem = new_elem, .size = a.size } });
         },
         else => return ty,
     }

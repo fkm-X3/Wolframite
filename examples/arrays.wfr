@@ -1,0 +1,52 @@
+fn sum3(values: [3]i32) -> i32 {
+    return values[0] + values[1] + values[2]
+}
+
+fn first(values: [3]i32) -> i32 {
+    return values[0]
+}
+
+fn sumWide(values: [3]i64) -> i64 {
+    return values[0] + values[1] + values[2]
+}
+
+fn make() -> [3]i32 {
+    return [20, 30, 50]
+}
+
+fn main() -> i32 {
+    mut values: [3]i32 = [2, 4, 6]
+    values[1] = 10
+
+    let copy = values
+    mut assigned: [3]i32 = [0, 0, 0]
+    assigned = values
+    values[0] = 100
+    if sum3(copy) != 18 || sum3(assigned) != 18 {
+        return 1
+    }
+
+    let inferred = [7, 8, 9]
+    mut index = 1
+    if inferred[index] != 8 {
+        return 2
+    }
+
+    let ascribed: [3]i64 = [11, 12, 13]
+    let wideTotal = ascribed[0] + ascribed[1] + ascribed[2]
+    if sumWide(ascribed) != wideTotal {
+        return 3
+    }
+
+    if first([5, 6, 7]) != 5 {
+        return 4
+    }
+
+    let made = make()
+    if sum3(made) != 100 {
+        return 5
+    }
+
+    print("arrays ok")
+    return 0
+}

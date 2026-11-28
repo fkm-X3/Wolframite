@@ -209,6 +209,12 @@ pub fn locationFromNode(arena: *const ast.AstArena, source: []const u8, node: as
         .try_propagate,
         => |operand| return locationFromNode(arena, source, operand),
         .unary_op => |u| return locationFromNode(arena, source, u.operand),
+        .index_access => |i| return locationFromNode(arena, source, i.object),
+        .array_type => |at| return locationFromNode(arena, source, at.elem),
+        .array_literal => |elements| {
+            if (elements.indices.len > 0) return locationFromNode(arena, source, elements.indices[0]);
+            return null;
+        },
         else => {},
     }
     const ref: ?ast.StringRef = switch (n.*) {

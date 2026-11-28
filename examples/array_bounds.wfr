@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let values = [10, 20, 30]
+    mut index = 1
+    index += 2
+    return values[index]
+}

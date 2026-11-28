@@ -289,6 +289,7 @@ Precedence, loosest→tightest. Assumed left-associative except assignment/arrow
                 | <comptime_expr>
                 | <region_expr>
                 | <struct_init>
+                | <array_literal>              -- fixed-length array value, see §4.18
                 | <fn_type_literal>            -- fn-type as first-class expr, see §4.10
 ```
 
@@ -506,14 +507,45 @@ Explicit move of a value into the target binding (linear/affine ownership):
 <type_repr>   ::= <named_type>
                 | <ref_type>
                 | <fn_type>
+                | <array_type>
 <named_type>  ::= <identifier> ( '[' <type_args> ']' )?      -- incl. generic app
-<ref_type>    ::= '&' <named_type>                            -- shared reference
-                | '&mut' <named_type>                         -- exclusive reference
+<ref_type>    ::= '&' <type_repr>                             -- shared reference
+                | '&mut' <type_repr>                          -- exclusive reference
 <fn_type>     ::= 'fn' '(' <type_list> ')' '->' <type_repr>   -- first-class fn type
+<array_type>  ::= '[' <expr> ']' <type_repr>                  -- non-negative comptime integer
 ```
 
 No lifetime annotations anywhere. References `&T` carry no lifetime
 arguments; the compiler infers region lifetimes.
+
+### 4.18 Arrays
+
+```
+<array_literal> ::= '[' ( <expr> (',' <expr>)* ','? )? ']'
+```
+
+`[N]T` is a fixed-length array of exactly `N` elements of type `T`; `N` is a
+non-negative compile-time integer. Array literals infer their length from the
+number of elements and their element type from the first element. Every other
+element must have that same type. An expected array type instead ascribes both
+parts of the literal's type:
+
+```wfr
+let inferred = [1, 2, 3]          // [3]i32
+let ascribed: [3]i64 = [1, 2, 3] // [3]i64
+let empty: [0]i32 = []
+```
+
+An empty literal requires an expected array type. A literal's length must match
+the expected length exactly. Arrays are values: initialization, assignment,
+function arguments, and returns copy their elements rather than creating an
+alias to the source array.
+
+`values[i]` reads an element and is an lvalue for writes. Indices must be
+integers. A compile-time index outside `0..N` is a semantic error. Every other
+array access checks `0 <= i < N` before computing the element address and traps
+on violation; this includes negative runtime indices. There is no unchecked
+array subscript form.
 
 ## 5. Removed constructs → replacements
 

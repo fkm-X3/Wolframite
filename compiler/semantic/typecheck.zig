@@ -632,6 +632,10 @@ pub const TypeChecker = struct {
                 const ret = self.resolveTemplateType(gparams, ft.return_type);
                 return self.functionType(params, ret);
             },
+            .array_type => |at| {
+                const elem = self.resolveTemplateType(gparams, at.elem);
+                return self.arrayTypeFromParts(node, at.size, elem);
+            },
             .generic_app => |ga| {
                 if (self.resolveTemplateApp(gparams, ga.base, ga.args.indices)) |ty| return ty;
                 return self.inferExprType(node);
@@ -1262,7 +1266,7 @@ pub const TypeChecker = struct {
                     else => null,
                 };
             },
-            .fn_type => return self.inferExprType(node_idx),
+            .fn_type, .array_type => return self.inferExprType(node_idx),
             .unary_op => |u| switch (u.op) {
                 .ref, .mut_ref => {
                     const pointee = self.comptimeTypeArg(u.operand) orelse return null;
@@ -1455,6 +1459,13 @@ pub const TypeChecker = struct {
                 if (self.genericParamMention(ia.object)) |n| return n;
                 return self.genericParamMention(ia.index);
             },
+            .array_literal => |elements| {
+                for (elements.indices) |element| {
+                    if (self.genericParamMention(element)) |n| return n;
+                }
+                return null;
+            },
+            .array_type => |at| return self.genericParamMention(at.elem),
             .generic_app => |ga| {
                 if (self.genericParamMention(ga.base)) |n| return n;
                 for (ga.args.indices) |arg| {
@@ -2100,7 +2111,13 @@ pub const TypeChecker = struct {
                 if (self.tryTypeApplication(expr_idx, ia.object, ia.index)) |ty| return ty;
                 const obj_ty = self.inferExprType(ia.object);
                 _ = self.inferExprType(ia.index);
+                self.checkArrayIndex(expr_idx, obj_ty, ia.index);
                 return self.inferElementType(expr_idx, obj_ty);
+            },
+            .array_literal => |elements| return self.inferArrayLiteral(expr_idx, elements, null),
+            .array_type => |at| {
+                const elem = self.inferTypeRef(at.elem);
+                return self.arrayTypeFromParts(expr_idx, at.size, elem);
             },
             .generic_app => |ga| {
                 return self.inferGenericApp(expr_idx, ga);
@@ -2241,6 +2258,76 @@ pub const TypeChecker = struct {
         self.in_type_ref = true;
         defer self.in_type_ref = prev;
         return self.inferExprType(expr_idx);
+    }
+
+    fn arrayTypeFromParts(self: *TypeChecker, expr_idx: NodeIdx, size_node: NodeIdx, elem: TypeIdx) TypeIdx {
+        var size: u64 = 0;
+        switch (self.evalComptime(size_node)) {
+            .int => |value| {
+                if (value < 0) {
+                    self.errorAt(expr_idx, "array length must be non-negative", .{});
+                } else {
+                    size = @intCast(value);
+                }
+            },
+            else => self.errorAt(expr_idx, "array length must be a comptime integer", .{}),
+        }
+        return self.type_pool.add(.{ .array = .{ .elem = elem, .size = size } }) catch @panic("OOM");
+    }
+
+    fn inferArrayLiteral(self: *TypeChecker, expr_idx: NodeIdx, elements: NodeList, expected: ?TypeIdx) TypeIdx {
+        if (expected) |expected_ty| {
+            const expected_sem = self.type_pool.get(expected_ty);
+            if (expected_sem == .array) {
+                const expected_array = expected_sem.array;
+                const expected_len = expected_array.size orelse 0;
+                if (elements.indices.len != expected_len) {
+                    self.errorAt(expr_idx, "array length mismatch: expected {d} element(s), got {d}", .{
+                        expected_len, elements.indices.len,
+                    });
+                }
+                for (elements.indices, 0..) |element, i| {
+                    const got = self.inferArrayElementExpected(element, expected_array.elem);
+                    if (!self.typesEqual(expected_array.elem, got)) {
+                        self.errorAt(element, "array element {d} expects '{s}' but got '{s}'", .{
+                            i, self.typeName(expected_array.elem), self.typeName(got),
+                        });
+                    }
+                }
+                return expected_ty;
+            }
+        }
+
+        if (elements.indices.len == 0) {
+            self.errorAt(expr_idx, "cannot infer the element type of an empty array literal; add a type annotation", .{});
+            return self.void_ty;
+        }
+
+        const elem_ty = self.inferExprType(elements.indices[0]);
+        for (elements.indices[1..], 1..) |element, i| {
+            const got = self.inferExprTypeExpected(element, elem_ty);
+            if (!self.typesEqual(elem_ty, got)) {
+                self.errorAt(element, "array element {d} has type '{s}'; expected '{s}'", .{
+                    i, self.typeName(got), self.typeName(elem_ty),
+                });
+            }
+        }
+        return self.type_pool.add(.{ .array = .{
+            .elem = elem_ty,
+            .size = elements.indices.len,
+        } }) catch @panic("OOM");
+    }
+
+    fn inferArrayElementExpected(self: *TypeChecker, element: NodeIdx, expected: TypeIdx) TypeIdx {
+        const node = self.arena.get(element);
+        const expected_sem = self.type_pool.get(expected);
+        const literal_matches = (node.* == .int_literal and expected_sem == .int) or
+            (node.* == .float_literal and expected_sem == .float);
+        if (literal_matches) {
+            self.setNodeType(element, expected);
+            return expected;
+        }
+        return self.inferExprTypeExpected(element, expected);
     }
 
     /// The `function` type for a signature. `params` is copied into a slice
@@ -2690,6 +2777,12 @@ pub const TypeChecker = struct {
                 }
                 break :blk null;
             },
+            .array_literal => |elements| blk: {
+                for (elements.indices) |element| {
+                    if (self.localOrigin(element)) |origin| break :blk origin;
+                }
+                break :blk null;
+            },
             .if_expr => |i| self.localOrigin(i.then_body) orelse
                 (if (i.else_body) |else_body| self.localOrigin(else_body) else null),
             .match_expr => |m| blk: {
@@ -2748,8 +2841,8 @@ pub const TypeChecker = struct {
     }
 
     /// Infer `expr_idx` with an expected type, threading it into closure params
-    /// (R11a). For anything but a closure this is a plain inference plus, when
-    /// the expression is an unresolved placeholder, adopting the expected type.
+    /// and fixed-length array literals. Other expressions use plain inference
+    /// plus placeholder resolution.
     fn inferExprTypeExpected(self: *TypeChecker, expr_idx: NodeIdx, expected: TypeIdx) TypeIdx {
         if (self.rejectNullForReference(expr_idx, expected)) return expected;
         const prev = self.getNodeType(expr_idx);
@@ -2758,6 +2851,11 @@ pub const TypeChecker = struct {
         const expr = self.arena.get(expr_idx);
         if (expr.* == .closure) {
             const ty = self.inferClosureType(expr_idx, expr.closure, expected);
+            self.setNodeType(expr_idx, ty);
+            return ty;
+        }
+        if (expr.* == .array_literal and self.type_pool.get(expected) == .array) {
+            const ty = self.inferArrayLiteral(expr_idx, expr.array_literal, expected);
             self.setNodeType(expr_idx, ty);
             return ty;
         }
@@ -3090,6 +3188,13 @@ pub const TypeChecker = struct {
             .index_access => |ia| {
                 self.walkCaptures(ia.object, cs);
                 self.walkCaptures(ia.index, cs);
+            },
+            .array_literal => |elements| {
+                for (elements.indices) |element| self.walkCaptures(element, cs);
+            },
+            .array_type => |at| {
+                self.walkCaptures(at.size, cs);
+                self.walkCaptures(at.elem, cs);
             },
             .generic_app => |ga| {
                 self.walkCaptures(ga.base, cs);
@@ -4126,6 +4231,27 @@ pub const TypeChecker = struct {
     // Indexing and iteration
     // ========================================================================
 
+    fn checkArrayIndex(self: *TypeChecker, node_idx: NodeIdx, obj_ty: TypeIdx, index: NodeIdx) void {
+        var sem = self.type_pool.get(obj_ty);
+        if (sem == .pointer) sem = self.type_pool.get(sem.pointer.elem);
+        if (sem != .array) return;
+
+        const index_ty = self.getNodeType(index);
+        if (self.type_pool.get(index_ty) != .int) {
+            self.errorAt(node_idx, "array index must be an integer, got '{s}'", .{self.typeName(index_ty)});
+            return;
+        }
+        const len = sem.array.size orelse return;
+        switch (self.evalComptime(index)) {
+            .int => |value| {
+                if (value < 0 or @as(u64, @intCast(value)) >= len) {
+                    self.errorAt(node_idx, "array index {d} is out of bounds for length {d}", .{ value, len });
+                }
+            },
+            else => {},
+        }
+    }
+
     /// Element type produced by `obj[index]`.
     fn inferElementType(self: *TypeChecker, node_idx: NodeIdx, obj_ty: TypeIdx) TypeIdx {
         var sem = self.type_pool.get(obj_ty);
@@ -4822,6 +4948,92 @@ test "typecheck: let with inferred type" {
 // ---------------------------------------------------------------------------
 // Definite initialization (R46)
 // ---------------------------------------------------------------------------
+
+test "typecheck: array types literals copies and checked indices" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn sum(values: [3]i32) -> i32 {
+        \\    return values[0] + values[1] + values[2]
+        \\}
+        \\fn make() -> [2]i32 {
+        \\    return [4, 5]
+        \\}
+        \\fn main() -> i32 {
+        \\    mut values: [3]i32 = [1, 2, 3]
+        \\    values[1] = 4
+        \\    let copy = values
+        \\    let pair = make()
+        \\    let wide: [2]i64 = [8, 9]
+        \\    mut index = 0
+        \\    return sum(copy) + pair[1] + values[index]
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(!res.diagnostics.hasErrors());
+}
+
+test "typecheck: array literal length and element types are checked" {
+    var short = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let values: [3]i32 = [1, 2]
+        \\}
+    );
+    defer deinitCheck(&short);
+    try std.testing.expect(hasMessage(&short.diagnostics, "array length mismatch: expected 3 element(s), got 2"));
+
+    var mixed = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let values = [1, true, 3]
+        \\}
+    );
+    defer deinitCheck(&mixed);
+    try std.testing.expect(hasMessage(&mixed.diagnostics, "array element 1 has type 'bool'; expected 'i32'"));
+
+    var ascribed = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let values: [2]i32 = [1, false]
+        \\}
+    );
+    defer deinitCheck(&ascribed);
+    try std.testing.expect(hasMessage(&ascribed.diagnostics, "array element 1 expects 'i32' but got 'bool'"));
+}
+
+test "typecheck: constant array indices are bounds checked" {
+    var res = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let values = [10, 20, 30]
+        \\    return values[3]
+        \\}
+    );
+    defer deinitCheck(&res);
+    try std.testing.expect(hasMessage(&res.diagnostics, "array index 3 is out of bounds for length 3"));
+
+    var negative = try runCheck(std.testing.allocator,
+        \\fn main() -> i32 {
+        \\    let values = [10, 20, 30]
+        \\    return values[-1]
+        \\}
+    );
+    defer deinitCheck(&negative);
+    try std.testing.expect(hasMessage(&negative.diagnostics, "array index -1 is out of bounds for length 3"));
+}
+
+test "typecheck: empty arrays require an ascription" {
+    var valid = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let values: [0]i32 = []
+        \\}
+    );
+    defer deinitCheck(&valid);
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+
+    var invalid = try runCheck(std.testing.allocator,
+        \\fn main() {
+        \\    let values = []
+        \\}
+    );
+    defer deinitCheck(&invalid);
+    try std.testing.expect(hasMessage(&invalid.diagnostics, "cannot infer the element type of an empty array literal"));
+}
 
 test "typecheck: definite initialization rejects a straight-line read" {
     var res = try runCheck(std.testing.allocator,

@@ -959,6 +959,7 @@ pub const Parser = struct {
             .lbrace => {
                 return self.parseBlock();
             },
+            .lbracket => return self.parseBracketPrefix(),
             .if_kw => {
                 _ = self.advance();
                 return self.parseIfExpr();
@@ -1015,6 +1016,34 @@ pub const Parser = struct {
                 return null;
             },
         }
+    }
+
+    fn parseBracketPrefix(self: *Parser) ?NodeIdx {
+        _ = self.expect(.lbracket) orelse return null;
+
+        if (self.in_type_ref) {
+            const size = self.parseExpr(Precedence.none.toInt()) orelse return null;
+            _ = self.expect(.rbracket) orelse return null;
+            const elem = self.parseExpr(Precedence.prefix.toInt()) orelse return null;
+            return self.appendNode(.{ .array_type = .{ .size = size, .elem = elem } });
+        }
+
+        var elements = std.ArrayList(NodeIdx).empty;
+        defer elements.deinit(self.allocator);
+        while (true) {
+            self.skipNewlinesAndSemicolons();
+            if (self.check(.rbracket)) break;
+            if (elements.items.len > 0) {
+                if (self.expect(.comma) == null) break;
+                self.skipNewlinesAndSemicolons();
+                if (self.check(.rbracket)) break;
+            }
+            const element = self.parseExpr(Precedence.none.toInt()) orelse break;
+            elements.append(self.allocator, element) catch unreachable;
+            self.skipNewlinesAndSemicolons();
+        }
+        _ = self.expect(.rbracket);
+        return self.appendNode(.{ .array_literal = self.arena.allocNodeList(elements.items) catch NodeList{ .indices = &.{} } });
     }
 
     fn parseInfix(self: *Parser, left: NodeIdx, tok: Token, prec: u8) NodeIdx {
@@ -1810,6 +1839,26 @@ test "parser: index access" {
     const expr = stmt.let_stmt.init_expr orelse return error.TestUnexpectedNull;
     const idx = res.arena.get(expr);
     try std.testing.expectEqual(@as(std.meta.Tag(Node), .index_access), tagOf(idx));
+}
+
+test "parser: array type and literal" {
+    var res = try runTest(std.testing.allocator,
+        \\fn main() {
+        \\    let values: [3]i32 = [1, 2, 3]
+        \\}
+    );
+    defer res.arena.deinit();
+
+    const body = res.arena.get(declAt(&res, 0).fn_decl.body);
+    const stmt = res.arena.get(body.block.stmts.indices[0]).let_stmt;
+    const ty = res.arena.get(stmt.ty orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .array_type), tagOf(ty));
+    try std.testing.expectEqual(@as(i64, 3), res.arena.get(ty.array_type.size).int_literal);
+    try std.testing.expectEqualStrings("i32", nameOf(&res, res.arena.get(ty.array_type.elem).identifier));
+
+    const literal = res.arena.get(stmt.init_expr orelse return error.TestUnexpectedNull);
+    try std.testing.expectEqual(@as(std.meta.Tag(Node), .array_literal), tagOf(literal));
+    try std.testing.expectEqual(@as(usize, 3), literal.array_literal.indices.len);
 }
 
 test "parser: module with multiple declarations" {

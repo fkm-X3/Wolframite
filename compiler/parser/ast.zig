@@ -84,6 +84,10 @@ pub const Node = union(enum) {
     call: struct { func: NodeIdx, args: NodeList },
     field_access: struct { object: NodeIdx, field: StringRef },
     index_access: struct { object: NodeIdx, index: NodeIdx },
+    /// `[a, b, c]` — a fixed-length array value.
+    array_literal: NodeList,
+    /// `[N]T` — a fixed-length array type.
+    array_type: struct { size: NodeIdx, elem: NodeIdx },
     /// `Name[A, B]` — a generic application. A single-argument application
     /// (`Option[i32]`) stays an `index_access`; the semantic passes read a type
     /// name on the left of one as a generic application. `args` holds one type
@@ -294,6 +298,15 @@ fn cloneNode(
             const object = try cloneNode(arena, ia.object, map);
             const index = try cloneNode(arena, ia.index, map);
             return appendClone(arena, idx, map, .{ .index_access = .{ .object = object, .index = index } });
+        },
+        .array_literal => |elements| {
+            const cloned = try cloneList(arena, elements, map);
+            return appendClone(arena, idx, map, .{ .array_literal = cloned });
+        },
+        .array_type => |at| {
+            const size = try cloneNode(arena, at.size, map);
+            const elem = try cloneNode(arena, at.elem, map);
+            return appendClone(arena, idx, map, .{ .array_type = .{ .size = size, .elem = elem } });
         },
         .generic_app => |ga| {
             const base = try cloneNode(arena, ga.base, map);

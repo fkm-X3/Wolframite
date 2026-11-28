@@ -494,9 +494,16 @@ pub const Lowerer = struct {
                 }
                 for (f.params.indices, 0..) |param_idx, i| {
                     const param = self.arena.get(param_idx);
+                    const param_ty = try self.paramType(param.param.ty);
+                    var param_value: api.Value = @fromBackingInt(@intCast(visible_start + i));
+                    if (self.type_pool.get(param_ty) == .array) {
+                        const source = param_value;
+                        param_value = try self.allocVarSlot(param_ty);
+                        try self.copyAggregate(param_value, source, param_ty);
+                    }
                     try self.params.put(self.gpa, self.nameSlice(param.param.name), .{
-                        .value = @fromBackingInt(@intCast(visible_start + i)),
-                        .ty = try self.paramType(param.param.ty),
+                        .value = param_value,
+                        .ty = param_ty,
                     });
                 }
 
@@ -926,7 +933,7 @@ pub const Lowerer = struct {
             // the binding owns its own copy (R8c).
             const ty = self.checker.nodeType(node_idx);
             const size = self.aggregateByteSize(ty);
-            if (size > 8) {
+            if (self.isAggregateValue(ty)) {
                 var offset: u64 = 0;
                 while (offset < size) {
                     const src_addr = try self.ctx.buildPtrAdd(
@@ -952,7 +959,16 @@ pub const Lowerer = struct {
         try self.bindLocalMaterialized(self.nameSlice(l.name), slot, self.checker.nodeType(node_idx), materialized);
     }
 
-    /// Byte size of an aggregate type (struct/enum/string), or 8 for scalars.
+    /// Whether the value representation is the address of its storage rather
+    /// than a scalar loaded into one SSA slot.
+    fn isAggregateValue(self: *Lowerer, ty: TypeIdx) bool {
+        return switch (self.type_pool.get(ty)) {
+            .struct_type, .applied_struct, .enum_type, .applied_enum, .string_type, .function, .array => true,
+            else => false,
+        };
+    }
+
+    /// Byte size of an aggregate type (struct/enum/string/array), or 8 for scalars.
     fn aggregateByteSize(self: *Lowerer, ty: TypeIdx) u64 {
         return switch (self.type_pool.get(ty)) {
             .struct_type => |decl_node| @as(u64, @intCast(structSize(self.arena, decl_node))),
@@ -960,6 +976,7 @@ pub const Lowerer = struct {
             .string_type => 16,
             .function => api.fn_value_size,
             .enum_type, .applied_enum => 16,
+            .array => |a| (a.size orelse 0) * self.aggregateByteSize(a.elem),
             else => 8,
         };
     }
@@ -968,7 +985,7 @@ pub const Lowerer = struct {
     /// rather than in `rax` (docs/semantics.md §6.3 R17).
     fn needsSret(self: *Lowerer, ty: TypeIdx) bool {
         return switch (self.type_pool.get(ty)) {
-            .struct_type, .applied_struct, .enum_type, .applied_enum, .string_type, .function => true,
+            .struct_type, .applied_struct, .enum_type, .applied_enum, .string_type, .function, .array => true,
             else => false,
         };
     }
@@ -981,6 +998,7 @@ pub const Lowerer = struct {
             .enum_type, .applied_enum => 16,
             .string_type => 16,
             .function => api.fn_value_size,
+            .array => @max(8, @as(u32, @intCast(self.aggregateByteSize(ty)))),
             .applied_fn => |a| blk: {
                 _ = a;
                 break :blk api.fn_value_size;
@@ -988,6 +1006,25 @@ pub const Lowerer = struct {
             else => 8,
         };
         return self.ctx.buildAllocaBytes(self.ptr_ty, size);
+    }
+
+    fn copyAggregate(self: *Lowerer, dst: api.Value, src: api.Value, ty: TypeIdx) !void {
+        const size = self.aggregateByteSize(ty);
+        var offset: u64 = 0;
+        while (offset < size) : (offset += 8) {
+            const src_addr = try self.ctx.buildPtrAdd(
+                self.ptr_ty,
+                src,
+                try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+            );
+            const loaded = try self.ctx.buildLoad(self.i64_ty, src_addr);
+            const dst_addr = try self.ctx.buildPtrAdd(
+                self.ptr_ty,
+                dst,
+                try self.ctx.buildIntConst(self.i64_ty, @intCast(offset)),
+            );
+            _ = try self.ctx.buildStore(self.i64_ty, dst_addr, loaded);
+        }
     }
 
     fn lowerReturn(self: *Lowerer, r: anytype) !void {
@@ -1234,7 +1271,7 @@ pub const Lowerer = struct {
     fn lowerIndexAccess(self: *Lowerer, node_idx: NodeIdx, ia: anytype) !api.Value {
         const elem_ptr = try self.lowerIndexAddr(node_idx, ia) orelse
             return self.ctx.buildIntConst(self.i64_ty, 0);
-        if (self.aggregateByteSize(self.exprType(node_idx)) > 8) return elem_ptr;
+        if (self.isAggregateValue(self.exprType(node_idx))) return elem_ptr;
         return self.ctx.buildLoad(self.irTypeFor(self.exprType(node_idx)), elem_ptr);
     }
 
@@ -1249,8 +1286,26 @@ pub const Lowerer = struct {
                 const data = try self.ctx.buildLoad(self.ptr_ty, data_addr);
                 return try self.ctx.buildPtrAdd(self.ptr_ty, data, index);
             },
-            .array => {
-                return try self.ctx.buildPtrAdd(self.ptr_ty, obj, try self.ctx.buildMul(self.i64_ty, index, try self.ctx.buildIntConst(self.i64_ty, 8)));
+            .array => |a| {
+                const len = a.size orelse {
+                    self.codegenError(node_idx, "cannot index an array with unknown length", .{});
+                    return null;
+                };
+                const len_value = try self.ctx.buildIntConst(self.i64_ty, @intCast(len));
+                const in_bounds = try self.ctx.buildIcmp(.icmp_ult, self.bool_ty, index, len_value);
+                const valid_block = try self.ctx.appendBlock();
+                const trap_block = try self.ctx.appendBlock();
+                _ = try self.ctx.buildCondBr(in_bounds, valid_block, trap_block);
+
+                self.setBlock(trap_block);
+                _ = try self.ctx.buildTrap();
+                self.terminated();
+
+                self.setBlock(valid_block);
+                const elem_size = self.aggregateByteSize(a.elem);
+                const stride = try self.ctx.buildIntConst(self.i64_ty, @intCast(elem_size));
+                const offset = try self.ctx.buildMul(self.i64_ty, index, stride);
+                return try self.ctx.buildPtrAdd(self.ptr_ty, obj, offset);
             },
             else => {
                 self.codegenError(node_idx, "index access is only lowered for String and array values", .{});
@@ -1552,12 +1607,17 @@ pub const Lowerer = struct {
             .call => |c| return self.lowerCall(node_idx, c),
             .field_access => |fa| {
                 if (try self.lowerFieldAddr(node_idx, fa)) |addr| {
-                    if (self.aggregateByteSize(self.exprType(node_idx)) > 8) return addr;
+                    if (self.isAggregateValue(self.exprType(node_idx))) return addr;
                     return self.ctx.buildLoad(self.irTypeFor(self.exprType(node_idx)), addr);
                 }
                 return self.ctx.buildIntConst(self.i64_ty, 0);
             },
             .index_access => |ia| return self.lowerIndexAccess(node_idx, ia),
+            .array_literal => |elements| return self.lowerArrayLiteral(node_idx, elements),
+            .array_type => {
+                self.codegenError(node_idx, "an array type is not a runtime value", .{});
+                return self.ctx.buildIntConst(self.i64_ty, 0);
+            },
             .generic_app => {
                 self.codegenError(node_idx, "a type application is not a value", .{});
                 return self.ctx.buildIntConst(self.i64_ty, 0);
@@ -1727,7 +1787,7 @@ pub const Lowerer = struct {
             // values), the binding is a pointer to the data; return it
             // directly without loading. For scalars and unit enums (8 bytes),
             // load the value.
-            if (self.aggregateByteSize(self.checker.nodeType(node_idx)) > 8) return binding.value;
+            if (self.isAggregateValue(self.checker.nodeType(node_idx))) return binding.value;
             return self.ctx.buildLoad(self.i64_ty, binding.value);
         }
         self.codegenError(node_idx, "unknown identifier '{s}'", .{name});
@@ -1855,7 +1915,12 @@ pub const Lowerer = struct {
         const rhs = try self.lowerExpr(b.right);
 
         if (b.op == .assign) {
-            _ = try self.ctx.buildStore(self.i64_ty, addr, rhs);
+            const left_ty = self.checker.nodeType(b.left);
+            if (self.isAggregateValue(left_ty)) {
+                try self.copyAggregate(addr, rhs, left_ty);
+            } else {
+                _ = try self.ctx.buildStore(self.i64_ty, addr, rhs);
+            }
             return rhs;
         }
 
@@ -1884,7 +1949,7 @@ pub const Lowerer = struct {
             return self.ctx.buildIntConst(self.i64_ty, 0);
         }
         const pointee = reference_sem.pointer.elem;
-        if (self.aggregateByteSize(pointee) > 8) return addr;
+        if (self.isAggregateValue(pointee)) return addr;
         return self.ctx.buildLoad(self.irTypeFor(pointee), addr);
     }
 
@@ -1915,7 +1980,7 @@ pub const Lowerer = struct {
         if (node.* == .identifier) {
             const name = self.nameSlice(node.identifier);
             if (self.params.getPtr(name)) |param| {
-                if (self.aggregateByteSize(param.ty) > 8) return param.value;
+                if (self.isAggregateValue(param.ty)) return param.value;
                 if (param.address) |address| return address;
                 const slot = try self.ctx.buildAllocaBytes(self.ptr_ty, 8);
                 _ = try self.ctx.buildStore(self.i64_ty, slot, param.value);
@@ -3104,6 +3169,34 @@ pub const Lowerer = struct {
         return vals;
     }
 
+    fn lowerArrayLiteral(self: *Lowerer, node_idx: NodeIdx, elements: NodeList) !api.Value {
+        const array_ty = self.checker.nodeType(node_idx);
+        const sem = self.type_pool.get(array_ty);
+        if (sem != .array) {
+            self.codegenError(node_idx, "array literal has no fixed array type", .{});
+            return self.ctx.buildIntConst(self.i64_ty, 0);
+        }
+
+        const base = try self.allocVarSlot(array_ty);
+        const elem_ty = sem.array.elem;
+        const elem_size = self.aggregateByteSize(elem_ty);
+        for (elements.indices, 0..) |element, i| {
+            const value = try self.lowerExpr(element);
+            const byte_offset = elem_size * @as(u64, @intCast(i));
+            const addr = try self.ctx.buildPtrAdd(
+                self.ptr_ty,
+                base,
+                try self.ctx.buildIntConst(self.i64_ty, @intCast(byte_offset)),
+            );
+            if (self.isAggregateValue(elem_ty)) {
+                try self.copyAggregate(addr, value, elem_ty);
+            } else {
+                _ = try self.ctx.buildStore(self.i64_ty, addr, value);
+            }
+        }
+        return base;
+    }
+
     fn lowerStructInit(self: *Lowerer, node_idx: NodeIdx, si: anytype) !api.Value {
         const ty = self.checker.nodeType(si.ty);
         const sem = self.type_pool.get(ty);
@@ -4166,6 +4259,29 @@ test "lower: for...in iterates string bytes" {
     var buf: [8192]u8 = undefined;
     const text = res.text(&buf);
     try std.testing.expect(std.mem.indexOf(u8, text, "icmp ult") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
+}
+
+test "lower: array values copy and indexing traps out of bounds" {
+    var res = try checkLower(std.testing.allocator,
+        \\fn sum(values: [3]i32) -> i32 {
+        \\    return values[0] + values[1] + values[2]
+        \\}
+        \\fn main() -> i32 {
+        \\    mut values: [3]i32 = [1, 2, 3]
+        \\    values[1] = 9
+        \\    let copy = values
+        \\    return sum(copy)
+        \\}
+    );
+    defer res.deinit();
+
+    var buf: [32768]u8 = undefined;
+    const text = res.text(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "alloca 24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "icmp ult") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "trap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mul") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ptr_add") != null);
 }
 
